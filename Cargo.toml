@@ -1,0 +1,17 @@
+[package]
+name = "ferntree"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Concurrent in-memory B+ Tree featuring optimistic lock coupling"
+
+[dependencies]
+crossbeam-epoch = "0.9"
+parking_lot = "0.12.5"
+smallvec = { version = "1.15.1", features = ["serde", "const_generics"] }
+thiserror = "2.0.18"
+
+[dev-dependencies]
+rand = "0.9.2"
+serde = { version = "1.0.228", features = ["derive", "rc"] }
+serde_json = "1"
