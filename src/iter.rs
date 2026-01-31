@@ -149,7 +149,10 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				JumpResult::Ok => {
 					return LeafResult::Ok;
 				}
-				JumpResult::End | JumpResult::Err(_) => {
+				JumpResult::End => {
+					return LeafResult::End;
+				}
+				JumpResult::Err(_) => {
 					self.restore_from_anchor(&anchor);
 					continue;
 				}
@@ -189,7 +192,10 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				JumpResult::Ok => {
 					return LeafResult::Ok;
 				}
-				JumpResult::End | JumpResult::Err(_) => {
+				JumpResult::End => {
+					return LeafResult::End;
+				}
+				JumpResult::Err(_) => {
 					self.restore_from_anchor(&anchor);
 					continue;
 				}
@@ -623,7 +629,10 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				JumpResult::Ok => {
 					return LeafResult::Ok;
 				}
-				JumpResult::End | JumpResult::Err(_) => {
+				JumpResult::End => {
+					return LeafResult::End;
+				}
+				JumpResult::Err(_) => {
 					self.restore_from_anchor(&anchor);
 					continue;
 				}
@@ -663,7 +672,10 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				JumpResult::Ok => {
 					return LeafResult::Ok;
 				}
-				JumpResult::End | JumpResult::Err(_) => {
+				JumpResult::End => {
+					return LeafResult::End;
+				}
+				JumpResult::Err(_) => {
 					self.restore_from_anchor(&anchor);
 					continue;
 				}

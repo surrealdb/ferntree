@@ -139,6 +139,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 				if let Some(tree_guard) = t_guard.take() {
 					tree_guard.recheck()?;
 				}
+				pos = c_pos; // Update pos to the actual position of the needle
 				break target_guard;
 			}
 
@@ -916,6 +917,14 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 				if parent_guard.as_internal().has_space() {
 					let swip = parent_guard.as_internal().edge_at(pos)?;
 					let target_guard = GenericTree::lock_coupling(&parent_guard, swip, eg)?;
+
+					// Verify that the target we found is actually the needle
+					let target_latch = target_guard.latch() as *const _;
+					let needle_latch = needle.latch() as *const _;
+					if target_latch != needle_latch {
+						// The tree structure has changed - return Reclaimed so we re-seek
+						return Err(error::Error::Reclaimed);
+					}
 					let mut parent_guard_x = parent_guard.to_exclusive()?;
 					let mut target_guard_x = target_guard.to_exclusive()?;
 
@@ -945,18 +954,20 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 							let parent_internal = parent_guard_x.as_internal_mut();
 
+							// After split: left node has lower keys, right node has higher keys.
+							// Left node stays at current position, right node is inserted after.
 							if pos == parent_internal.len {
+								// Node was at upper_edge - it becomes the left.
+								// Insert split key and make right the new upper_edge.
 								let left_edge = parent_internal
 									.upper_edge
 									.replace(new_right_node_edge)
 									.expect("upper_edge must be populated");
 								parent_internal.insert(split_key, left_edge);
 							} else {
-								let left_edge = std::mem::replace(
-									&mut parent_internal.edges[pos as usize],
-									new_right_node_edge,
-								);
-								parent_internal.insert(split_key, left_edge);
+								// Node was at edges[pos] - keep it there (it's now the left).
+								// Insert split key with right node after it.
+								parent_internal.insert_after(pos, split_key, new_right_node_edge);
 							}
 						}
 						Node::Leaf(left_leaf) => {
@@ -984,23 +995,29 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 							let parent_internal = parent_guard_x.as_internal_mut();
 
+							// After split: left node has lower keys, right node has higher keys.
+							// Left node stays at current position, right node is inserted after.
 							if pos == parent_internal.len {
+								// Node was at upper_edge - it becomes the left.
+								// Insert split key and make right the new upper_edge.
 								let left_edge = parent_internal
 									.upper_edge
 									.replace(new_right_node_edge)
 									.expect("upper_edge must be populated");
 								parent_internal.insert(split_key, left_edge);
 							} else {
-								let left_edge = std::mem::replace(
-									&mut parent_internal.edges[pos as usize],
-									new_right_node_edge,
-								);
-								parent_internal.insert(split_key, left_edge);
+								// Node was at edges[pos] - keep it there (it's now the left).
+								// Insert split key with right node after it.
+								parent_internal.insert_after(pos, split_key, new_right_node_edge);
 							}
 						}
 					}
 				} else {
+					// Parent is full, split it first
 					self.try_split(&parent_guard, eg)?;
+					// After splitting parent, the tree structure changed.
+					// Return Reclaimed so caller goes back to seek_exact and finds the right leaf.
+					return Err(error::Error::Reclaimed);
 				}
 			}
 		}
@@ -1703,6 +1720,23 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 
 		(key, edge)
 	}
+
+	/// Insert a separator key and new right child after a split.
+	/// The left child remains at edges[pos], and we insert:
+	/// - the split_key at keys[pos] (shifting keys[pos:] right)
+	/// - the right child at edges[pos+1] (shifting edges[pos+1:] right)
+	pub(crate) fn insert_after(
+		&mut self,
+		pos: u16,
+		key: K,
+		edge: Atomic<HybridLatch<Node<K, V, IC, LC>>>,
+	) {
+		// Insert key at position pos (this becomes the separator between left and right)
+		self.keys.insert(pos as usize, key);
+		// Insert edge at position pos+1 (right child, after the left child at pos)
+		self.edges.insert((pos + 1) as usize, edge);
+		self.len += 1;
+	}
 }
 
 impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
@@ -1792,7 +1826,6 @@ mod tests {
 	}
 
 	#[test]
-	#[ignore = "iterator logic needs investigation - may hang"]
 	fn raw_iter() {
 		let tree: Tree<i32, i32> = Tree::new();
 
@@ -1804,7 +1837,8 @@ mod tests {
 		iter.seek_to_first();
 
 		for i in 0..100 {
-			let (k, v) = iter.next().unwrap();
+			let result = iter.next();
+			let (k, v) = result.unwrap();
 			assert_eq!(*k, i);
 			assert_eq!(*v, i * 10);
 		}
@@ -1813,7 +1847,6 @@ mod tests {
 	}
 
 	#[test]
-	#[ignore = "iterator logic needs investigation - may hang"]
 	fn raw_iter_reverse() {
 		let tree: Tree<i32, i32> = Tree::new();
 
