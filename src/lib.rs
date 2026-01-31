@@ -81,6 +81,9 @@
 //! All operations use epoch-based memory reclamation via `crossbeam_epoch` to safely
 //! deallocate nodes that may still be accessed by concurrent readers.
 
+// Complex types are intentional in this crate for expressing tree traversal results
+#![allow(clippy::type_complexity)]
+
 use crossbeam_epoch::{self as epoch, Atomic, Owned};
 use smallvec::{smallvec, SmallVec};
 
@@ -298,7 +301,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// - `Ok(ParentHandler::Parent)` with the parent guard and position
 	/// - `Err(Error::Reclaimed)` if the node was retired from the tree
 	/// - `Err(Error::Unwind)` if optimistic validation failed
-	pub(crate) fn find_parent<'t, 'g>(
+	pub(crate) fn find_parent<'t>(
 		&'t self,
 		needle: &impl HybridGuard<Node<K, V, IC, LC>>,
 		eg: &'t epoch::Guard,
@@ -319,7 +322,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 		// Step 3: Check if the needle IS the root
 		// Compare latch pointers (identity check, not content)
-		if needle.latch() as *const _ == root_latch_ptr {
+		if std::ptr::eq(needle.latch(), root_latch_ptr) {
 			// Validate our optimistic reads were consistent
 			tree_guard.recheck()?;
 			return Ok(ParentHandler::Root {
@@ -373,7 +376,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 			let c_latch_ptr = c_latch as *const _;
 
 			// Check if this child IS the needle we're looking for
-			if needle.latch() as *const _ == c_latch_ptr {
+			if std::ptr::eq(needle.latch(), c_latch_ptr) {
 				// Found it! The current target_guard is the parent
 				target_guard.recheck()?;
 				if let Some(tree_guard) = t_guard.take() {
@@ -452,7 +455,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		let root_latch_ptr = root_latch as *const _;
 		let root_guard = root_latch.optimistic_or_spin();
 
-		if needle.latch() as *const _ == root_latch_ptr {
+		if std::ptr::eq(needle.latch(), root_latch_ptr) {
 			// Needle is the root - no siblings exist
 			root_guard.recheck()?;
 			tree_guard.recheck()?;
@@ -477,7 +480,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		// For Forward: can we go to pos+1?
 		// For Reverse: can we go to pos-1?
 		let within_bounds = match direction {
-			Direction::Forward => pos + 1 <= parent_guard.as_internal().len,
+			Direction::Forward => pos < parent_guard.as_internal().len,
 			Direction::Reverse => pos > 0,
 		};
 
@@ -497,13 +500,13 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 			if guard.is_leaf() {
 				// Sibling is directly a leaf - we're done
 				guard.recheck()?;
-				return error::Result::Ok(Some((guard, (parent_guard, lookup_pos))));
+				error::Result::Ok(Some((guard, (parent_guard, lookup_pos))))
 			} else {
 				// Sibling is an internal node - descend to the appropriate leaf
 				// (leftmost for Forward, rightmost for Reverse)
 				let (leaf, parent_opt) =
 					self.find_leaf_and_parent_from_node(guard, direction, eg)?;
-				return error::Result::Ok(Some((leaf, parent_opt.expect("must have parent here"))));
+				error::Result::Ok(Some((leaf, parent_opt.expect("must have parent here"))))
 			}
 		} else {
 			// No sibling in parent - must go up to grandparent and try again
@@ -527,7 +530,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 				// Check if there's a sibling at this level
 				let within_bounds = match direction {
-					Direction::Forward => pos + 1 <= parent_guard.as_internal().len,
+					Direction::Forward => pos < parent_guard.as_internal().len,
 					Direction::Reverse => pos > 0,
 				};
 
@@ -663,8 +666,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// A tuple of:
 	/// - The leaf guard
 	/// - The parent info (parent guard and position), or `None` if starting from root
-	fn find_leaf_and_parent_from_node<'t, 'e>(
-		&'t self,
+	fn find_leaf_and_parent_from_node<'e>(
+		&self,
 		needle: OptimisticGuard<'e, Node<K, V, IC, LC>>,
 		direction: Direction,
 		eg: &'e epoch::Guard,
@@ -710,8 +713,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// Finds the first (leftmost) leaf in the tree with its parent info.
 	///
 	/// Used by iterators to initialize at the beginning of the tree.
-	fn find_first_leaf_and_parent<'t, 'e>(
-		&'t self,
+	fn find_first_leaf_and_parent<'e>(
+		&self,
 		eg: &'e epoch::Guard,
 	) -> error::Result<(
 		OptimisticGuard<'e, Node<K, V, IC, LC>>,
@@ -730,8 +733,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// Finds the last (rightmost) leaf in the tree with its parent info.
 	///
 	/// Used by iterators to initialize at the end of the tree.
-	fn find_last_leaf_and_parent<'t, 'e>(
-		&'t self,
+	fn find_last_leaf_and_parent<'e>(
+		&self,
 		eg: &'e epoch::Guard,
 	) -> error::Result<(
 		OptimisticGuard<'e, Node<K, V, IC, LC>>,
@@ -758,9 +761,9 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// A tuple of:
 	/// - The leaf guard (optimistic)
 	/// - The parent info (parent guard and position in parent), or `None` if tree has only root
-	fn find_leaf_and_parent<'t, 'k, 'e, Q>(
-		&'t self,
-		key: &'k Q,
+	fn find_leaf_and_parent<'e, Q>(
+		&self,
+		key: &Q,
 		eg: &'e epoch::Guard,
 	) -> error::Result<(
 		OptimisticGuard<'e, Node<K, V, IC, LC>>,
@@ -812,9 +815,9 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 	/// Convenience function to find just the leaf (without parent info).
 	#[allow(dead_code)]
-	fn find_leaf<'t, 'k, 'e, Q>(
-		&'t self,
-		key: &'k Q,
+	fn find_leaf<'e, Q>(
+		&self,
+		key: &Q,
 		eg: &'e epoch::Guard,
 	) -> error::Result<OptimisticGuard<'e, Node<K, V, IC, LC>>>
 	where
@@ -845,9 +848,9 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	///
 	/// This function loops internally until successful. Validation failures
 	/// at any point cause a retry from the beginning.
-	pub(crate) fn find_shared_leaf_and_optimistic_parent<'t, 'k, 'e, Q>(
-		&'t self,
-		key: &'k Q,
+	pub(crate) fn find_shared_leaf_and_optimistic_parent<'e, Q>(
+		&self,
+		key: &Q,
 		eg: &'e epoch::Guard,
 	) -> (SharedGuard<'e, Node<K, V, IC, LC>>, Option<(OptimisticGuard<'e, Node<K, V, IC, LC>>, u16)>)
 	where
@@ -940,8 +943,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// Finds the first leaf and acquires a shared lock.
 	///
 	/// Used by iterators when seeking to the beginning of the tree.
-	pub(crate) fn find_first_shared_leaf_and_optimistic_parent<'t, 'e>(
-		&'t self,
+	pub(crate) fn find_first_shared_leaf_and_optimistic_parent<'e>(
+		&self,
 		eg: &'e epoch::Guard,
 	) -> (SharedGuard<'e, Node<K, V, IC, LC>>, Option<(OptimisticGuard<'e, Node<K, V, IC, LC>>, u16)>)
 	{
@@ -968,8 +971,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// Finds the last leaf and acquires a shared lock.
 	///
 	/// Used by iterators when seeking to the end of the tree.
-	pub(crate) fn find_last_shared_leaf_and_optimistic_parent<'t, 'e>(
-		&'t self,
+	pub(crate) fn find_last_shared_leaf_and_optimistic_parent<'e>(
+		&self,
 		eg: &'e epoch::Guard,
 	) -> (SharedGuard<'e, Node<K, V, IC, LC>>, Option<(OptimisticGuard<'e, Node<K, V, IC, LC>>, u16)>)
 	{
@@ -998,9 +1001,9 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// Used by `RawExclusiveIter` for read-write iteration (insert/remove).
 	/// The traversal uses optimistic locks until the leaf level, where an
 	/// exclusive lock is acquired. This blocks all other readers and writers.
-	pub(crate) fn find_exclusive_leaf_and_optimistic_parent<'t, 'k, 'e, Q>(
-		&'t self,
-		key: &'k Q,
+	pub(crate) fn find_exclusive_leaf_and_optimistic_parent<'e, Q>(
+		&self,
+		key: &Q,
 		eg: &'e epoch::Guard,
 	) -> (
 		ExclusiveGuard<'e, Node<K, V, IC, LC>>,
@@ -1089,9 +1092,9 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// Returns `None` if the key doesn't exist. Used for remove operations
 	/// where we need to find a specific entry.
 	#[allow(dead_code)]
-	pub(crate) fn find_exact_exclusive_leaf_and_optimistic_parent<'t, 'k, 'e, Q>(
-		&'t self,
-		key: &'k Q,
+	pub(crate) fn find_exact_exclusive_leaf_and_optimistic_parent<'e, Q>(
+		&self,
+		key: &Q,
 		eg: &'e epoch::Guard,
 	) -> Option<(
 		(ExclusiveGuard<'e, Node<K, V, IC, LC>>, u16),
@@ -1132,8 +1135,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	}
 
 	/// Finds the first leaf and acquires an exclusive lock.
-	pub(crate) fn find_first_exclusive_leaf_and_optimistic_parent<'t, 'e>(
-		&'t self,
+	pub(crate) fn find_first_exclusive_leaf_and_optimistic_parent<'e>(
+		&self,
 		eg: &'e epoch::Guard,
 	) -> (
 		ExclusiveGuard<'e, Node<K, V, IC, LC>>,
@@ -1158,8 +1161,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	}
 
 	/// Finds the last leaf and acquires an exclusive lock.
-	pub(crate) fn find_last_exclusive_leaf_and_optimistic_parent<'t, 'e>(
-		&'t self,
+	pub(crate) fn find_last_exclusive_leaf_and_optimistic_parent<'e>(
+		&self,
 		eg: &'e epoch::Guard,
 	) -> (
 		ExclusiveGuard<'e, Node<K, V, IC, LC>>,
@@ -1335,25 +1338,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 				// Unlock the leaf before attempting merge (merge needs fresh traversal)
 				let guard = guard.unlock();
 
-				// Attempt to merge with a sibling
-				// Note: Merge may fail due to concurrent operations; that's okay
-				loop {
-					let perform_merge = || {
-						let _ = self.try_merge(&guard, &eg)?;
-						error::Result::Ok(())
-					};
-
-					match perform_merge() {
-						Ok(_) | Err(error::Error::Reclaimed) => {
-							// Merge succeeded or node was already reclaimed
-							break;
-						}
-						Err(_) => {
-							// Other error - stop trying (merge is best-effort)
-							break;
-						}
-					}
-				}
+				// Attempt to merge with a sibling (best-effort, ignore result)
+				let _ = self.try_merge(&guard, &eg);
 			}
 
 			Some(kv)

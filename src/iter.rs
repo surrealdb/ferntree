@@ -558,7 +558,9 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 
 				self.leaf = Some((leaf_guard, l_cursor));
 				// Update parent cursor position
-				self.parent.as_mut().map(|(_, p_c)| *p_c = p_cursor);
+				if let Some((_, p_c)) = self.parent.as_mut() {
+					*p_c = p_cursor;
+				}
 
 				JumpResult::Ok
 			}
@@ -783,7 +785,12 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 	/// - If `Cursor::Before(n)`: Returns entry at `n`, cursor becomes `Before(n+1)`
 	/// - If `Cursor::After(n)`: Returns entry at `n+1`, cursor becomes `Before(n+2)`
 	/// - If at end of leaf: Moves to next leaf and continues
+	///
+	/// Note: This method intentionally doesn't implement `Iterator` because the
+	/// iterator holds locks and has complex retry semantics incompatible with
+	/// the standard trait.
 	#[inline]
+	#[allow(clippy::should_implement_trait)]
 	pub fn next(&mut self) -> Option<(&K, &V)> {
 		loop {
 			// Determine what to return based on current cursor position
@@ -1225,7 +1232,9 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				};
 
 				self.leaf = Some((leaf_guard, l_cursor));
-				self.parent.as_mut().map(|(_, p_c)| *p_c = p_cursor);
+				if let Some((_, p_c)) = self.parent.as_mut() {
+					*p_c = p_cursor;
+				}
 
 				JumpResult::Ok
 			}
@@ -1558,24 +1567,8 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 						// Unlock to get optimistic guard for merge
 						let guard = guard.unlock();
 
-						// Attempt to merge with a sibling
-						loop {
-							let perform_merge = || {
-								let _ = self.tree.try_merge(&guard, &self.eg)?;
-								error::Result::Ok(())
-							};
-
-							match perform_merge() {
-								Ok(_) | Err(error::Error::Reclaimed) => {
-									// Merge succeeded or node was reclaimed
-									break;
-								}
-								Err(_) => {
-									// Merge failed - that's okay, merge is best-effort
-									break;
-								}
-							}
-						}
+						// Attempt to merge with a sibling (best-effort, ignore result)
+						let _ = self.tree.try_merge(&guard, &self.eg);
 
 						// Re-position iterator after structural change
 						self.seek(removed_key);
@@ -1599,7 +1592,12 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 	/// 2. It returns `&mut V` instead of `&V`
 	///
 	/// This allows modifying values during iteration.
+	///
+	/// Note: This method intentionally doesn't implement `Iterator` because the
+	/// iterator holds locks and has complex retry semantics incompatible with
+	/// the standard trait.
 	#[inline]
+	#[allow(clippy::should_implement_trait)]
 	pub fn next(&mut self) -> Option<(&K, &mut V)> {
 		loop {
 			let opt = match self.leaf.as_ref() {

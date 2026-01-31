@@ -556,7 +556,7 @@ fn boundary_keys_i32() {
 fn string_keys_various_lengths() {
 	let tree: Tree<String, i32> = Tree::new();
 
-	let keys = vec![
+	let keys = [
 		"".to_string(),
 		"a".to_string(),
 		"ab".to_string(),
