@@ -94,8 +94,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub mod error;
 pub mod iter;
 pub mod latch;
-#[cfg(test)]
-pub mod util;
 
 use latch::{ExclusiveGuard, HybridGuard, HybridLatch, OptimisticGuard, SharedGuard};
 
