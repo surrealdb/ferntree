@@ -1,17 +1,82 @@
-//! Implementation of a hybrid latch based on the LeanStore paper.
+//! # Hybrid Latch Implementation
 //!
-//! The key difference from a standard `RwLock` is the ability of acquiring optimistic read access
-//! without performing any writes to memory. This mode of access is called optimistic because it allows reads
-//! to the underlying data even though writers may be able to acquire exclusive access without
-//! being blocked and perform writes while optimistic access is still in place.
+//! This module provides the [`HybridLatch`], a concurrency primitive based on the
+//! [LeanStore paper](https://dbis1.github.io/leanstore.html) that enables optimistic
+//! lock-free reading for high-performance concurrent data structures.
 //!
-//! Those reads would normally result in undefined behavior, but can be made safe by correctly validating
-//! each optimistic access before allowing any side effects to happen. The validation is performed through
-//! the [`OptimisticGuard::recheck`] method that returns an [`error::Error::Unwind`] if any writes could have taken place since
-//! the acquisition of the optimistic access.
+//! ## Overview
 //!
-//! We refer to unwinding as the premature return from a function that performed invalid accesses with the
-//! error variant [`error::Error::Unwind`].
+//! A `HybridLatch` is like a `RwLock` but with an additional "optimistic" access mode
+//! that doesn't acquire any lock at all. This is the key innovation that enables
+//! high-throughput concurrent B+ tree operations.
+//!
+//! ## Access Modes
+//!
+//! | Mode       | Blocking? | Prevents Writers? | Validates Reads? |
+//! |------------|-----------|-------------------|------------------|
+//! | Optimistic | No        | No                | Yes (required)   |
+//! | Shared     | Yes       | Yes               | No               |
+//! | Exclusive  | Yes       | Yes               | No               |
+//!
+//! ### Optimistic Access
+//!
+//! Optimistic access is the most efficient read mode. It captures a version number
+//! and allows the caller to read data without blocking. However:
+//!
+//! - Writers can acquire the latch and modify data concurrently
+//! - All reads MUST be validated before trusting the data
+//! - If validation fails, the operation must be retried
+//!
+//! ### Shared Access
+//!
+//! Traditional read lock. Blocks until no writer holds the latch, then blocks
+//! subsequent writers. Use when you need guaranteed consistent reads.
+//!
+//! ### Exclusive Access
+//!
+//! Traditional write lock. Blocks until no other readers or writers hold the latch.
+//! Increments the version number to invalidate optimistic readers.
+//!
+//! ## Version Encoding
+//!
+//! The latch uses a version number (`AtomicUsize`) with special encoding:
+//!
+//! ```text
+//! Version bits: [.......X]
+//!                       ^
+//!                       └── Odd (1) = Write lock held
+//!                           Even (0) = No write lock
+//!
+//! Sequence:
+//!   0 (unlocked) -> 1 (write locked) -> 2 (unlocked) -> 3 (write locked) -> ...
+//! ```
+//!
+//! - When a writer acquires the latch: version becomes odd (v + 1)
+//! - When a writer releases the latch: version becomes even (v + 1 again)
+//! - Optimistic readers check: has the version changed since we started?
+//!
+//! ## Validation Pattern
+//!
+//! ```ignore
+//! let guard = latch.optimistic_or_spin();
+//!
+//! // Read some data (might be inconsistent if concurrent write!)
+//! let value = guard.some_field;
+//!
+//! // CRITICAL: Validate before trusting the read
+//! guard.recheck()?;  // Returns Err(Unwind) if version changed
+//!
+//! // Now safe to use `value`
+//! ```
+//!
+//! ## Unwinding
+//!
+//! When optimistic validation fails, we say the operation must "unwind". This means:
+//! - Discard any data read (it may be garbage)
+//! - Return `Err(error::Error::Unwind)` to the caller
+//! - Caller typically retries the entire operation
+//!
+//! This is safe because no side effects occurred before validation.
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::cell::UnsafeCell;
@@ -19,69 +84,160 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error;
 
-/// Simple spin wait implementation
+// ===========================================================================
+// Spin Wait Helper
+// ===========================================================================
+
+/// A simple spin-wait implementation with exponential backoff.
+///
+/// Used when acquiring optimistic access while a write is in progress.
+/// Instead of immediately blocking, we spin briefly hoping the writer finishes.
+///
+/// # Backoff Strategy
+///
+/// 1. First 10 iterations: CPU spin loop (`spin_loop()`)
+/// 2. Next 10 iterations: Thread yield (`yield_now()`)
+/// 3. After 20 iterations: Returns `false` to signal "give up spinning"
+///
+/// This balances low-latency (spinning is faster than sleeping) with
+/// fairness (eventually yielding to let other threads run).
 struct SpinWait {
+	/// Number of spin iterations performed.
 	counter: u32,
 }
 
 impl SpinWait {
+	/// Creates a new `SpinWait` with counter at 0.
 	fn new() -> Self {
 		SpinWait {
 			counter: 0,
 		}
 	}
 
+	/// Performs one spin iteration.
+	///
+	/// # Returns
+	///
+	/// - `true`: Keep spinning (more attempts available)
+	/// - `false`: Stop spinning (reached iteration limit)
 	fn spin(&mut self) -> bool {
 		if self.counter < 10 {
+			// Phase 1: CPU spin loop (fastest, no OS involvement)
 			self.counter += 1;
 			std::hint::spin_loop();
 			true
 		} else if self.counter < 20 {
+			// Phase 2: Yield to OS scheduler (slightly slower, fairer)
 			self.counter += 1;
 			std::thread::yield_now();
 			true
 		} else {
+			// Phase 3: Exhausted patience, but still yield once
 			std::thread::yield_now();
 			false
 		}
 	}
 
+	/// Resets the counter to start fresh spin-waiting.
 	fn reset(&mut self) {
 		self.counter = 0;
 	}
 }
 
-/// A hybrid latch that uses versioning to enable optimistic, shared or exclusive access to the
-/// underlying data
+// ===========================================================================
+// HybridLatch
+// ===========================================================================
+
+/// A hybrid latch enabling optimistic, shared, or exclusive access to data.
+///
+/// This is the core concurrency primitive for the B+ tree. It combines:
+/// - A version counter for optimistic locking
+/// - A `RwLock` for blocking shared/exclusive access
+/// - The actual data protected by the latch
+///
+/// # Version Encoding
+///
+/// ```text
+/// version = 0: Unlocked (even)
+/// version = 1: Write-locked (odd)
+/// version = 2: Unlocked (even), one write completed
+/// version = 3: Write-locked (odd)
+/// ...
+/// ```
+///
+/// The least significant bit indicates lock state:
+/// - Even (bit 0 = 0): No exclusive lock held
+/// - Odd (bit 0 = 1): Exclusive lock is held
+///
+/// # Thread Safety
+///
+/// The latch is `Send` if `T: Send` and `Sync` if `T: Send + Sync`.
 pub struct HybridLatch<T> {
+	/// Version counter for optimistic validation.
+	/// - Odd values indicate write lock is held
+	/// - Each exclusive lock acquire/release increments by 1
 	version: AtomicUsize,
+
+	/// Traditional RwLock for shared and exclusive access.
+	/// Note: The lock protects nothing directly (unit type) - the version
+	/// number and UnsafeCell provide the actual synchronization.
 	lock: RwLock<()>,
+
+	/// The protected data. Access is coordinated through the version and lock.
 	data: UnsafeCell<T>,
 }
 
+// SAFETY: HybridLatch can be sent between threads if T can be sent.
 unsafe impl<T: Send> Send for HybridLatch<T> {}
+
+// SAFETY: HybridLatch can be shared between threads if T is Send+Sync.
+// The latch provides its own synchronization.
 unsafe impl<T: Send + Sync> Sync for HybridLatch<T> {}
 
 impl<T> HybridLatch<T> {
-	/// Creates a new instance of a `HybridLatch<T>` which is unlocked.
+	/// Creates a new, unlocked `HybridLatch` containing the given data.
+	///
+	/// # Example
+	///
+	/// ```ignore
+	/// let latch = HybridLatch::new(42);
+	/// ```
 	#[inline]
 	pub fn new(data: T) -> HybridLatch<T> {
 		HybridLatch {
-			version: AtomicUsize::new(0),
+			version: AtomicUsize::new(0), // Start at 0 (even = unlocked)
 			data: UnsafeCell::new(data),
 			lock: RwLock::new(()),
 		}
 	}
 
-	/// Locks this `HybridLatch` with exclusive write access, blocking the thread until it can be
-	/// acquired.
+	// -----------------------------------------------------------------------
+	// Lock Acquisition Methods
+	// -----------------------------------------------------------------------
+
+	/// Acquires exclusive (write) access, blocking until available.
 	///
-	/// Returns an RAII guard which will release the exclusive access when dropped
+	/// The returned guard provides mutable access to the data. When dropped,
+	/// the lock is released and the version is incremented (invalidating
+	/// optimistic readers).
+	///
+	/// # Version Sequence
+	///
+	/// ```text
+	/// Before: version = 2n (even, unlocked)
+	/// After acquire: version = 2n+1 (odd, locked)
+	/// After drop: version = 2n+2 (even, unlocked)
+	/// ```
 	#[inline]
 	pub fn exclusive(&self) -> ExclusiveGuard<'_, T> {
+		// Acquire the write lock (blocks if held)
 		let guard = self.lock.write();
+
+		// Increment version to odd (signals "write in progress")
+		// This invalidates any optimistic readers who started before us
 		let version = self.version.load(Ordering::Relaxed) + 1;
 		self.version.store(version, Ordering::Release);
+
 		ExclusiveGuard {
 			latch: self,
 			guard,
@@ -90,14 +246,21 @@ impl<T> HybridLatch<T> {
 		}
 	}
 
-	/// Locks this `HybridLatch` with shared read access, blocking the thread until it can be
-	/// acquired.
+	/// Acquires shared (read) access, blocking until available.
 	///
-	/// Returns an RAII guard which will release the shared access when dropped
+	/// The returned guard provides immutable access to the data. Multiple
+	/// shared guards can exist simultaneously, but they block exclusive access.
+	///
+	/// Unlike optimistic access, shared access doesn't need validation - the
+	/// lock guarantees no concurrent writes.
 	#[inline]
 	pub fn shared(&self) -> SharedGuard<'_, T> {
+		// Acquire the read lock (blocks if write lock held)
 		let guard = self.lock.read();
+
+		// Capture current version (for debugging/assertions, not validation)
 		let version = self.version.load(Ordering::Relaxed);
+
 		SharedGuard {
 			latch: self,
 			guard,
@@ -106,31 +269,54 @@ impl<T> HybridLatch<T> {
 		}
 	}
 
-	/// Acquires optimistic read access from this `HybridLatch`, spinning until it can be acquired.
+	/// Acquires optimistic (non-blocking) read access, spinning if write-locked.
 	///
-	/// Optimistic access must be validated before performing any action based on a read of the
-	/// underlying data. See [`OptimisticGuard::recheck`] for the details.
+	/// This is the primary method for reading in the B+ tree. It captures the
+	/// current version and returns immediately if no writer holds the lock.
+	/// If a writer is active, it spins briefly waiting for the write to complete.
 	///
-	/// Returns an RAII guard which will NOT validate any accesses when dropped.
+	/// # Important
+	///
+	/// **All reads through the returned guard MUST be validated** with
+	/// [`OptimisticGuard::recheck`] before trusting the data. Failure to validate
+	/// can result in using garbage data.
+	///
+	/// # Spin Behavior
+	///
+	/// If the latch is write-locked (version is odd), this method spins:
+	/// 1. First 10 iterations: CPU spin loop
+	/// 2. Next 10 iterations: Thread yield
+	/// 3. After that: Keeps yielding and retrying
+	///
+	/// The spin is designed to be brief, as writes in the B+ tree are typically fast.
 	#[inline(never)]
 	pub fn optimistic_or_spin(&self) -> OptimisticGuard<'_, T> {
+		// Load current version
 		let mut version = self.version.load(Ordering::Acquire);
+
+		// Check if write-locked (odd version)
 		if (version & 1) == 1 {
+			// Write in progress - spin until it completes
 			let mut spinwait = SpinWait::new();
 			loop {
 				version = self.version.load(Ordering::Acquire);
 				if (version & 1) == 1 {
+					// Still locked - continue spinning
 					let result = spinwait.spin();
 					if !result {
+						// Exhausted spin budget - reset and keep trying
+						// (We don't give up because we need to acquire access)
 						spinwait.reset();
 					}
 					continue;
 				} else {
+					// Write completed - version is now even
 					break;
 				}
 			}
 		}
 
+		// Return optimistic guard with captured version
 		OptimisticGuard {
 			latch: self,
 			data: self.data.get(),
@@ -138,17 +324,21 @@ impl<T> HybridLatch<T> {
 		}
 	}
 
-	/// Tries to acquire optimistic read access from this `HybridLatch`, unwinding on contention.
+	/// Tries to acquire optimistic access, falling back to shared on contention.
 	///
-	/// Optimistic access must be validated before performing any action based on a read of the
-	/// underlying data. See [`OptimisticGuard::recheck`] for the details.
+	/// This is an alternative to `optimistic_or_spin` that uses blocking shared
+	/// access instead of spinning when a write is in progress.
 	///
-	/// Returns an RAII guard which will NOT validate any accesses when dropped.
+	/// # When to Use
+	///
+	/// Use when you prefer blocking over spinning, or when writes are expected
+	/// to be long-running.
 	#[inline]
 	#[allow(dead_code)]
 	pub fn optimistic_or_unwind(&self) -> OptimisticOrShared<'_, T> {
 		let version = self.version.load(Ordering::Acquire);
 		if (version & 1) == 1 {
+			// Write in progress - fall back to shared (blocking) access
 			let guard = self.lock.read();
 			let version = self.version.load(Ordering::Relaxed);
 			OptimisticOrShared::Shared(SharedGuard {
@@ -158,6 +348,7 @@ impl<T> HybridLatch<T> {
 				version,
 			})
 		} else {
+			// Not write-locked - use optimistic access
 			OptimisticOrShared::Optimistic(OptimisticGuard {
 				latch: self,
 				data: self.data.get(),
@@ -166,21 +357,17 @@ impl<T> HybridLatch<T> {
 		}
 	}
 
-	/// Tries to acquire optimistic read access from this `HybridLatch`, falling back to exclusive
-	/// access on contention.
+	/// Tries to acquire optimistic access, falling back to exclusive on contention.
 	///
-	/// Optimistic access must be validated before performing any action based on a read of the
-	/// underlying data. See [`OptimisticGuard::recheck`] for the details.
-	///
-	/// Acquiring exclusive access will may block the current thread. Reads or writes from exclusive access do not
-	/// need to be validated.
-	///
-	/// Returns either an [`OptimisticGuard`] or an [`ExclusiveGuard`] through the [`OptimisticOrExclusive`] enum.
+	/// This is useful when you need to read data but might need to modify it
+	/// based on what you read. If a write is in progress, you get exclusive
+	/// access and can proceed without re-reading.
 	#[inline]
 	#[allow(dead_code)]
 	pub fn optimistic_or_exclusive(&self) -> OptimisticOrExclusive<'_, T> {
 		let version = self.version.load(Ordering::Acquire);
 		if (version & 1) == 1 {
+			// Write in progress - fall back to exclusive access
 			let guard = self.lock.write();
 			let version = self.version.load(Ordering::Relaxed) + 1;
 			self.version.store(version, Ordering::Release);
@@ -191,6 +378,7 @@ impl<T> HybridLatch<T> {
 				version,
 			})
 		} else {
+			// Not write-locked - use optimistic access
 			OptimisticOrExclusive::Optimistic(OptimisticGuard {
 				latch: self,
 				data: self.data.get(),
@@ -201,57 +389,157 @@ impl<T> HybridLatch<T> {
 }
 
 impl<T> std::convert::AsMut<T> for HybridLatch<T> {
+	/// Returns mutable access to the data without any synchronization.
+	///
+	/// # Safety
+	///
+	/// This is only safe when you have `&mut self`, which guarantees
+	/// no other references exist.
 	#[inline]
 	fn as_mut(&mut self) -> &mut T {
+		// SAFETY: We have &mut self, so no other references exist
 		unsafe { &mut *self.data.get() }
 	}
 }
 
-/// Trait to allow using any guard when only read access is needed.
+// ===========================================================================
+// HybridGuard Trait
+// ===========================================================================
+
+/// A unified interface for all guard types.
+///
+/// This trait allows code to work with any guard type when it only needs
+/// read access. The key methods are:
+/// - `inner()`: Get a reference to the protected data
+/// - `recheck()`: Validate optimistic reads (may be a no-op for blocking guards)
+/// - `latch()`: Get a reference to the underlying latch
+///
+/// This is particularly useful in the B+ tree for `find_parent()` which
+/// accepts any guard type.
 pub trait HybridGuard<T> {
-	/// Allows read access to the underlying data, which must be validated before any side effects
+	/// Returns a reference to the underlying data.
+	///
+	/// **Warning**: For optimistic guards, this data may be inconsistent.
+	/// Always call `recheck()` before trusting the data.
 	fn inner(&self) -> &T;
 
-	/// Validates any accesses performed.
+	/// Validates all reads performed through this guard.
 	///
-	/// The user of a `HybridGuard` must validate all accesses because there is no guarantee of which
-	/// mode the accesses are being performed.
+	/// - For `OptimisticGuard`: Checks if version changed (may return `Err(Unwind)`)
+	/// - For `SharedGuard`/`ExclusiveGuard`: Always succeeds (blocking guarantees consistency)
 	///
-	/// If validation fails it returns [`error::Error::Unwind`].
+	/// # Errors
+	///
+	/// Returns `Err(error::Error::Unwind)` if validation fails, indicating
+	/// the caller should discard all read data and retry.
 	fn recheck(&self) -> error::Result<()>;
 
-	/// Returns a reference to the original `HybridLatch` struct
+	/// Returns a reference to the `HybridLatch` this guard is associated with.
+	///
+	/// Useful for operations like comparing latch pointers (identity checks)
+	/// or acquiring different lock types on the same latch.
 	fn latch(&self) -> &HybridLatch<T>;
 }
 
-/// Structure used to perform optimistic accesses and validation.
+// ===========================================================================
+// OptimisticGuard
+// ===========================================================================
+
+/// A guard for optimistic (non-blocking) read access.
+///
+/// This guard captures a version number when created and allows reading
+/// the protected data without blocking. However, because no lock is held,
+/// concurrent writers can modify the data at any time.
+///
+/// # Critical: Validation Required
+///
+/// **You MUST call `recheck()` before trusting any data read through this guard.**
+///
+/// The typical pattern is:
+///
+/// ```ignore
+/// let guard = latch.optimistic_or_spin();
+/// let value = guard.field;  // Read data (may be garbage!)
+/// guard.recheck()?;          // Validate the read
+/// // Now `value` is safe to use
+/// ```
+///
+/// # What Happens Without Validation
+///
+/// If you skip validation and a write occurred:
+/// - You might read partially-written data (torn reads)
+/// - You might read data that no longer exists
+/// - Your logic might behave incorrectly based on stale data
+/// - **This is undefined behavior** in the formal sense
+///
+/// # Version Check
+///
+/// `recheck()` compares the version captured at guard creation with the
+/// current version. If they differ, a write occurred (or is in progress),
+/// and the guard is invalid.
 pub struct OptimisticGuard<'a, T> {
+	/// Reference to the latch for version checking.
 	latch: &'a HybridLatch<T>,
+	/// Raw pointer to the data.
 	data: *const T,
+	/// Version captured at guard creation.
 	version: usize,
 }
 
+// SAFETY: OptimisticGuard can be shared if T is Sync.
+// Even though it holds a raw pointer, access is read-only and
+// coordinated through version checking.
 unsafe impl<'a, T: Sync> Sync for OptimisticGuard<'a, T> {}
 
 impl<'a, T> OptimisticGuard<'a, T> {
-	/// Validates all previous optimistic accesses since the creation of the guard,
-	/// if validation fails an [`error::Error::Unwind`] is returned to signal that the
-	/// stack should be unwinded (by conditional returns) to a safe state.
+	/// Validates all reads performed through this guard.
+	///
+	/// This is the **critical** method that makes optimistic reads safe.
+	/// It checks if the latch's version has changed since this guard was created.
+	///
+	/// # Returns
+	///
+	/// - `Ok(())`: Version unchanged - all reads are valid
+	/// - `Err(Error::Unwind)`: Version changed - discard all reads and retry
+	///
+	/// # Example
+	///
+	/// ```ignore
+	/// let guard = latch.optimistic_or_spin();
+	/// let data = guard.some_field;  // Potentially invalid read
+	/// guard.recheck()?;              // Validate
+	/// process(data);                 // Safe to use data now
+	/// ```
 	#[inline]
 	pub fn recheck(&self) -> error::Result<()> {
+		// Compare current version with captured version
+		// If they differ, a write occurred and our reads are invalid
 		if self.version != self.latch.version.load(Ordering::Acquire) {
 			return Err(error::Error::Unwind);
 		}
 		Ok(())
 	}
 
-	/// Tries to acquire shared access after validation of all previous optimistic accesses on
-	/// this guard.
+	/// Upgrades to a shared (blocking read) guard after validation.
 	///
-	/// If validation fails it returns [`error::Error::Unwind`].
+	/// This is useful when you want to "lock in" your position after
+	/// optimistically finding what you're looking for.
+	///
+	/// # Algorithm
+	///
+	/// 1. Try to acquire read lock (non-blocking try_read)
+	/// 2. Re-validate version hasn't changed
+	/// 3. Return SharedGuard if both succeed
+	///
+	/// # Returns
+	///
+	/// - `Ok(SharedGuard)`: Successfully upgraded
+	/// - `Err(Unwind)`: Lock couldn't be acquired or version changed
 	#[inline]
 	pub fn to_shared(self) -> error::Result<SharedGuard<'a, T>> {
+		// Try to acquire read lock without blocking
 		if let Some(guard) = self.latch.lock.try_read() {
+			// Double-check version hasn't changed while we acquired the lock
 			if self.version != self.latch.version.load(Ordering::Relaxed) {
 				return Err(error::Error::Unwind);
 			}
@@ -263,20 +551,30 @@ impl<'a, T> OptimisticGuard<'a, T> {
 				version: self.version,
 			})
 		} else {
+			// Lock is held by a writer - can't upgrade
 			Err(error::Error::Unwind)
 		}
 	}
 
-	/// Tries to acquire exclusive access after validation.
+	/// Upgrades to an exclusive (blocking write) guard after validation.
 	///
-	/// If validation fails it returns [`error::Error::Unwind`].
+	/// Similar to `to_shared`, but acquires write access. This increments
+	/// the version number, invalidating other optimistic readers.
+	///
+	/// # Returns
+	///
+	/// - `Ok(ExclusiveGuard)`: Successfully upgraded
+	/// - `Err(Unwind)`: Lock couldn't be acquired or version changed
 	#[inline]
 	pub fn to_exclusive(self) -> error::Result<ExclusiveGuard<'a, T>> {
+		// Try to acquire write lock without blocking
 		if let Some(guard) = self.latch.lock.try_write() {
+			// Validate version hasn't changed
 			if self.version != self.latch.version.load(Ordering::Relaxed) {
 				return Err(error::Error::Unwind);
 			}
 
+			// Increment version to odd (write in progress)
 			let version = self.version + 1;
 			self.latch.version.store(version, Ordering::Release);
 
@@ -287,11 +585,12 @@ impl<'a, T> OptimisticGuard<'a, T> {
 				version,
 			})
 		} else {
+			// Lock is held - can't upgrade
 			Err(error::Error::Unwind)
 		}
 	}
 
-	/// Returns a reference to the original `HybridLatch` struct
+	/// Returns a reference to the underlying latch.
 	pub fn latch(&self) -> &'a HybridLatch<T> {
 		self.latch
 	}
@@ -300,7 +599,12 @@ impl<'a, T> OptimisticGuard<'a, T> {
 impl<'a, T> std::ops::Deref for OptimisticGuard<'a, T> {
 	type Target = T;
 
+	/// Dereferences to the underlying data.
+	///
+	/// **Warning**: The data may be inconsistent! Always `recheck()` after reading.
 	fn deref(&self) -> &T {
+		// SAFETY: The pointer is valid for the latch's lifetime.
+		// However, the DATA may be inconsistent - caller must validate.
 		unsafe { &*self.data }
 	}
 }
@@ -317,32 +621,74 @@ impl<'a, T> HybridGuard<T> for OptimisticGuard<'a, T> {
 	}
 }
 
-/// RAII structure used to release the exclusive write access of a latch when dropped.
+// ===========================================================================
+// ExclusiveGuard
+// ===========================================================================
+
+/// RAII guard for exclusive (write) access to a latch.
+///
+/// This guard provides mutable access to the protected data. While held:
+/// - No other readers or writers can access the data
+/// - The version number is odd, invalidating optimistic readers
+///
+/// When dropped, the version is incremented again (becoming even), and
+/// the write lock is released.
+///
+/// # Version Lifecycle
+///
+/// ```text
+/// Acquire: version 2n -> 2n+1 (odd, write in progress)
+/// Drop:    version 2n+1 -> 2n+2 (even, unlocked)
+/// ```
 pub struct ExclusiveGuard<'a, T> {
+	/// Reference to the latch.
 	latch: &'a HybridLatch<T>,
+	/// The actual RwLock write guard (ensures mutual exclusion).
 	#[allow(dead_code)]
 	guard: RwLockWriteGuard<'a, ()>,
+	/// Mutable pointer to the data.
 	data: *mut T,
+	/// Version at acquisition (odd).
 	version: usize,
 }
 
+// SAFETY: ExclusiveGuard can be shared if T is Sync (though mutable ops need &mut self)
 unsafe impl<'a, T: Sync> Sync for ExclusiveGuard<'a, T> {}
 
 impl<'a, T> ExclusiveGuard<'a, T> {
-	/// A sanity assertion, exclusive guards do not need to be validated
+	/// Debug assertion that we still own the lock.
+	///
+	/// This is a sanity check - exclusive guards don't need validation
+	/// because the lock guarantees exclusive access.
 	#[inline]
 	pub fn recheck(&self) {
 		assert!(self.version == self.latch.version.load(Ordering::Relaxed));
 	}
 
-	/// Unlocks the `HybridLatch` returning a [`OptimisticGuard`] in the current version
+	/// Releases the write lock and returns an optimistic guard.
+	///
+	/// This is useful when you've finished writing and want to continue
+	/// reading without blocking other readers. The returned optimistic
+	/// guard has the new (post-write) version.
+	///
+	/// # Version Sequence
+	///
+	/// ```text
+	/// Before unlock: version = 2n+1 (odd, locked)
+	/// After unlock:  version = 2n+2 (even, unlocked)
+	/// Returned guard has version 2n+2
+	/// ```
 	#[inline]
 	pub fn unlock(self) -> OptimisticGuard<'a, T> {
+		// The version will become self.version + 1 after drop
 		let new_version = self.version + 1;
 		let latch = self.latch;
 		let data = self.data;
-		// The version is incremented in drop
+
+		// Drop self, which increments version and releases lock
 		drop(self);
+
+		// Return optimistic guard with the new version
 		OptimisticGuard {
 			latch,
 			data,
@@ -350,32 +696,42 @@ impl<'a, T> ExclusiveGuard<'a, T> {
 		}
 	}
 
-	/// Returns a reference to the original `HybridLatch` struct
+	/// Returns a reference to the underlying latch.
 	pub fn latch(&self) -> &'a HybridLatch<T> {
 		self.latch
 	}
 }
 
 impl<'a, T> Drop for ExclusiveGuard<'a, T> {
+	/// Releases the exclusive lock and increments the version.
+	///
+	/// The version increment is critical - it signals to any optimistic
+	/// readers that started during our write that their reads are invalid.
 	#[inline]
 	fn drop(&mut self) {
+		// Increment version to even (write complete)
 		let new_version = self.version + 1;
 		self.latch.version.store(new_version, Ordering::Release);
+		// RwLockWriteGuard is dropped automatically, releasing the lock
 	}
 }
 
 impl<'a, T> std::ops::Deref for ExclusiveGuard<'a, T> {
 	type Target = T;
 
+	/// Returns an immutable reference to the data.
 	#[inline]
 	fn deref(&self) -> &T {
+		// SAFETY: We hold the exclusive lock, so no concurrent access
 		unsafe { &*self.data }
 	}
 }
 
 impl<'a, T> std::ops::DerefMut for ExclusiveGuard<'a, T> {
+	/// Returns a mutable reference to the data.
 	#[inline]
 	fn deref_mut(&mut self) -> &mut T {
+		// SAFETY: We hold the exclusive lock, so no concurrent access
 		unsafe { &mut *self.data }
 	}
 }
@@ -383,6 +739,7 @@ impl<'a, T> std::ops::DerefMut for ExclusiveGuard<'a, T> {
 impl<'a, T> std::convert::AsMut<T> for ExclusiveGuard<'a, T> {
 	#[inline]
 	fn as_mut(&mut self) -> &mut T {
+		// SAFETY: Same as DerefMut
 		unsafe { &mut *self.data }
 	}
 }
@@ -392,6 +749,7 @@ impl<'a, T> HybridGuard<T> for ExclusiveGuard<'a, T> {
 		self
 	}
 	fn recheck(&self) -> error::Result<()> {
+		// Exclusive guards never fail validation
 		self.recheck();
 		Ok(())
 	}
@@ -400,25 +758,48 @@ impl<'a, T> HybridGuard<T> for ExclusiveGuard<'a, T> {
 	}
 }
 
-/// RAII structure used to release the shared read access of a latch when dropped.
+// ===========================================================================
+// SharedGuard
+// ===========================================================================
+
+/// RAII guard for shared (read) access to a latch.
+///
+/// This guard provides immutable access to the protected data. While held:
+/// - Other readers can access the data (shared access)
+/// - Writers are blocked
+/// - The version number remains stable (no writes occurring)
+///
+/// Unlike optimistic guards, shared guards don't need validation - the
+/// lock guarantees no concurrent writes.
 pub struct SharedGuard<'a, T> {
+	/// Reference to the latch.
 	latch: &'a HybridLatch<T>,
+	/// The actual RwLock read guard (blocks writers).
 	#[allow(dead_code)]
 	guard: RwLockReadGuard<'a, ()>,
+	/// Immutable pointer to the data.
 	data: *const T,
+	/// Version at acquisition (should be even, no write in progress).
 	version: usize,
 }
 
+// SAFETY: SharedGuard can be shared if T is Sync
 unsafe impl<'a, T: Sync> Sync for SharedGuard<'a, T> {}
 
 impl<'a, T> SharedGuard<'a, T> {
-	/// A sanity assertion, shared guards do not need to be validated
+	/// Debug assertion that the version hasn't changed.
+	///
+	/// This should never fail for a shared guard (we block writers),
+	/// but it's useful as a sanity check.
 	#[inline]
 	pub fn recheck(&self) {
 		assert!(self.version == self.latch.version.load(Ordering::Relaxed));
 	}
 
-	/// Unlocks the `HybridLatch` returning a [`OptimisticGuard`] in the current version
+	/// Releases the shared lock and returns an optimistic guard.
+	///
+	/// The returned guard has the same version as this guard (no writes
+	/// occurred while we held the lock).
 	#[inline]
 	pub fn unlock(self) -> OptimisticGuard<'a, T> {
 		OptimisticGuard {
@@ -428,7 +809,10 @@ impl<'a, T> SharedGuard<'a, T> {
 		}
 	}
 
-	/// Returns a [`OptimisticGuard`] in the current version without consuming the original `SharedGuard`
+	/// Creates an optimistic guard without releasing this shared guard.
+	///
+	/// This is useful when you want to pass an optimistic guard to a function
+	/// but continue holding the shared lock.
 	#[inline]
 	#[allow(dead_code)]
 	pub fn as_optimistic(&self) -> OptimisticGuard<'_, T> {
@@ -439,7 +823,7 @@ impl<'a, T> SharedGuard<'a, T> {
 		}
 	}
 
-	/// Returns a reference to the original `HybridLatch` struct
+	/// Returns a reference to the underlying latch.
 	pub fn latch(&self) -> &'a HybridLatch<T> {
 		self.latch
 	}
@@ -448,8 +832,10 @@ impl<'a, T> SharedGuard<'a, T> {
 impl<'a, T> std::ops::Deref for SharedGuard<'a, T> {
 	type Target = T;
 
+	/// Returns an immutable reference to the data.
 	#[inline]
 	fn deref(&self) -> &T {
+		// SAFETY: We hold the read lock, blocking writers
 		unsafe { &*self.data }
 	}
 }
@@ -459,6 +845,7 @@ impl<'a, T> HybridGuard<T> for SharedGuard<'a, T> {
 		self
 	}
 	fn recheck(&self) -> error::Result<()> {
+		// Shared guards never fail validation (we block writers)
 		self.recheck();
 		Ok(())
 	}
@@ -467,15 +854,31 @@ impl<'a, T> HybridGuard<T> for SharedGuard<'a, T> {
 	}
 }
 
-/// Either an `OptimisticGuard` or a `SharedGuard`.
+// ===========================================================================
+// Fallback Enums
+// ===========================================================================
+
+/// Result of `optimistic_or_unwind()` - either optimistic or shared access.
+///
+/// This enum is returned when you want optimistic access but are willing to
+/// fall back to shared (blocking) access if contention is detected.
+///
+/// Use the unified `recheck()` method to validate regardless of which
+/// variant you have.
 #[allow(dead_code)]
 pub enum OptimisticOrShared<'a, T> {
+	/// Got optimistic access (no blocking).
 	Optimistic(OptimisticGuard<'a, T>),
+	/// Fell back to shared access (blocking, but read-only).
 	Shared(SharedGuard<'a, T>),
 }
 
 #[allow(dead_code)]
 impl<'a, T> OptimisticOrShared<'a, T> {
+	/// Validates reads through this guard.
+	///
+	/// - For `Optimistic`: Actually validates (may return `Err(Unwind)`)
+	/// - For `Shared`: Always succeeds (blocking guarantees consistency)
 	#[inline]
 	pub fn recheck(&self) -> error::Result<()> {
 		match self {
@@ -488,15 +891,27 @@ impl<'a, T> OptimisticOrShared<'a, T> {
 	}
 }
 
-/// Either an `OptimisticGuard` or an `ExclusiveGuard`.
+/// Result of `optimistic_or_exclusive()` - either optimistic or exclusive access.
+///
+/// This enum is returned when you want optimistic access but are willing to
+/// fall back to exclusive (blocking write) access if contention is detected.
+///
+/// This is useful when you might need to write based on what you read - if
+/// you get exclusive access, you can proceed without re-reading.
 #[allow(dead_code)]
 pub enum OptimisticOrExclusive<'a, T> {
+	/// Got optimistic access (no blocking).
 	Optimistic(OptimisticGuard<'a, T>),
+	/// Fell back to exclusive access (blocking write access).
 	Exclusive(ExclusiveGuard<'a, T>),
 }
 
 #[allow(dead_code)]
 impl<'a, T> OptimisticOrExclusive<'a, T> {
+	/// Validates reads through this guard.
+	///
+	/// - For `Optimistic`: Actually validates (may return `Err(Unwind)`)
+	/// - For `Exclusive`: Always succeeds (we have write access)
 	#[inline]
 	pub fn recheck(&self) -> error::Result<()> {
 		match self {
