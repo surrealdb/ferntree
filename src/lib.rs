@@ -1282,6 +1282,110 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		}
 	}
 
+	/// Returns `true` if the tree contains the specified key.
+	///
+	/// This is a convenience method equivalent to `lookup(key, |_| ()).is_some()`.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, &str> = Tree::new();
+	/// tree.insert(1, "one");
+	///
+	/// assert!(tree.contains_key(&1));
+	/// assert!(!tree.contains_key(&2));
+	/// ```
+	pub fn contains_key<Q>(&self, key: &Q) -> bool
+	where
+		K: Borrow<Q> + Ord,
+		Q: ?Sized + Ord,
+	{
+		self.lookup(key, |_| ()).is_some()
+	}
+
+	/// Returns a clone of the value corresponding to the key.
+	///
+	/// This is a convenience method equivalent to `lookup(key, |v| v.clone())`.
+	/// For more control over what is extracted, use [`lookup`](Self::lookup).
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, String> = Tree::new();
+	/// tree.insert(1, "one".to_string());
+	///
+	/// assert_eq!(tree.get(&1), Some("one".to_string()));
+	/// assert_eq!(tree.get(&2), None);
+	/// ```
+	pub fn get<Q>(&self, key: &Q) -> Option<V>
+	where
+		K: Borrow<Q> + Ord,
+		Q: ?Sized + Ord,
+		V: Clone,
+	{
+		self.lookup(key, |v| v.clone())
+	}
+
+	/// Returns the first (minimum) key-value pair in the tree.
+	///
+	/// The closure receives references to the key and value and should extract
+	/// whatever data is needed. Returns `None` if the tree is empty.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, &str> = Tree::new();
+	/// tree.insert(3, "three");
+	/// tree.insert(1, "one");
+	/// tree.insert(2, "two");
+	///
+	/// let first = tree.first_key_value(|k, v| (*k, *v));
+	/// assert_eq!(first, Some((1, "one")));
+	/// ```
+	pub fn first_key_value<R, F>(&self, f: F) -> Option<R>
+	where
+		K: Ord,
+		F: Fn(&K, &V) -> R,
+	{
+		let mut iter = self.raw_iter();
+		iter.seek_to_first();
+		iter.next().map(|(k, v)| f(k, v))
+	}
+
+	/// Returns the last (maximum) key-value pair in the tree.
+	///
+	/// The closure receives references to the key and value and should extract
+	/// whatever data is needed. Returns `None` if the tree is empty.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, &str> = Tree::new();
+	/// tree.insert(1, "one");
+	/// tree.insert(3, "three");
+	/// tree.insert(2, "two");
+	///
+	/// let last = tree.last_key_value(|k, v| (*k, *v));
+	/// assert_eq!(last, Some((3, "three")));
+	/// ```
+	pub fn last_key_value<R, F>(&self, f: F) -> Option<R>
+	where
+		K: Ord,
+		F: Fn(&K, &V) -> R,
+	{
+		let mut iter = self.raw_iter();
+		iter.seek_to_last();
+		iter.prev().map(|(k, v)| f(k, v))
+	}
+
 	// -----------------------------------------------------------------------
 	// Public API: Write Operations
 	// -----------------------------------------------------------------------
@@ -1383,6 +1487,50 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		// This handles splits automatically
 		let mut iter = self.raw_iter_mut();
 		iter.insert(key, value)
+	}
+
+	/// Removes all entries from the tree.
+	///
+	/// After calling this method, the tree will be empty with height 1.
+	/// Old nodes are scheduled for deferred destruction via epoch-based
+	/// reclamation, ensuring concurrent readers can safely finish.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, &str> = Tree::new();
+	/// tree.insert(1, "one");
+	/// tree.insert(2, "two");
+	/// assert_eq!(tree.len(), 2);
+	///
+	/// tree.clear();
+	/// assert!(tree.is_empty());
+	/// assert_eq!(tree.height(), 1);
+	/// ```
+	pub fn clear(&self)
+	where
+		K: Ord,
+	{
+		let eg = epoch::pin();
+
+		// Acquire exclusive access to root
+		let mut tree_guard = self.root.exclusive();
+
+		// Schedule old root for deferred destruction
+		let old_root = tree_guard.load(Ordering::Acquire, &eg);
+		if !old_root.is_null() {
+			// SAFETY: The epoch guard ensures safe reclamation
+			unsafe { eg.defer_destroy(old_root) };
+		}
+
+		// Create fresh empty leaf as new root
+		let new_root = Owned::new(HybridLatch::new(Node::Leaf(LeafNode::new())));
+		*tree_guard = Atomic::from(new_root);
+
+		// Reset height to 1
+		self.height.store(1, Ordering::Release);
 	}
 
 	// -----------------------------------------------------------------------
@@ -4173,5 +4321,226 @@ mod tests {
 		let internal: InternalNode<i32, i32, 64, 64> = InternalNode::new();
 		let node: Node<i32, i32, 64, 64> = Node::Internal(internal);
 		assert!(node.sample_key().is_none());
+	}
+
+	// -----------------------------------------------------------------------
+	// Convenience Method Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn contains_key_returns_true_for_existing() {
+		let tree: Tree<i32, &str> = Tree::new();
+		tree.insert(1, "one");
+		tree.insert(2, "two");
+		tree.insert(3, "three");
+
+		assert!(tree.contains_key(&1));
+		assert!(tree.contains_key(&2));
+		assert!(tree.contains_key(&3));
+	}
+
+	#[test]
+	fn contains_key_returns_false_for_missing() {
+		let tree: Tree<i32, &str> = Tree::new();
+		tree.insert(1, "one");
+
+		assert!(!tree.contains_key(&0));
+		assert!(!tree.contains_key(&2));
+		assert!(!tree.contains_key(&100));
+	}
+
+	#[test]
+	fn contains_key_empty_tree() {
+		let tree: Tree<i32, &str> = Tree::new();
+		assert!(!tree.contains_key(&1));
+	}
+
+	#[test]
+	fn get_returns_cloned_value() {
+		let tree: Tree<i32, String> = Tree::new();
+		tree.insert(1, "one".to_string());
+		tree.insert(2, "two".to_string());
+
+		assert_eq!(tree.get(&1), Some("one".to_string()));
+		assert_eq!(tree.get(&2), Some("two".to_string()));
+		assert_eq!(tree.get(&3), None);
+	}
+
+	#[test]
+	fn get_empty_tree() {
+		let tree: Tree<i32, String> = Tree::new();
+		assert_eq!(tree.get(&1), None);
+	}
+
+	#[test]
+	fn first_key_value_returns_minimum() {
+		let tree: Tree<i32, &str> = Tree::new();
+		tree.insert(3, "three");
+		tree.insert(1, "one");
+		tree.insert(2, "two");
+
+		let first = tree.first_key_value(|k, v| (*k, *v));
+		assert_eq!(first, Some((1, "one")));
+	}
+
+	#[test]
+	fn first_key_value_empty_tree() {
+		let tree: Tree<i32, &str> = Tree::new();
+		let first = tree.first_key_value(|k, v| (*k, *v));
+		assert_eq!(first, None);
+	}
+
+	#[test]
+	fn first_key_value_single_entry() {
+		let tree: Tree<i32, &str> = Tree::new();
+		tree.insert(42, "answer");
+
+		let first = tree.first_key_value(|k, v| (*k, *v));
+		assert_eq!(first, Some((42, "answer")));
+	}
+
+	#[test]
+	fn last_key_value_returns_maximum() {
+		let tree: Tree<i32, &str> = Tree::new();
+		tree.insert(1, "one");
+		tree.insert(3, "three");
+		tree.insert(2, "two");
+
+		let last = tree.last_key_value(|k, v| (*k, *v));
+		assert_eq!(last, Some((3, "three")));
+	}
+
+	#[test]
+	fn last_key_value_empty_tree() {
+		let tree: Tree<i32, &str> = Tree::new();
+		let last = tree.last_key_value(|k, v| (*k, *v));
+		assert_eq!(last, None);
+	}
+
+	#[test]
+	fn last_key_value_single_entry() {
+		let tree: Tree<i32, &str> = Tree::new();
+		tree.insert(42, "answer");
+
+		let last = tree.last_key_value(|k, v| (*k, *v));
+		assert_eq!(last, Some((42, "answer")));
+	}
+
+	#[test]
+	fn clear_empties_tree() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..100 {
+			tree.insert(i, i * 10);
+		}
+
+		assert_eq!(tree.len(), 100);
+		assert!(tree.height() > 1);
+
+		tree.clear();
+
+		assert!(tree.is_empty());
+		assert_eq!(tree.height(), 1);
+		assert_eq!(tree.len(), 0);
+	}
+
+	#[test]
+	fn clear_empty_tree() {
+		let tree: Tree<i32, i32> = Tree::new();
+		tree.clear();
+
+		assert!(tree.is_empty());
+		assert_eq!(tree.height(), 1);
+	}
+
+	#[test]
+	fn clear_then_insert() {
+		let tree: Tree<i32, &str> = Tree::new();
+		tree.insert(1, "one");
+		tree.insert(2, "two");
+
+		tree.clear();
+		assert!(tree.is_empty());
+
+		// Can insert again after clear
+		tree.insert(3, "three");
+		tree.insert(4, "four");
+
+		assert_eq!(tree.len(), 2);
+		assert_eq!(tree.get(&3), Some("three"));
+		assert_eq!(tree.get(&4), Some("four"));
+		assert_eq!(tree.get(&1), None); // Old entries gone
+	}
+
+	#[test]
+	fn contains_key_with_borrowed_key() {
+		let tree: Tree<String, i32> = Tree::new();
+		tree.insert("hello".to_string(), 42);
+		tree.insert("world".to_string(), 99);
+
+		// Lookup using &str instead of String
+		assert!(tree.contains_key("hello"));
+		assert!(tree.contains_key("world"));
+		assert!(!tree.contains_key("missing"));
+	}
+
+	#[test]
+	fn get_with_borrowed_key() {
+		let tree: Tree<String, i32> = Tree::new();
+		tree.insert("hello".to_string(), 42);
+
+		// Lookup using &str instead of String
+		assert_eq!(tree.get("hello"), Some(42));
+		assert_eq!(tree.get("missing"), None);
+	}
+
+	#[test]
+	fn first_key_value_multilevel_tree() {
+		let tree: Tree<i32, i32> = Tree::new();
+
+		// Insert enough to cause splits and create multiple levels
+		for i in (0..200).rev() {
+			tree.insert(i, i * 10);
+		}
+
+		tree.assert_invariants();
+		assert!(tree.height() > 1);
+
+		let first = tree.first_key_value(|k, v| (*k, *v));
+		assert_eq!(first, Some((0, 0)));
+	}
+
+	#[test]
+	fn last_key_value_multilevel_tree() {
+		let tree: Tree<i32, i32> = Tree::new();
+
+		// Insert enough to cause splits and create multiple levels
+		for i in 0..200 {
+			tree.insert(i, i * 10);
+		}
+
+		tree.assert_invariants();
+		assert!(tree.height() > 1);
+
+		let last = tree.last_key_value(|k, v| (*k, *v));
+		assert_eq!(last, Some((199, 1990)));
+	}
+
+	#[test]
+	fn clear_maintains_invariants() {
+		let tree: Tree<i32, i32> = Tree::new();
+
+		for i in 0..200 {
+			tree.insert(i, i);
+		}
+
+		tree.assert_invariants();
+		tree.clear();
+		tree.assert_invariants();
+
+		// Insert again and verify invariants still hold
+		for i in 0..50 {
+			tree.insert(i, i * 2);
+		}
+		tree.assert_invariants();
 	}
 }
