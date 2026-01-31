@@ -330,9 +330,9 @@ fn stress_concurrent_insert_overlapping_ranges() {
 		.map(|t| {
 			let tree = Arc::clone(&tree);
 			thread::spawn(move || {
-				let mut rng = rand::thread_rng();
+				let mut rng = rand::rng();
 				for _ in 0..entries_per_thread {
-					let key: i32 = rng.gen_range(0..key_range);
+					let key: i32 = rng.random_range(0..key_range);
 					tree.insert(key, t);
 				}
 			})
@@ -369,10 +369,10 @@ fn stress_concurrent_mixed_operations() {
 		.map(|t| {
 			let tree = Arc::clone(&tree);
 			thread::spawn(move || {
-				let mut rng = rand::thread_rng();
+				let mut rng = rand::rng();
 				for _ in 0..operations_per_thread {
-					let key: i32 = rng.gen_range(0..key_range);
-					let op: u8 = rng.gen_range(0..3);
+					let key: i32 = rng.random_range(0..key_range);
+					let op: u8 = rng.random_range(0..3);
 
 					match op {
 						0 => {
@@ -453,12 +453,12 @@ fn stress_sustained_mixed_operations() {
 			let tree = Arc::clone(&tree);
 			let running = Arc::clone(&running);
 			thread::spawn(move || {
-				let mut rng = rand::thread_rng();
+				let mut rng = rand::rng();
 				let mut ops = 0u64;
 
 				while running.load(Ordering::Relaxed) == 1 {
-					let key: i32 = rng.gen_range(0..1000);
-					let op: u8 = rng.gen_range(0..10);
+					let key: i32 = rng.random_range(0..1000);
+					let op: u8 = rng.random_range(0..10);
 
 					match op {
 						0..=3 => {
@@ -553,12 +553,12 @@ fn stress_producer_consumer() {
 			let tree = Arc::clone(&tree);
 			let produced = Arc::clone(&produced);
 			thread::spawn(move || {
-				let mut rng = rand::thread_rng();
+				let mut rng = rand::rng();
 				let mut found = 0u64;
 				let total_entries = num_producers * entries_per_producer;
 
 				while produced.load(Ordering::Relaxed) < total_entries as usize {
-					let key: i32 = rng.gen_range(0..total_entries);
+					let key: i32 = rng.random_range(0..total_entries);
 					if tree.lookup(&key, |v| *v).is_some() {
 						found += 1;
 					}

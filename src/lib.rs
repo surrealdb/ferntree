@@ -1261,7 +1261,9 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 					}
 				} else {
 					// find_leaf should always return a leaf node
-					unreachable!("find_leaf returned non-leaf node - tree traversal invariant violated")
+					unreachable!(
+						"find_leaf returned non-leaf node - tree traversal invariant violated"
+					)
 				}
 			};
 
@@ -1487,8 +1489,10 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 						// Choose the middle position for the split
 						let split_pos = root_internal_node.len / 2;
-						let split_key =
-							root_internal_node.key_at(split_pos).expect("split position must be within node bounds").clone();
+						let split_key = root_internal_node
+							.key_at(split_pos)
+							.expect("split position must be within node bounds")
+							.clone();
 
 						// Allocate the new right sibling (also internal)
 						let mut new_right_node_owned =
@@ -1524,8 +1528,10 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 						// Choose the middle position for the split
 						let split_pos = root_leaf_node.len / 2;
-						let split_key =
-							root_leaf_node.key_at(split_pos).expect("split position must be within node bounds").clone();
+						let split_key = root_leaf_node
+							.key_at(split_pos)
+							.expect("split position must be within node bounds")
+							.clone();
 
 						// Allocate the new right sibling (also a leaf)
 						let mut new_right_node_owned =
@@ -1600,8 +1606,10 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 							// Choose split position
 							let split_pos = left_internal.len / 2;
-							let split_key =
-								left_internal.key_at(split_pos).expect("split position must be within node bounds").clone();
+							let split_key = left_internal
+								.key_at(split_pos)
+								.expect("split position must be within node bounds")
+								.clone();
 
 							// Allocate the new right sibling
 							let mut new_right_node_owned =
@@ -1649,8 +1657,10 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 							// Choose split position
 							let split_pos = left_leaf.len / 2;
-							let split_key =
-								left_leaf.key_at(split_pos).expect("split position must be within node bounds").clone();
+							let split_key = left_leaf
+								.key_at(split_pos)
+								.expect("split position must be within node bounds")
+								.clone();
 
 							// Allocate the new right sibling
 							let mut new_right_node_owned =
@@ -1909,111 +1919,113 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 				// ===============================================================
 				// Try 2: Merge with RIGHT sibling (if left merge failed)
 				// ===============================================================
-				let merge_succeeded =
-					if !merge_succeeded && parent_len > 0 && (pos + 1) <= parent_len {
-						// Right sibling exists - try to merge
+				let merge_succeeded = if !merge_succeeded
+					&& parent_len > 0
+					&& (pos + 1) <= parent_len
+				{
+					// Right sibling exists - try to merge
 
-						let r_swip = parent_guard.as_internal().edge_at(pos + 1)?;
-						let right_guard = GenericTree::lock_coupling(&parent_guard, r_swip, eg)?;
+					let r_swip = parent_guard.as_internal().edge_at(pos + 1)?;
+					let right_guard = GenericTree::lock_coupling(&parent_guard, r_swip, eg)?;
 
-						if !right_guard.can_merge_with(&target_guard) {
-							// Can't merge with right sibling either
-							right_guard.recheck()?;
-							target_guard.recheck()?;
-							false
-						} else {
-							// Upgrade to exclusive
-							let mut parent_guard_x = parent_guard.to_exclusive()?;
-							let mut target_guard_x = target_guard.to_exclusive()?;
-							let mut right_guard_x = right_guard.to_exclusive()?;
+					if !right_guard.can_merge_with(&target_guard) {
+						// Can't merge with right sibling either
+						right_guard.recheck()?;
+						target_guard.recheck()?;
+						false
+					} else {
+						// Upgrade to exclusive
+						let mut parent_guard_x = parent_guard.to_exclusive()?;
+						let mut target_guard_x = target_guard.to_exclusive()?;
+						let mut right_guard_x = right_guard.to_exclusive()?;
 
-							match target_guard_x.as_mut() {
-								Node::Leaf(ref mut target_leaf) => {
-									// Merging leaf nodes (target absorbs right)
-									assert!(right_guard_x.is_leaf());
+						match target_guard_x.as_mut() {
+							Node::Leaf(ref mut target_leaf) => {
+								// Merging leaf nodes (target absorbs right)
+								assert!(right_guard_x.is_leaf());
 
-									if !target_leaf.merge(right_guard_x.as_leaf_mut()) {
-										parent_guard = parent_guard_x.unlock();
-										let _ = target_guard_x.unlock();
-										false
-									} else {
-										let parent_internal = parent_guard_x.as_internal_mut();
+								if !target_leaf.merge(right_guard_x.as_leaf_mut()) {
+									parent_guard = parent_guard_x.unlock();
+									let _ = target_guard_x.unlock();
+									false
+								} else {
+									let parent_internal = parent_guard_x.as_internal_mut();
 
-										// Remove separator and schedule right node for destruction
-										if pos + 1 == parent_len {
-											let (_, left_edge) = parent_internal.remove_at(pos);
-											let dropped_edge = parent_internal
-												.upper_edge
-												.replace(left_edge)
-												.expect("parent upper_edge must exist during merge");
+									// Remove separator and schedule right node for destruction
+									if pos + 1 == parent_len {
+										let (_, left_edge) = parent_internal.remove_at(pos);
+										let dropped_edge = parent_internal
+											.upper_edge
+											.replace(left_edge)
+											.expect("parent upper_edge must exist during merge");
 
-											let shared = dropped_edge.load(Ordering::Relaxed, eg);
-											if !shared.is_null() {
-												unsafe { eg.defer_destroy(shared) };
-											}
-										} else {
-											let (_, left_edge) = parent_internal.remove_at(pos);
-											let dropped_edge = std::mem::replace(
-												&mut parent_internal.edges[pos as usize],
-												left_edge,
-											);
-
-											let shared = dropped_edge.load(Ordering::Relaxed, eg);
-											if !shared.is_null() {
-												unsafe { eg.defer_destroy(shared) };
-											}
+										let shared = dropped_edge.load(Ordering::Relaxed, eg);
+										if !shared.is_null() {
+											unsafe { eg.defer_destroy(shared) };
 										}
+									} else {
+										let (_, left_edge) = parent_internal.remove_at(pos);
+										let dropped_edge = std::mem::replace(
+											&mut parent_internal.edges[pos as usize],
+											left_edge,
+										);
 
-										parent_guard = parent_guard_x.unlock();
-										let _ = target_guard_x.unlock();
-										true
+										let shared = dropped_edge.load(Ordering::Relaxed, eg);
+										if !shared.is_null() {
+											unsafe { eg.defer_destroy(shared) };
+										}
 									}
+
+									parent_guard = parent_guard_x.unlock();
+									let _ = target_guard_x.unlock();
+									true
 								}
-								Node::Internal(target_internal) => {
-									// Merging internal nodes
-									assert!(!right_guard_x.is_leaf());
+							}
+							Node::Internal(target_internal) => {
+								// Merging internal nodes
+								assert!(!right_guard_x.is_leaf());
 
-									if !target_internal.merge(right_guard_x.as_internal_mut()) {
-										parent_guard = parent_guard_x.unlock();
-										let _ = target_guard_x.unlock();
-										false
-									} else {
-										let parent_internal = parent_guard_x.as_internal_mut();
+								if !target_internal.merge(right_guard_x.as_internal_mut()) {
+									parent_guard = parent_guard_x.unlock();
+									let _ = target_guard_x.unlock();
+									false
+								} else {
+									let parent_internal = parent_guard_x.as_internal_mut();
 
-										if pos + 1 == parent_len {
-											let (_, left_edge) = parent_internal.remove_at(pos);
-											let dropped_edge = parent_internal
-												.upper_edge
-												.replace(left_edge)
-												.expect("parent upper_edge must exist during merge");
+									if pos + 1 == parent_len {
+										let (_, left_edge) = parent_internal.remove_at(pos);
+										let dropped_edge = parent_internal
+											.upper_edge
+											.replace(left_edge)
+											.expect("parent upper_edge must exist during merge");
 
-											let shared = dropped_edge.load(Ordering::Relaxed, eg);
-											if !shared.is_null() {
-												unsafe { eg.defer_destroy(shared) };
-											}
-										} else {
-											let (_, left_edge) = parent_internal.remove_at(pos);
-											let dropped_edge = std::mem::replace(
-												&mut parent_internal.edges[pos as usize],
-												left_edge,
-											);
-
-											let shared = dropped_edge.load(Ordering::Relaxed, eg);
-											if !shared.is_null() {
-												unsafe { eg.defer_destroy(shared) };
-											}
+										let shared = dropped_edge.load(Ordering::Relaxed, eg);
+										if !shared.is_null() {
+											unsafe { eg.defer_destroy(shared) };
 										}
+									} else {
+										let (_, left_edge) = parent_internal.remove_at(pos);
+										let dropped_edge = std::mem::replace(
+											&mut parent_internal.edges[pos as usize],
+											left_edge,
+										);
 
-										parent_guard = parent_guard_x.unlock();
-										let _ = target_guard_x.unlock();
-										true
+										let shared = dropped_edge.load(Ordering::Relaxed, eg);
+										if !shared.is_null() {
+											unsafe { eg.defer_destroy(shared) };
+										}
 									}
+
+									parent_guard = parent_guard_x.unlock();
+									let _ = target_guard_x.unlock();
+									true
 								}
 							}
 						}
-					} else {
-						merge_succeeded
-					};
+					}
+				} else {
+					merge_succeeded
+				};
 
 				// ===============================================================
 				// Recursive: Check if parent also needs merging
@@ -2199,7 +2211,9 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 		match self {
 			Node::Leaf(ref leaf) => leaf,
 			Node::Internal(_) => {
-				unreachable!("as_leaf() called on internal node - this indicates a tree traversal bug")
+				unreachable!(
+					"as_leaf() called on internal node - this indicates a tree traversal bug"
+				)
 			}
 		}
 	}
@@ -2227,7 +2241,9 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 		match self {
 			Node::Leaf(ref mut leaf) => leaf,
 			Node::Internal(_) => {
-				unreachable!("as_leaf_mut() called on internal node - this indicates a tree traversal bug")
+				unreachable!(
+					"as_leaf_mut() called on internal node - this indicates a tree traversal bug"
+				)
 			}
 		}
 	}
@@ -2255,7 +2271,9 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 		match self {
 			Node::Internal(ref internal) => internal,
 			Node::Leaf(_) => {
-				unreachable!("as_internal() called on leaf node - this indicates a tree traversal bug")
+				unreachable!(
+					"as_internal() called on leaf node - this indicates a tree traversal bug"
+				)
 			}
 		}
 	}
@@ -2283,7 +2301,9 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 		match self {
 			Node::Internal(ref mut internal) => internal,
 			Node::Leaf(_) => {
-				unreachable!("as_internal_mut() called on leaf node - this indicates a tree traversal bug")
+				unreachable!(
+					"as_internal_mut() called on leaf node - this indicates a tree traversal bug"
+				)
 			}
 		}
 	}
@@ -2538,9 +2558,7 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 			return Err(error::Error::Unwind);
 		}
 		// SAFETY: We just checked bounds above
-		Ok(unsafe {
-			(self.keys.get_unchecked(pos), self.values.get_unchecked_mut(pos))
-		})
+		Ok(unsafe { (self.keys.get_unchecked(pos), self.values.get_unchecked_mut(pos)) })
 	}
 
 	/// Returns `true` if there's room for another entry.
@@ -2632,7 +2650,8 @@ impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
 	/// - `split_pos`: Position of the key that becomes the separator
 	pub(crate) fn split(&mut self, right: &mut LeafNode<K, V, LC>, split_pos: u16) {
 		// The key at split_pos becomes the boundary between left and right
-		let split_key = self.key_at(split_pos).expect("split position must be within node bounds").clone();
+		let split_key =
+			self.key_at(split_pos).expect("split position must be within node bounds").clone();
 
 		// Update fence keys:
 		// - Right's lower fence is the split key (exclusive)
@@ -3004,7 +3023,8 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	/// the left node's upper_edge.
 	pub(crate) fn split(&mut self, right: &mut InternalNode<K, V, IC, LC>, split_pos: u16) {
 		// Get the split key - this will be pushed up to the parent
-		let split_key = self.key_at(split_pos).expect("split position must be within node bounds").clone();
+		let split_key =
+			self.key_at(split_pos).expect("split position must be within node bounds").clone();
 
 		// Update fence keys
 		right.lower_fence = Some(split_key.clone());
@@ -3022,15 +3042,10 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 
 		// The edge at split_pos becomes our new upper_edge
 		// (it was pointing to children between K(split_pos-1) and K(split_pos))
-		self.upper_edge = Some(
-			self.edges
-				.pop()
-				.expect("edges non-empty: split requires at least one edge"),
-		);
+		self.upper_edge =
+			Some(self.edges.pop().expect("edges non-empty: split requires at least one edge"));
 		// Remove the key at split_pos (it's being pushed to parent)
-		self.keys
-			.pop()
-			.expect("keys non-empty: split requires at least one key");
+		self.keys.pop().expect("keys non-empty: split requires at least one key");
 
 		// Set sample keys for node relocation
 		self.sample_key = Some(self.keys[0].clone());
@@ -3080,15 +3095,14 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 		// Re-insert the separator key (was in parent, stored as right's lower_fence)
 		// This key goes between our old content and right's content
 		self.keys.push(
-		right
-			.lower_fence
-			.take()
-			.expect("merge requires right node to have lower_fence (separator key)"),
-	);
+			right
+				.lower_fence
+				.take()
+				.expect("merge requires right node to have lower_fence (separator key)"),
+		);
 
 		// Our old upper_edge becomes a regular edge (points to children < separator)
-		self.edges
-			.push(left_upper_edge.expect("merge requires left node to have upper_edge"));
+		self.edges.push(left_upper_edge.expect("merge requires left node to have upper_edge"));
 
 		// Append all of right's content
 		self.keys.extend(right.keys.drain(..));
@@ -3175,8 +3189,7 @@ impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
 				assert!(
 					is_leaf_level,
 					"Found leaf at level {} but expected internal (height={})",
-					level,
-					height
+					level, height
 				);
 
 				// Invariant 6: Length consistency
@@ -3220,12 +3233,7 @@ impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
 				}
 				if let Some(upper) = &leaf.upper_fence {
 					for key in &leaf.keys[..] {
-						assert!(
-							key <= upper,
-							"Key {:?} not <= upper_fence {:?}",
-							key,
-							upper
-						);
+						assert!(key <= upper, "Key {:?} not <= upper_fence {:?}", key, upper);
 					}
 				}
 
@@ -3256,8 +3264,7 @@ impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
 				assert!(
 					!is_leaf_level,
 					"Found internal node at leaf level {} (height={})",
-					level,
-					height
+					level, height
 				);
 
 				// Invariant 5: Upper edge presence
@@ -3880,7 +3887,7 @@ mod tests {
 		let tree: Tree<i32, i32> = Tree::new();
 
 		let mut keys: Vec<i32> = (0..200).collect();
-		let mut rng = rand::thread_rng();
+		let mut rng = rand::rng();
 		keys.shuffle(&mut rng);
 
 		for k in keys {
@@ -3958,7 +3965,7 @@ mod tests {
 		tree.assert_invariants();
 
 		let mut keys: Vec<i32> = (0..100).collect();
-		let mut rng = rand::thread_rng();
+		let mut rng = rand::rng();
 		keys.shuffle(&mut rng);
 
 		for k in keys {

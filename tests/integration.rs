@@ -51,14 +51,14 @@ fn large_scale_insert_and_remove() {
 #[test]
 fn large_scale_random_operations() {
 	let tree: Tree<i32, i32> = Tree::new();
-	let mut rng = rand::thread_rng();
+	let mut rng = rand::rng();
 
 	// Random insert/delete/lookup operations
 	let mut expected: std::collections::BTreeMap<i32, i32> = std::collections::BTreeMap::new();
 
 	for _ in 0..10_000 {
-		let key: i32 = rng.gen_range(0..1000);
-		let op: u8 = rng.gen_range(0..3);
+		let key: i32 = rng.random_range(0..1000);
+		let op: u8 = rng.random_range(0..3);
 
 		match op {
 			0 => {
@@ -144,7 +144,7 @@ fn sequential_keys_descending() {
 #[test]
 fn random_keys() {
 	let tree: Tree<i32, i32> = Tree::new();
-	let mut rng = rand::thread_rng();
+	let mut rng = rand::rng();
 
 	let mut keys: Vec<i32> = (0..5000).collect();
 	keys.shuffle(&mut rng);
@@ -232,7 +232,7 @@ fn delete_all_reverse() {
 #[test]
 fn delete_all_random() {
 	let tree: Tree<i32, i32> = Tree::new();
-	let mut rng = rand::thread_rng();
+	let mut rng = rand::rng();
 
 	for i in 0..1000 {
 		tree.insert(i, i);

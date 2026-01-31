@@ -148,7 +148,7 @@ enum JumpResult {
 	/// No sibling exists (at tree boundary).
 	End,
 	/// Optimistic validation failed - must restore from anchor and retry.
-	Err(error::Error),
+	Err,
 }
 
 // ===========================================================================
@@ -414,7 +414,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				JumpResult::End => {
 					return LeafResult::End;
 				}
-				JumpResult::Err(_) => {
+				JumpResult::Err => {
 					// Validation failed - restore from anchor and retry
 					self.restore_from_anchor(&anchor);
 					continue;
@@ -467,7 +467,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				JumpResult::End => {
 					return LeafResult::End;
 				}
-				JumpResult::Err(_) => {
+				JumpResult::Err => {
 					self.restore_from_anchor(&anchor);
 					continue;
 				}
@@ -574,7 +574,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				JumpResult::Ok
 			}
 			Ok(Outcome::End) => JumpResult::End,
-			Err(e) => JumpResult::Err(e),
+			Err(_) => JumpResult::Err,
 		}
 	}
 
@@ -1116,7 +1116,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				JumpResult::End => {
 					return LeafResult::End;
 				}
-				JumpResult::Err(_) => {
+				JumpResult::Err => {
 					self.restore_from_anchor(&anchor);
 					continue;
 				}
@@ -1160,7 +1160,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				JumpResult::End => {
 					return LeafResult::End;
 				}
-				JumpResult::Err(_) => {
+				JumpResult::Err => {
 					self.restore_from_anchor(&anchor);
 					continue;
 				}
@@ -1241,7 +1241,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				JumpResult::Ok
 			}
 			Ok(Outcome::End) => JumpResult::End,
-			Err(e) => JumpResult::Err(e),
+			Err(_) => JumpResult::Err,
 		}
 	}
 
