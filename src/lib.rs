@@ -2129,11 +2129,11 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 	/// Returns `true` if the tree contains no entries.
 	///
-	/// **Note**: This is also O(n) because it calls `len()`.
-	/// For a true O(1) check, you could check if `raw_iter().seek_to_first().next()`
-	/// returns `None`.
+	/// This is an O(1) operation that checks if the first leaf has any entries.
 	pub fn is_empty(&self) -> bool {
-		self.len() == 0
+		let mut iter = self.raw_iter();
+		iter.seek_to_first();
+		iter.next().is_none()
 	}
 }
 
