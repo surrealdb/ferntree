@@ -3005,6 +3005,10 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 mod tests {
 	use super::*;
 
+	// -----------------------------------------------------------------------
+	// Basic Tree Operation Tests
+	// -----------------------------------------------------------------------
+
 	#[test]
 	fn basic_insert_and_lookup() {
 		let tree: Tree<i32, &str> = Tree::new();
@@ -3097,5 +3101,674 @@ mod tests {
 
 		tree.remove(&1);
 		assert_eq!(tree.len(), 1);
+	}
+
+	// -----------------------------------------------------------------------
+	// LeafNode Unit Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn leaf_lower_bound_empty() {
+		let leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		let (pos, exact) = leaf.lower_bound(&5);
+		assert_eq!(pos, 0);
+		assert!(!exact);
+	}
+
+	#[test]
+	fn leaf_lower_bound_exact_match() {
+		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		leaf.insert_at(0, 10, 100);
+		leaf.insert_at(1, 20, 200);
+		leaf.insert_at(2, 30, 300);
+
+		let (pos, exact) = leaf.lower_bound(&20);
+		assert_eq!(pos, 1);
+		assert!(exact);
+	}
+
+	#[test]
+	fn leaf_lower_bound_between_keys() {
+		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		leaf.insert_at(0, 10, 100);
+		leaf.insert_at(1, 20, 200);
+		leaf.insert_at(2, 30, 300);
+
+		let (pos, exact) = leaf.lower_bound(&25);
+		assert_eq!(pos, 2); // Would insert at position 2
+		assert!(!exact);
+	}
+
+	#[test]
+	fn leaf_lower_bound_before_all() {
+		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		leaf.insert_at(0, 10, 100);
+		leaf.insert_at(1, 20, 200);
+
+		let (pos, exact) = leaf.lower_bound(&5);
+		assert_eq!(pos, 0);
+		assert!(!exact);
+	}
+
+	#[test]
+	fn leaf_lower_bound_after_all() {
+		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		leaf.insert_at(0, 10, 100);
+		leaf.insert_at(1, 20, 200);
+
+		let (pos, exact) = leaf.lower_bound(&25);
+		assert_eq!(pos, 2);
+		assert!(!exact);
+	}
+
+	#[test]
+	fn leaf_lower_bound_respects_lower_fence() {
+		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		leaf.lower_fence = Some(50);
+		leaf.insert_at(0, 60, 600);
+		leaf.insert_at(1, 70, 700);
+
+		// Key below lower fence
+		let (pos, exact) = leaf.lower_bound(&40);
+		assert_eq!(pos, 0);
+		assert!(!exact);
+	}
+
+	#[test]
+	fn leaf_lower_bound_respects_upper_fence() {
+		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		leaf.upper_fence = Some(50);
+		leaf.insert_at(0, 30, 300);
+		leaf.insert_at(1, 40, 400);
+
+		// Key above upper fence
+		let (pos, exact) = leaf.lower_bound(&60);
+		assert_eq!(pos, 2);
+		assert!(!exact);
+	}
+
+	#[test]
+	fn leaf_within_bounds() {
+		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		leaf.lower_fence = Some(10);
+		leaf.upper_fence = Some(50);
+
+		assert!(!leaf.within_bounds(&5)); // Below lower
+		assert!(!leaf.within_bounds(&10)); // At lower (exclusive)
+		assert!(leaf.within_bounds(&30)); // In range
+		assert!(leaf.within_bounds(&50)); // At upper (inclusive)
+		assert!(!leaf.within_bounds(&55)); // Above upper
+	}
+
+	#[test]
+	fn leaf_within_bounds_no_lower_fence() {
+		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		leaf.upper_fence = Some(50);
+
+		assert!(leaf.within_bounds(&5)); // No lower bound
+		assert!(leaf.within_bounds(&50));
+		assert!(!leaf.within_bounds(&55));
+	}
+
+	#[test]
+	fn leaf_within_bounds_no_upper_fence() {
+		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		leaf.lower_fence = Some(10);
+
+		assert!(!leaf.within_bounds(&5));
+		assert!(leaf.within_bounds(&50)); // No upper bound
+		assert!(leaf.within_bounds(&1000));
+	}
+
+	#[test]
+	fn leaf_within_bounds_no_fences() {
+		let leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+
+		assert!(leaf.within_bounds(&0));
+		assert!(leaf.within_bounds(&100));
+		assert!(leaf.within_bounds(&i32::MAX));
+	}
+
+	#[test]
+	fn leaf_insert_at_and_remove_at() {
+		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+
+		assert!(leaf.insert_at(0, 10, 100).is_some());
+		assert!(leaf.insert_at(1, 30, 300).is_some());
+		assert!(leaf.insert_at(1, 20, 200).is_some()); // Insert in middle
+
+		assert_eq!(leaf.len, 3);
+		assert_eq!(*leaf.key_at(0).unwrap(), 10);
+		assert_eq!(*leaf.key_at(1).unwrap(), 20);
+		assert_eq!(*leaf.key_at(2).unwrap(), 30);
+
+		let (k, v) = leaf.remove_at(1);
+		assert_eq!(k, 20);
+		assert_eq!(v, 200);
+		assert_eq!(leaf.len, 2);
+	}
+
+	#[test]
+	fn leaf_split_sets_fences_correctly() {
+		let mut left: LeafNode<i32, i32, 64> = LeafNode::new();
+		for i in 0..10 {
+			left.insert_at(i as u16, i * 10, i * 100);
+		}
+
+		let mut right: LeafNode<i32, i32, 64> = LeafNode::new();
+		left.split(&mut right, 5);
+
+		// Left should have keys 0-50, right should have keys 60-90
+		assert_eq!(left.len, 6); // 0, 10, 20, 30, 40, 50
+		assert_eq!(right.len, 4); // 60, 70, 80, 90
+
+		// Check fence keys
+		assert!(left.lower_fence.is_none()); // Left keeps original lower fence
+		assert_eq!(left.upper_fence, Some(50)); // Split key becomes left's upper fence
+
+		assert_eq!(right.lower_fence, Some(50)); // Split key becomes right's lower fence
+		assert!(right.upper_fence.is_none()); // Right inherits original upper fence
+
+		// Check sample keys
+		assert_eq!(left.sample_key, Some(0));
+		assert_eq!(right.sample_key, Some(60));
+	}
+
+	#[test]
+	fn leaf_merge_combines_entries() {
+		let mut left: LeafNode<i32, i32, 64> = LeafNode::new();
+		left.insert_at(0, 10, 100);
+		left.insert_at(1, 20, 200);
+		left.upper_fence = Some(25);
+
+		let mut right: LeafNode<i32, i32, 64> = LeafNode::new();
+		right.lower_fence = Some(25);
+		right.upper_fence = Some(50);
+		right.insert_at(0, 30, 300);
+		right.insert_at(1, 40, 400);
+		right.sample_key = Some(30);
+
+		let result = left.merge(&mut right);
+		assert!(result);
+
+		assert_eq!(left.len, 4);
+		assert_eq!(*left.key_at(0).unwrap(), 10);
+		assert_eq!(*left.key_at(1).unwrap(), 20);
+		assert_eq!(*left.key_at(2).unwrap(), 30);
+		assert_eq!(*left.key_at(3).unwrap(), 40);
+
+		// Left inherits right's upper fence
+		assert_eq!(left.upper_fence, Some(50));
+		// Left inherits right's sample key
+		assert_eq!(left.sample_key, Some(30));
+
+		// Right should be empty
+		assert_eq!(right.len, 0);
+	}
+
+	#[test]
+	fn leaf_merge_fails_when_too_full() {
+		let mut left: LeafNode<i32, i32, 4> = LeafNode::new();
+		left.insert_at(0, 10, 100);
+		left.insert_at(1, 20, 200);
+		left.insert_at(2, 30, 300);
+
+		let mut right: LeafNode<i32, i32, 4> = LeafNode::new();
+		right.insert_at(0, 40, 400);
+		right.insert_at(1, 50, 500);
+
+		// Combined size (5) > capacity (4)
+		let result = left.merge(&mut right);
+		assert!(!result);
+		// Both should be unchanged
+		assert_eq!(left.len, 3);
+		assert_eq!(right.len, 2);
+	}
+
+	#[test]
+	fn leaf_has_space() {
+		let mut leaf: LeafNode<i32, i32, 3> = LeafNode::new();
+		assert!(leaf.has_space());
+
+		leaf.insert_at(0, 1, 1);
+		assert!(leaf.has_space());
+
+		leaf.insert_at(1, 2, 2);
+		assert!(leaf.has_space());
+
+		leaf.insert_at(2, 3, 3);
+		assert!(!leaf.has_space());
+	}
+
+	#[test]
+	fn leaf_is_underfull() {
+		// With capacity 10, underfull threshold is 4 (40%)
+		let mut leaf: LeafNode<i32, i32, 10> = LeafNode::new();
+
+		// Empty is underfull
+		assert!(leaf.is_underfull());
+
+		for i in 0..3 {
+			leaf.insert_at(i as u16, i, i);
+		}
+		// 3 entries with capacity 10 = 30%, still underfull
+		assert!(leaf.is_underfull());
+
+		leaf.insert_at(3, 3, 3);
+		// 4 entries = 40%, at threshold, NOT underfull
+		assert!(!leaf.is_underfull());
+	}
+
+	// -----------------------------------------------------------------------
+	// InternalNode Unit Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn internal_lower_bound_empty() {
+		let internal: InternalNode<i32, i32, 64, 64> = InternalNode::new();
+		let (pos, exact) = internal.lower_bound(&5);
+		assert_eq!(pos, 0);
+		assert!(!exact);
+	}
+
+	#[test]
+	fn internal_lower_bound_finds_correct_child() {
+		let mut internal: InternalNode<i32, i32, 64, 64> = InternalNode::new();
+		// Keys: 10, 20, 30
+		// Children: [<10], [10-20), [20-30), [>=30]
+		internal.keys.push(10);
+		internal.keys.push(20);
+		internal.keys.push(30);
+		internal.len = 3;
+
+		let (pos, exact) = internal.lower_bound(&5);
+		assert_eq!(pos, 0); // < 10, go to child 0
+		assert!(!exact);
+
+		let (pos, exact) = internal.lower_bound(&10);
+		assert_eq!(pos, 0); // == 10, exact match
+		assert!(exact);
+
+		let (pos, exact) = internal.lower_bound(&15);
+		assert_eq!(pos, 1); // > 10, < 20
+		assert!(!exact);
+
+		let (pos, exact) = internal.lower_bound(&25);
+		assert_eq!(pos, 2); // > 20, < 30
+		assert!(!exact);
+
+		let (pos, exact) = internal.lower_bound(&35);
+		assert_eq!(pos, 3); // >= 30, go to upper_edge
+		assert!(!exact);
+	}
+
+	#[test]
+	fn internal_has_space() {
+		let mut internal: InternalNode<i32, i32, 3, 64> = InternalNode::new();
+		assert!(internal.has_space());
+
+		internal.len = 2;
+		assert!(internal.has_space());
+
+		internal.len = 3;
+		assert!(!internal.has_space());
+	}
+
+	#[test]
+	fn internal_is_underfull() {
+		// With capacity 10, underfull threshold is 4 (40%)
+		let mut internal: InternalNode<i32, i32, 10, 64> = InternalNode::new();
+
+		internal.len = 3;
+		assert!(internal.is_underfull());
+
+		internal.len = 4;
+		assert!(!internal.is_underfull());
+	}
+
+	// -----------------------------------------------------------------------
+	// Tree Structure Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn new_tree_has_height_one() {
+		let tree: Tree<i32, i32> = Tree::new();
+		assert_eq!(tree.height(), 1);
+	}
+
+	#[test]
+	fn inserts_cause_splits_and_height_increase() {
+		let tree: Tree<i32, i32> = Tree::new();
+
+		// Insert enough to cause splits (LEAF_CAPACITY is 64)
+		for i in 0..200 {
+			tree.insert(i, i);
+		}
+
+		assert!(tree.height() > 1);
+
+		// Verify all entries are still findable
+		for i in 0..200 {
+			assert_eq!(tree.lookup(&i, |v| *v), Some(i));
+		}
+	}
+
+	#[test]
+	fn many_inserts_cause_multiple_levels() {
+		let tree: Tree<i32, i32> = Tree::new();
+
+		// Insert enough to cause multiple levels of splits
+		for i in 0..1000 {
+			tree.insert(i, i);
+		}
+
+		assert!(tree.height() >= 2);
+		assert_eq!(tree.len(), 1000);
+
+		// Verify random access works
+		assert_eq!(tree.lookup(&0, |v| *v), Some(0));
+		assert_eq!(tree.lookup(&500, |v| *v), Some(500));
+		assert_eq!(tree.lookup(&999, |v| *v), Some(999));
+	}
+
+	#[test]
+	fn reverse_insertion_order() {
+		let tree: Tree<i32, i32> = Tree::new();
+
+		// Insert in reverse order
+		for i in (0..200).rev() {
+			tree.insert(i, i);
+		}
+
+		// Verify all entries and order
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		for i in 0..200 {
+			let (k, v) = iter.next().unwrap();
+			assert_eq!(*k, i);
+			assert_eq!(*v, i);
+		}
+	}
+
+	#[test]
+	fn random_insertion_order() {
+		use rand::prelude::*;
+
+		let tree: Tree<i32, i32> = Tree::new();
+
+		let mut keys: Vec<i32> = (0..200).collect();
+		let mut rng = rand::thread_rng();
+		keys.shuffle(&mut rng);
+
+		for k in keys {
+			tree.insert(k, k * 10);
+		}
+
+		// Verify all entries are findable
+		for i in 0..200 {
+			assert_eq!(tree.lookup(&i, |v| *v), Some(i * 10));
+		}
+
+		// Verify iteration order is sorted
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		let mut prev = -1;
+		while let Some((k, _)) = iter.next() {
+			assert!(*k > prev);
+			prev = *k;
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Delete and Merge Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn delete_all_entries() {
+		let tree: Tree<i32, i32> = Tree::new();
+
+		for i in 0..100 {
+			tree.insert(i, i);
+		}
+
+		for i in 0..100 {
+			assert_eq!(tree.remove(&i), Some(i));
+		}
+
+		assert!(tree.is_empty());
+	}
+
+	#[test]
+	fn delete_in_reverse_order() {
+		let tree: Tree<i32, i32> = Tree::new();
+
+		for i in 0..100 {
+			tree.insert(i, i);
+		}
+
+		for i in (0..100).rev() {
+			assert_eq!(tree.remove(&i), Some(i));
+		}
+
+		assert!(tree.is_empty());
+	}
+
+	#[test]
+	fn delete_random_order() {
+		use rand::prelude::*;
+
+		let tree: Tree<i32, i32> = Tree::new();
+
+		for i in 0..100 {
+			tree.insert(i, i);
+		}
+
+		let mut keys: Vec<i32> = (0..100).collect();
+		let mut rng = rand::thread_rng();
+		keys.shuffle(&mut rng);
+
+		for k in keys {
+			assert_eq!(tree.remove(&k), Some(k));
+		}
+
+		assert!(tree.is_empty());
+	}
+
+	#[test]
+	fn delete_nonexistent_returns_none() {
+		let tree: Tree<i32, i32> = Tree::new();
+		tree.insert(1, 10);
+
+		assert_eq!(tree.remove(&999), None);
+		assert_eq!(tree.len(), 1);
+	}
+
+	#[test]
+	fn remove_entry_returns_key_and_value() {
+		let tree: Tree<i32, i32> = Tree::new();
+		tree.insert(42, 420);
+
+		let result = tree.remove_entry(&42);
+		assert_eq!(result, Some((42, 420)));
+	}
+
+	#[test]
+	fn interleaved_insert_and_delete() {
+		let tree: Tree<i32, i32> = Tree::new();
+
+		// Insert some entries
+		for i in 0..50 {
+			tree.insert(i, i);
+		}
+
+		// Delete half
+		for i in 0..25 {
+			tree.remove(&i);
+		}
+
+		// Insert more
+		for i in 50..100 {
+			tree.insert(i, i);
+		}
+
+		// Delete some more
+		for i in 50..75 {
+			tree.remove(&i);
+		}
+
+		// Verify remaining entries
+		assert_eq!(tree.len(), 50); // 25-49 and 75-99
+
+		for i in 25..50 {
+			assert_eq!(tree.lookup(&i, |v| *v), Some(i));
+		}
+		for i in 75..100 {
+			assert_eq!(tree.lookup(&i, |v| *v), Some(i));
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Node Type Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn node_is_leaf() {
+		let leaf_node: Node<i32, i32, 64, 64> = Node::Leaf(LeafNode::new());
+		let internal_node: Node<i32, i32, 64, 64> = Node::Internal(InternalNode::new());
+
+		assert!(leaf_node.is_leaf());
+		assert!(!internal_node.is_leaf());
+	}
+
+	#[test]
+	fn node_can_merge_with_same_type() {
+		let leaf1: Node<i32, i32, 64, 64> = Node::Leaf(LeafNode::new());
+		let leaf2: Node<i32, i32, 64, 64> = Node::Leaf(LeafNode::new());
+
+		assert!(leaf1.can_merge_with(&leaf2));
+	}
+
+	#[test]
+	fn node_cannot_merge_with_different_type() {
+		let leaf: Node<i32, i32, 64, 64> = Node::Leaf(LeafNode::new());
+		let internal: Node<i32, i32, 64, 64> = Node::Internal(InternalNode::new());
+
+		assert!(!leaf.can_merge_with(&internal));
+		assert!(!internal.can_merge_with(&leaf));
+	}
+
+	// -----------------------------------------------------------------------
+	// Edge Case Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn empty_tree_lookup() {
+		let tree: Tree<i32, i32> = Tree::new();
+		assert_eq!(tree.lookup(&1, |v| *v), None);
+	}
+
+	#[test]
+	fn empty_tree_remove() {
+		let tree: Tree<i32, i32> = Tree::new();
+		assert_eq!(tree.remove(&1), None);
+	}
+
+	#[test]
+	fn duplicate_inserts_update_value() {
+		let tree: Tree<i32, i32> = Tree::new();
+
+		tree.insert(1, 10);
+		tree.insert(1, 20);
+		tree.insert(1, 30);
+
+		assert_eq!(tree.lookup(&1, |v| *v), Some(30));
+		assert_eq!(tree.len(), 1);
+	}
+
+	#[test]
+	fn string_keys() {
+		let tree: Tree<String, i32> = Tree::new();
+
+		tree.insert("apple".to_string(), 1);
+		tree.insert("banana".to_string(), 2);
+		tree.insert("cherry".to_string(), 3);
+
+		assert_eq!(tree.lookup(&"banana".to_string(), |v| *v), Some(2));
+	}
+
+	#[test]
+	fn lookup_with_borrowed_key() {
+		let tree: Tree<String, i32> = Tree::new();
+		tree.insert("hello".to_string(), 42);
+
+		// Lookup using &str instead of String
+		assert_eq!(tree.lookup("hello", |v| *v), Some(42));
+	}
+
+	#[test]
+	fn empty_string_key() {
+		let tree: Tree<String, i32> = Tree::new();
+		tree.insert("".to_string(), 42);
+
+		assert_eq!(tree.lookup(&"".to_string(), |v| *v), Some(42));
+	}
+
+	#[test]
+	fn large_values() {
+		let tree: Tree<i32, Vec<u8>> = Tree::new();
+
+		let large_value = vec![0u8; 10000];
+		tree.insert(1, large_value.clone());
+
+		let result = tree.lookup(&1, |v| v.len());
+		assert_eq!(result, Some(10000));
+	}
+
+	// -----------------------------------------------------------------------
+	// Default Implementation Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn tree_default_creates_empty_tree() {
+		let tree: Tree<i32, i32> = Tree::default();
+		assert!(tree.is_empty());
+		assert_eq!(tree.height(), 1);
+	}
+
+	// -----------------------------------------------------------------------
+	// Keys Method Test
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn node_keys_returns_keys() {
+		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		leaf.insert_at(0, 10, 100);
+		leaf.insert_at(1, 20, 200);
+		leaf.insert_at(2, 30, 300);
+
+		let node: Node<i32, i32, 64, 64> = Node::Leaf(leaf);
+		let keys = node.keys();
+
+		assert_eq!(keys, &[10, 20, 30]);
+	}
+
+	// -----------------------------------------------------------------------
+	// Sample Key Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn leaf_sample_key_initially_none() {
+		let leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		let node: Node<i32, i32, 64, 64> = Node::Leaf(leaf);
+		assert!(node.sample_key().is_none());
+	}
+
+	#[test]
+	fn internal_sample_key_initially_none() {
+		let internal: InternalNode<i32, i32, 64, 64> = InternalNode::new();
+		let node: Node<i32, i32, 64, 64> = Node::Internal(internal);
+		assert!(node.sample_key().is_none());
 	}
 }

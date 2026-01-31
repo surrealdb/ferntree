@@ -1665,3 +1665,576 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		}
 	}
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+	use crate::Tree;
+
+	// -----------------------------------------------------------------------
+	// Empty Tree Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn iter_empty_tree_next_returns_none() {
+		let tree: Tree<i32, i32> = Tree::new();
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+		assert!(iter.next().is_none());
+	}
+
+	#[test]
+	fn iter_empty_tree_prev_returns_none() {
+		let tree: Tree<i32, i32> = Tree::new();
+		let mut iter = tree.raw_iter();
+		iter.seek_to_last();
+		assert!(iter.prev().is_none());
+	}
+
+	#[test]
+	fn iter_mut_empty_tree_next_returns_none() {
+		let tree: Tree<i32, i32> = Tree::new();
+		let mut iter = tree.raw_iter_mut();
+		iter.seek_to_first();
+		assert!(iter.next().is_none());
+	}
+
+	#[test]
+	fn iter_mut_empty_tree_prev_returns_none() {
+		let tree: Tree<i32, i32> = Tree::new();
+		let mut iter = tree.raw_iter_mut();
+		iter.seek_to_last();
+		assert!(iter.prev().is_none());
+	}
+
+	// -----------------------------------------------------------------------
+	// Single Element Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn iter_single_element_forward() {
+		let tree: Tree<i32, i32> = Tree::new();
+		tree.insert(42, 100);
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		let (k, v) = iter.next().unwrap();
+		assert_eq!(*k, 42);
+		assert_eq!(*v, 100);
+
+		assert!(iter.next().is_none());
+	}
+
+	#[test]
+	fn iter_single_element_backward() {
+		let tree: Tree<i32, i32> = Tree::new();
+		tree.insert(42, 100);
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_last();
+
+		let (k, v) = iter.prev().unwrap();
+		assert_eq!(*k, 42);
+		assert_eq!(*v, 100);
+
+		assert!(iter.prev().is_none());
+	}
+
+	// -----------------------------------------------------------------------
+	// Seek Variants Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn seek_to_existing_key() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i * 10, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek(&50);
+
+		let (k, v) = iter.next().unwrap();
+		assert_eq!(*k, 50);
+		assert_eq!(*v, 5);
+	}
+
+	#[test]
+	fn seek_to_nonexisting_key() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i * 10, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		// Seek to 55, which doesn't exist. Should position before 60.
+		iter.seek(&55);
+
+		let (k, v) = iter.next().unwrap();
+		assert_eq!(*k, 60);
+		assert_eq!(*v, 6);
+	}
+
+	#[test]
+	fn seek_exact_returns_true_for_existing() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i * 10, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		let found = iter.seek_exact(&50);
+		assert!(found);
+
+		let (k, _) = iter.next().unwrap();
+		assert_eq!(*k, 50);
+	}
+
+	#[test]
+	fn seek_exact_returns_false_for_nonexisting() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i * 10, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		let found = iter.seek_exact(&55);
+		assert!(!found);
+
+		// Should still be positioned at 60 (next key)
+		let (k, _) = iter.next().unwrap();
+		assert_eq!(*k, 60);
+	}
+
+	#[test]
+	fn seek_for_prev_existing_key() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i * 10, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_for_prev(&50);
+
+		// prev() should return the key we sought
+		let (k, v) = iter.prev().unwrap();
+		assert_eq!(*k, 50);
+		assert_eq!(*v, 5);
+	}
+
+	#[test]
+	fn seek_for_prev_nonexisting_key() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i * 10, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		// Seek for prev at 55 (doesn't exist)
+		// Keys are: 0, 10, 20, 30, 40, 50, 60, 70, 80, 90
+		// seek_for_prev positions us after the lower_bound position
+		iter.seek_for_prev(&55);
+
+		// prev() should give us the key at lower_bound position (60)
+		let (k, _) = iter.prev().unwrap();
+		assert_eq!(*k, 60);
+
+		// And prev() again should give us 50
+		let (k, _) = iter.prev().unwrap();
+		assert_eq!(*k, 50);
+	}
+
+	#[test]
+	fn seek_to_first_positions_at_beginning() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in (0..10).rev() {
+			tree.insert(i, i * 10);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		let (k, v) = iter.next().unwrap();
+		assert_eq!(*k, 0);
+		assert_eq!(*v, 0);
+	}
+
+	#[test]
+	fn seek_to_last_positions_at_end() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_last();
+
+		// next() should return None (we're past the last element)
+		assert!(iter.next().is_none());
+
+		// prev() should return the last element
+		let (k, v) = iter.prev().unwrap();
+		assert_eq!(*k, 9);
+		assert_eq!(*v, 90);
+	}
+
+	// -----------------------------------------------------------------------
+	// Bidirectional Iteration Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn mixed_next_and_prev() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek(&5);
+
+		// next() returns 5
+		assert_eq!(*iter.next().unwrap().0, 5);
+		// next() returns 6
+		assert_eq!(*iter.next().unwrap().0, 6);
+		// prev() returns 6 (we just visited it)
+		assert_eq!(*iter.prev().unwrap().0, 6);
+		// prev() returns 5
+		assert_eq!(*iter.prev().unwrap().0, 5);
+		// prev() returns 4
+		assert_eq!(*iter.prev().unwrap().0, 4);
+		// next() returns 4
+		assert_eq!(*iter.next().unwrap().0, 4);
+	}
+
+	#[test]
+	fn reverse_from_middle() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek(&5);
+
+		// Go forward once
+		iter.next();
+
+		// Now go backwards to the beginning
+		let mut collected: Vec<i32> = Vec::new();
+		while let Some((k, _)) = iter.prev() {
+			collected.push(*k);
+		}
+
+		assert_eq!(collected, vec![5, 4, 3, 2, 1, 0]);
+	}
+
+	#[test]
+	fn forward_then_full_reverse() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..5 {
+			tree.insert(i, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		// Go to the end
+		while iter.next().is_some() {}
+
+		// Now reverse
+		let mut collected: Vec<i32> = Vec::new();
+		while let Some((k, _)) = iter.prev() {
+			collected.push(*k);
+		}
+
+		assert_eq!(collected, vec![4, 3, 2, 1, 0]);
+	}
+
+	// -----------------------------------------------------------------------
+	// Full Forward and Reverse Iteration Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn full_forward_iteration() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..100 {
+			tree.insert(i, i * 2);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		let mut count = 0;
+		while let Some((k, v)) = iter.next() {
+			assert_eq!(*k, count);
+			assert_eq!(*v, count * 2);
+			count += 1;
+		}
+		assert_eq!(count, 100);
+	}
+
+	#[test]
+	fn full_reverse_iteration() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..100 {
+			tree.insert(i, i * 2);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_last();
+
+		let mut count = 99i32;
+		while let Some((k, v)) = iter.prev() {
+			assert_eq!(*k, count);
+			assert_eq!(*v, count * 2);
+			count -= 1;
+		}
+		assert_eq!(count, -1);
+	}
+
+	// -----------------------------------------------------------------------
+	// Cross-Leaf Navigation Tests (need enough keys to cause splits)
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn iteration_crosses_leaf_boundaries_forward() {
+		let tree: Tree<i32, i32> = Tree::new();
+		// Insert enough to cause splits (LEAF_CAPACITY is 64)
+		for i in 0..200 {
+			tree.insert(i, i);
+		}
+		assert!(tree.height() > 1, "Tree should have multiple levels");
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		let mut count = 0;
+		while let Some((k, _)) = iter.next() {
+			assert_eq!(*k, count);
+			count += 1;
+		}
+		assert_eq!(count, 200);
+	}
+
+	#[test]
+	fn iteration_crosses_leaf_boundaries_reverse() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..200 {
+			tree.insert(i, i);
+		}
+		assert!(tree.height() > 1);
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_last();
+
+		let mut count = 199i32;
+		while let Some((k, _)) = iter.prev() {
+			assert_eq!(*k, count);
+			count -= 1;
+		}
+		assert_eq!(count, -1);
+	}
+
+	// -----------------------------------------------------------------------
+	// Exclusive Iterator Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn exclusive_iter_can_modify_values() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i);
+		}
+
+		{
+			let mut iter = tree.raw_iter_mut();
+			iter.seek_to_first();
+
+			while let Some((_, v)) = iter.next() {
+				*v *= 2;
+			}
+		}
+
+		// Verify modifications
+		for i in 0..10 {
+			assert_eq!(tree.lookup(&i, |v| *v), Some(i * 2));
+		}
+	}
+
+	#[test]
+	fn exclusive_iter_insert() {
+		let tree: Tree<i32, i32> = Tree::new();
+
+		{
+			let mut iter = tree.raw_iter_mut();
+			iter.insert(5, 50);
+			iter.insert(3, 30);
+			iter.insert(7, 70);
+		}
+
+		assert_eq!(tree.lookup(&3, |v| *v), Some(30));
+		assert_eq!(tree.lookup(&5, |v| *v), Some(50));
+		assert_eq!(tree.lookup(&7, |v| *v), Some(70));
+	}
+
+	#[test]
+	fn exclusive_iter_insert_updates_existing() {
+		let tree: Tree<i32, i32> = Tree::new();
+		tree.insert(5, 50);
+
+		{
+			let mut iter = tree.raw_iter_mut();
+			let old = iter.insert(5, 500);
+			assert_eq!(old, Some(50));
+		}
+
+		assert_eq!(tree.lookup(&5, |v| *v), Some(500));
+	}
+
+	#[test]
+	fn exclusive_iter_remove() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i);
+		}
+
+		{
+			let mut iter = tree.raw_iter_mut();
+			let removed = iter.remove(&5);
+			assert_eq!(removed, Some((5, 5)));
+		}
+
+		assert_eq!(tree.lookup(&5, |v| *v), None);
+		assert_eq!(tree.len(), 9);
+	}
+
+	#[test]
+	fn exclusive_iter_remove_nonexistent() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i);
+		}
+
+		{
+			let mut iter = tree.raw_iter_mut();
+			let removed = iter.remove(&100);
+			assert!(removed.is_none());
+		}
+
+		assert_eq!(tree.len(), 10);
+	}
+
+	// -----------------------------------------------------------------------
+	// Seek Boundary Conditions
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn seek_before_first_key() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 10..20 {
+			tree.insert(i, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek(&5); // Before any key
+
+		let (k, _) = iter.next().unwrap();
+		assert_eq!(*k, 10); // Should get first key
+	}
+
+	#[test]
+	fn seek_after_last_key() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 10..20 {
+			tree.insert(i, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek(&100); // After any key
+
+		assert!(iter.next().is_none());
+	}
+
+	#[test]
+	fn seek_for_prev_before_first_key() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 10..20 {
+			tree.insert(i, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_for_prev(&5); // Before any key
+
+		// prev should return None (nothing before)
+		// but we should be positioned at the start
+		let (k, _) = iter.next().unwrap();
+		assert_eq!(*k, 10);
+	}
+
+	// -----------------------------------------------------------------------
+	// String Key Tests (to match fixture type)
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn iter_with_string_keys() {
+		let tree: Tree<String, i32> = Tree::new();
+		tree.insert("apple".to_string(), 1);
+		tree.insert("banana".to_string(), 2);
+		tree.insert("cherry".to_string(), 3);
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		let (k, _) = iter.next().unwrap();
+		assert_eq!(k, "apple");
+
+		let (k, _) = iter.next().unwrap();
+		assert_eq!(k, "banana");
+
+		let (k, _) = iter.next().unwrap();
+		assert_eq!(k, "cherry");
+
+		assert!(iter.next().is_none());
+	}
+
+	#[test]
+	fn seek_with_string_borrow() {
+		let tree: Tree<String, i32> = Tree::new();
+		tree.insert("apple".to_string(), 1);
+		tree.insert("banana".to_string(), 2);
+		tree.insert("cherry".to_string(), 3);
+
+		let mut iter = tree.raw_iter();
+		// Seek using &str instead of String
+		iter.seek("banana");
+
+		let (k, v) = iter.next().unwrap();
+		assert_eq!(k, "banana");
+		assert_eq!(*v, 2);
+	}
+
+	// -----------------------------------------------------------------------
+	// Reuse Leaf Optimization Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn seek_reuses_current_leaf_when_within_bounds() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek(&5);
+
+		// Seek to a nearby key - should reuse current leaf
+		iter.seek(&7);
+
+		let (k, _) = iter.next().unwrap();
+		assert_eq!(*k, 7);
+	}
+}

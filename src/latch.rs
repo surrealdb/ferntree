@@ -923,3 +923,442 @@ impl<'a, T> OptimisticOrExclusive<'a, T> {
 		}
 	}
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// -----------------------------------------------------------------------
+	// Version Encoding Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn version_starts_at_zero() {
+		let latch = HybridLatch::new(42);
+		// New latch should have version 0 (even = unlocked)
+		assert_eq!(latch.version.load(Ordering::Relaxed), 0);
+	}
+
+	#[test]
+	fn exclusive_lock_makes_version_odd() {
+		let latch = HybridLatch::new(42);
+		let guard = latch.exclusive();
+		// While exclusive lock is held, version should be odd
+		assert_eq!(latch.version.load(Ordering::Relaxed) & 1, 1);
+		drop(guard);
+	}
+
+	#[test]
+	fn exclusive_unlock_makes_version_even() {
+		let latch = HybridLatch::new(42);
+		{
+			let _guard = latch.exclusive();
+		}
+		// After exclusive lock is released, version should be even (and incremented)
+		let version = latch.version.load(Ordering::Relaxed);
+		assert_eq!(version & 1, 0);
+		assert_eq!(version, 2); // 0 -> 1 (lock) -> 2 (unlock)
+	}
+
+	#[test]
+	fn multiple_exclusive_locks_increment_version() {
+		let latch = HybridLatch::new(42);
+
+		for i in 0..5 {
+			{
+				let _guard = latch.exclusive();
+				// During lock: version should be 2*i + 1
+				assert_eq!(latch.version.load(Ordering::Relaxed), 2 * i + 1);
+			}
+			// After unlock: version should be 2*(i+1)
+			assert_eq!(latch.version.load(Ordering::Relaxed), 2 * (i + 1));
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Optimistic Validation Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn optimistic_recheck_succeeds_without_write() {
+		let latch = HybridLatch::new(42);
+		let guard = latch.optimistic_or_spin();
+
+		// Read the value
+		let value = *guard;
+		assert_eq!(value, 42);
+
+		// Recheck should succeed - no concurrent write
+		assert!(guard.recheck().is_ok());
+	}
+
+	#[test]
+	fn optimistic_recheck_fails_after_write() {
+		let latch = HybridLatch::new(42);
+		let opt = latch.optimistic_or_spin();
+
+		// Concurrent write happens
+		{
+			let mut exc = latch.exclusive();
+			*exc = 100;
+		}
+
+		// Recheck should fail - version changed
+		assert!(opt.recheck().is_err());
+	}
+
+	#[test]
+	fn optimistic_recheck_fails_during_write() {
+		let latch = HybridLatch::new(42);
+
+		// First, acquire exclusive to set version to odd
+		let exc = latch.exclusive();
+
+		// Another thread (simulated) would see odd version and spin
+		// We can't easily test the spinning behavior, but we can verify
+		// that the version is odd during exclusive lock
+		assert_eq!(latch.version.load(Ordering::Relaxed) & 1, 1);
+
+		drop(exc);
+	}
+
+	#[test]
+	fn optimistic_captures_correct_version() {
+		let latch = HybridLatch::new(42);
+
+		// Do some writes to increment version
+		for _ in 0..3 {
+			let _guard = latch.exclusive();
+		}
+
+		let opt = latch.optimistic_or_spin();
+		// Version should be 6 after 3 exclusive locks
+		assert_eq!(opt.version, 6);
+		assert!(opt.recheck().is_ok());
+	}
+
+	// -----------------------------------------------------------------------
+	// Lock Upgrade Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn to_shared_succeeds_without_contention() {
+		let latch = HybridLatch::new(42);
+		let opt = latch.optimistic_or_spin();
+
+		let shared = opt.to_shared();
+		assert!(shared.is_ok());
+
+		let shared = shared.unwrap();
+		assert_eq!(*shared, 42);
+	}
+
+	#[test]
+	fn to_shared_fails_after_write() {
+		let latch = HybridLatch::new(42);
+		let opt = latch.optimistic_or_spin();
+
+		// Concurrent write
+		{
+			let mut exc = latch.exclusive();
+			*exc = 100;
+		}
+
+		// Upgrade should fail due to version change
+		assert!(opt.to_shared().is_err());
+	}
+
+	#[test]
+	fn to_exclusive_succeeds_without_contention() {
+		let latch = HybridLatch::new(42);
+		let opt = latch.optimistic_or_spin();
+
+		let exc = opt.to_exclusive();
+		assert!(exc.is_ok());
+
+		let mut exc = exc.unwrap();
+		*exc = 100;
+		drop(exc);
+
+		// Verify the write took effect
+		let opt2 = latch.optimistic_or_spin();
+		assert_eq!(*opt2, 100);
+	}
+
+	#[test]
+	fn to_exclusive_fails_after_write() {
+		let latch = HybridLatch::new(42);
+		let opt = latch.optimistic_or_spin();
+
+		// Concurrent write
+		{
+			let mut exc = latch.exclusive();
+			*exc = 100;
+		}
+
+		// Upgrade should fail due to version change
+		assert!(opt.to_exclusive().is_err());
+	}
+
+	#[test]
+	fn to_exclusive_increments_version() {
+		let latch = HybridLatch::new(42);
+		let opt = latch.optimistic_or_spin();
+		let initial_version = opt.version;
+
+		let exc = opt.to_exclusive().unwrap();
+		// Version should be odd (initial + 1)
+		assert_eq!(latch.version.load(Ordering::Relaxed), initial_version + 1);
+
+		drop(exc);
+		// Version should be even (initial + 2)
+		assert_eq!(latch.version.load(Ordering::Relaxed), initial_version + 2);
+	}
+
+	// -----------------------------------------------------------------------
+	// Guard Unlock Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn exclusive_unlock_returns_optimistic_with_new_version() {
+		let latch = HybridLatch::new(42);
+		let exc = latch.exclusive();
+		let version_during_lock = exc.version;
+
+		let opt = exc.unlock();
+
+		// Returned optimistic guard should have version = version_during_lock + 1
+		assert_eq!(opt.version, version_during_lock + 1);
+		// And recheck should succeed (we just unlocked, no one else modified)
+		assert!(opt.recheck().is_ok());
+	}
+
+	#[test]
+	fn shared_unlock_returns_optimistic_with_same_version() {
+		let latch = HybridLatch::new(42);
+		let shared = latch.shared();
+		let version = shared.version;
+
+		let opt = shared.unlock();
+
+		// Shared unlock doesn't change version
+		assert_eq!(opt.version, version);
+		assert!(opt.recheck().is_ok());
+	}
+
+	// -----------------------------------------------------------------------
+	// Shared Lock Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn shared_lock_provides_read_access() {
+		let latch = HybridLatch::new(42);
+		let shared = latch.shared();
+		assert_eq!(*shared, 42);
+	}
+
+	#[test]
+	fn multiple_shared_locks_allowed() {
+		let latch = HybridLatch::new(42);
+		let shared1 = latch.shared();
+		let shared2 = latch.shared();
+
+		assert_eq!(*shared1, 42);
+		assert_eq!(*shared2, 42);
+	}
+
+	#[test]
+	fn shared_recheck_always_succeeds() {
+		let latch = HybridLatch::new(42);
+		let shared = latch.shared();
+
+		// Shared guards don't need validation - they block writers
+		// The recheck is just an assertion that should pass
+		shared.recheck();
+	}
+
+	// -----------------------------------------------------------------------
+	// Exclusive Lock Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn exclusive_lock_provides_write_access() {
+		let latch = HybridLatch::new(42);
+		{
+			let mut exc = latch.exclusive();
+			*exc = 100;
+		}
+
+		let opt = latch.optimistic_or_spin();
+		assert_eq!(*opt, 100);
+	}
+
+	#[test]
+	fn exclusive_deref_mut_works() {
+		let latch = HybridLatch::new(vec![1, 2, 3]);
+		{
+			let mut exc = latch.exclusive();
+			exc.push(4);
+		}
+
+		let opt = latch.optimistic_or_spin();
+		assert_eq!(*opt, vec![1, 2, 3, 4]);
+	}
+
+	// -----------------------------------------------------------------------
+	// SpinWait Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn spinwait_returns_true_initially() {
+		let mut sw = SpinWait::new();
+		// First 20 spins should return true
+		for _ in 0..20 {
+			assert!(sw.spin());
+		}
+	}
+
+	#[test]
+	fn spinwait_returns_false_after_exhaustion() {
+		let mut sw = SpinWait::new();
+		// Exhaust the spin budget
+		for _ in 0..20 {
+			sw.spin();
+		}
+		// After 20 spins, spin() returns false
+		assert!(!sw.spin());
+	}
+
+	#[test]
+	fn spinwait_reset_restarts_counter() {
+		let mut sw = SpinWait::new();
+		// Exhaust budget
+		for _ in 0..20 {
+			sw.spin();
+		}
+		assert!(!sw.spin());
+
+		// Reset
+		sw.reset();
+
+		// Should return true again
+		assert!(sw.spin());
+	}
+
+	// -----------------------------------------------------------------------
+	// HybridGuard Trait Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn hybrid_guard_trait_works_for_optimistic() {
+		let latch = HybridLatch::new(42);
+		let guard = latch.optimistic_or_spin();
+
+		fn use_guard<T>(guard: &impl HybridGuard<T>) -> &T {
+			guard.inner()
+		}
+
+		assert_eq!(*use_guard(&guard), 42);
+		assert!(guard.recheck().is_ok());
+	}
+
+	#[test]
+	fn hybrid_guard_trait_works_for_shared() {
+		let latch = HybridLatch::new(42);
+		let guard = latch.shared();
+
+		fn use_guard<T>(guard: &impl HybridGuard<T>) -> &T {
+			guard.inner()
+		}
+
+		assert_eq!(*use_guard(&guard), 42);
+		// SharedGuard::recheck() is an assertion, not fallible
+		guard.recheck();
+	}
+
+	#[test]
+	fn hybrid_guard_trait_works_for_exclusive() {
+		let latch = HybridLatch::new(42);
+		let guard = latch.exclusive();
+
+		fn use_guard<T>(guard: &impl HybridGuard<T>) -> &T {
+			guard.inner()
+		}
+
+		assert_eq!(*use_guard(&guard), 42);
+		// ExclusiveGuard::recheck() is an assertion, not fallible
+		guard.recheck();
+	}
+
+	// -----------------------------------------------------------------------
+	// OptimisticOrShared / OptimisticOrExclusive Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn optimistic_or_unwind_returns_optimistic_when_unlocked() {
+		let latch = HybridLatch::new(42);
+		let guard = latch.optimistic_or_unwind();
+
+		match guard {
+			OptimisticOrShared::Optimistic(_) => {}
+			OptimisticOrShared::Shared(_) => panic!("expected optimistic"),
+		}
+	}
+
+	#[test]
+	fn optimistic_or_exclusive_returns_optimistic_when_unlocked() {
+		let latch = HybridLatch::new(42);
+		let guard = latch.optimistic_or_exclusive();
+
+		match guard {
+			OptimisticOrExclusive::Optimistic(_) => {}
+			OptimisticOrExclusive::Exclusive(_) => panic!("expected optimistic"),
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Edge Cases
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn latch_with_zero_sized_type() {
+		let latch = HybridLatch::new(());
+		let opt = latch.optimistic_or_spin();
+		assert!(opt.recheck().is_ok());
+	}
+
+	#[test]
+	fn latch_with_complex_type() {
+		#[derive(Debug, PartialEq)]
+		struct Complex {
+			a: i32,
+			b: String,
+			c: Vec<u8>,
+		}
+
+		let latch = HybridLatch::new(Complex {
+			a: 42,
+			b: "hello".to_string(),
+			c: vec![1, 2, 3],
+		});
+
+		let opt = latch.optimistic_or_spin();
+		assert_eq!(opt.a, 42);
+		assert_eq!(opt.b, "hello");
+		assert_eq!(opt.c, vec![1, 2, 3]);
+		assert!(opt.recheck().is_ok());
+	}
+
+	#[test]
+	fn as_mut_provides_direct_access() {
+		let mut latch = HybridLatch::new(42);
+		*latch.as_mut() = 100;
+
+		let opt = latch.optimistic_or_spin();
+		assert_eq!(*opt, 100);
+	}
+}
