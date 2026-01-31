@@ -5,12 +5,8 @@
 //!
 //! ## Test Categories
 //!
-//! - Basic concurrent tests: Lower contention, always run
-//! - Stress tests: Higher contention, marked with `#[ignore]` - run with `cargo test -- --ignored`
-//!
-//! Some stress tests may expose race conditions in the underlying implementation
-//! that occur under extreme contention. These are marked as ignored but can be
-//! run explicitly to investigate potential issues.
+//! - Basic concurrent tests: Lower contention scenarios
+//! - Stress tests: Higher contention scenarios to validate behavior under load
 
 use ferntree::Tree;
 use rand::prelude::*;
@@ -45,6 +41,8 @@ fn concurrent_insert_disjoint_ranges() {
 		h.join().unwrap();
 	}
 
+	// Single-threaded invariant check after all concurrent operations complete
+	tree.assert_invariants();
 	assert_eq!(tree.len(), (num_threads * entries_per_thread) as usize);
 
 	// Verify all entries
@@ -79,6 +77,9 @@ fn concurrent_insert_same_keys() {
 		h.join().unwrap();
 	}
 
+	// Single-threaded invariant check after all concurrent operations complete
+	tree.assert_invariants();
+
 	// Should have exactly 10 entries
 	assert_eq!(tree.len(), 10);
 
@@ -104,6 +105,8 @@ fn many_concurrent_readers() {
 		tree.insert(i, i * 10);
 	}
 
+	tree.assert_invariants();
+
 	let handles: Vec<_> = (0..num_readers)
 		.map(|_| {
 			let tree = Arc::clone(&tree);
@@ -126,6 +129,9 @@ fn many_concurrent_readers() {
 		let count = h.join().unwrap();
 		assert_eq!(count, entries);
 	}
+
+	// Final invariant check
+	tree.assert_invariants();
 }
 
 // ===========================================================================
@@ -141,6 +147,8 @@ fn concurrent_insert_and_lookup() {
 	for i in 0..entries {
 		tree.insert(i, i * 10);
 	}
+
+	tree.assert_invariants();
 
 	let tree_writer = Arc::clone(&tree);
 	let tree_reader = Arc::clone(&tree);
@@ -164,6 +172,9 @@ fn concurrent_insert_and_lookup() {
 	writer.join().unwrap();
 	let found = reader.join().unwrap();
 
+	// Final invariant check after all concurrent operations
+	tree.assert_invariants();
+
 	// Reader should have found entries
 	assert!(found > 0);
 	assert!(tree.len() >= entries as usize);
@@ -181,6 +192,8 @@ fn iterate_while_inserting() {
 	for i in 0..50 {
 		tree.insert(i, i);
 	}
+
+	tree.assert_invariants();
 
 	let tree_writer = Arc::clone(&tree);
 	let tree_reader = Arc::clone(&tree);
@@ -208,6 +221,9 @@ fn iterate_while_inserting() {
 
 	writer.join().unwrap();
 	let count = reader.join().unwrap();
+
+	// Final invariant check
+	tree.assert_invariants();
 
 	// Reader should have seen a consistent snapshot
 	assert!(count > 0);
@@ -239,6 +255,9 @@ fn concurrent_inserts_cause_splits() {
 		h.join().unwrap();
 	}
 
+	// Final invariant check after concurrent splits
+	tree.assert_invariants();
+
 	// Tree should have grown
 	assert!(tree.height() > 1, "Tree should have split");
 	assert_eq!(tree.len(), (num_threads * entries_per_thread) as usize);
@@ -266,6 +285,8 @@ fn concurrent_removes() {
 		tree.insert(i, i);
 	}
 
+	tree.assert_invariants();
+
 	let num_threads = 2;
 	let entries_per_thread = entries / num_threads;
 
@@ -286,17 +307,19 @@ fn concurrent_removes() {
 		h.join().unwrap();
 	}
 
+	// Final invariant check after concurrent removes
+	tree.assert_invariants();
+
 	// Tree should be empty
 	assert!(tree.is_empty());
 }
 
 // ===========================================================================
-// Stress Tests (ignored by default - run with `cargo test -- --ignored`)
+// Stress Tests
 // ===========================================================================
 
-/// Higher contention stress test - may expose race conditions
+/// Higher contention stress test - validates behavior under heavy contention
 #[test]
-#[ignore]
 fn stress_concurrent_insert_overlapping_ranges() {
 	let tree = Arc::new(Tree::<i32, i32>::new());
 	let num_threads = 8;
@@ -320,13 +343,15 @@ fn stress_concurrent_insert_overlapping_ranges() {
 		h.join().unwrap();
 	}
 
+	// Final invariant check
+	tree.assert_invariants();
+
 	// Tree should have at most key_range entries
 	assert!(tree.len() <= key_range as usize);
 }
 
 /// Mixed operations stress test
 #[test]
-#[ignore]
 fn stress_concurrent_mixed_operations() {
 	let tree = Arc::new(Tree::<i32, i32>::new());
 	let num_threads = 8;
@@ -337,6 +362,8 @@ fn stress_concurrent_mixed_operations() {
 	for i in 0..key_range {
 		tree.insert(i, i);
 	}
+
+	tree.assert_invariants();
 
 	let handles: Vec<_> = (0..num_threads)
 		.map(|t| {
@@ -368,6 +395,9 @@ fn stress_concurrent_mixed_operations() {
 		h.join().unwrap();
 	}
 
+	// Final invariant check
+	tree.assert_invariants();
+
 	// Verify tree is still functional
 	let len = tree.len();
 	assert!(len <= key_range as usize);
@@ -375,7 +405,6 @@ fn stress_concurrent_mixed_operations() {
 
 /// High contention single key stress test
 #[test]
-#[ignore]
 fn stress_high_contention_single_key() {
 	let tree = Arc::new(Tree::<i32, i32>::new());
 	let num_threads = 8;
@@ -402,6 +431,9 @@ fn stress_high_contention_single_key() {
 		h.join().unwrap();
 	}
 
+	// Final invariant check
+	tree.assert_invariants();
+
 	// Key should still exist
 	assert!(tree.lookup(&42, |v| *v).is_some());
 	assert_eq!(tree.len(), 1);
@@ -409,7 +441,6 @@ fn stress_high_contention_single_key() {
 
 /// Sustained mixed operations stress test
 #[test]
-#[ignore]
 fn stress_sustained_mixed_operations() {
 	let tree = Arc::new(Tree::<i32, i32>::new());
 	let num_threads = 4;
@@ -455,13 +486,15 @@ fn stress_sustained_mixed_operations() {
 
 	let total_ops: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
 
+	// Final invariant check
+	tree.assert_invariants();
+
 	// Should have performed many operations
 	assert!(total_ops > 100, "Only {} operations performed", total_ops);
 }
 
 /// Large scale concurrent inserts stress test
 #[test]
-#[ignore]
 fn stress_large_scale_concurrent_inserts() {
 	let tree = Arc::new(Tree::<i32, i32>::new());
 	let num_threads = 8;
@@ -483,12 +516,14 @@ fn stress_large_scale_concurrent_inserts() {
 		h.join().unwrap();
 	}
 
+	// Final invariant check
+	tree.assert_invariants();
+
 	assert_eq!(tree.len(), (num_threads * entries_per_thread) as usize);
 }
 
 /// Producer-consumer pattern stress test
 #[test]
-#[ignore]
 fn stress_producer_consumer() {
 	let tree = Arc::new(Tree::<i32, i32>::new());
 	let num_producers = 4;
@@ -539,6 +574,9 @@ fn stress_producer_consumer() {
 	}
 
 	let total_found: u64 = consumer_handles.into_iter().map(|h| h.join().unwrap()).sum();
+
+	// Final invariant check
+	tree.assert_invariants();
 
 	// Consumers should have found some entries
 	assert!(total_found > 0);

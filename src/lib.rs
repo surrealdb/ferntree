@@ -2434,10 +2434,12 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	/// - `position`: Index where the key is or should be inserted
 	/// - `exact_match`: `true` if `keys[position] == key`
 	///
-	/// # Safety Note
+	/// # Concurrency Safety
 	///
-	/// Uses `get_unchecked` for performance - bounds are guaranteed by the
-	/// binary search algorithm (`mid` is always in `[lower, upper)`).
+	/// Uses safe bounds checking to handle concurrent access. Under optimistic
+	/// locking, `self.len` may be inconsistent with `self.keys.len()` during
+	/// concurrent modifications. The caller's recheck will detect this, but
+	/// we must not cause undefined behavior in the meantime.
 	#[inline]
 	pub(crate) fn lower_bound<Q>(&self, key: &Q) -> (u16, bool)
 	where
@@ -2457,17 +2459,23 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 			}
 		}
 
-		// Standard binary search within the keys array
+		// Use actual keys length for safe bounds - handles concurrent modifications
+		let keys_len = self.keys.len() as u16;
 		let mut lower = 0;
-		let mut upper = self.len;
+		let mut upper = self.len.min(keys_len);
 
 		while lower < upper {
 			let mid = ((upper - lower) / 2) + lower;
 
-			// SAFETY: mid is always in [lower, upper), which is valid for keys[0..len]
-			if key < unsafe { self.keys.get_unchecked(mid as usize) }.borrow() {
+			// Safe bounds check - concurrent modifications may cause len > keys.len()
+			let Some(mid_key) = self.keys.get(mid as usize) else {
+				// Index out of bounds due to concurrent modification - return conservative result
+				return (lower, false);
+			};
+
+			if key < mid_key.borrow() {
 				upper = mid;
-			} else if key > unsafe { self.keys.get_unchecked(mid as usize) }.borrow() {
+			} else if key > mid_key.borrow() {
 				lower = mid + 1;
 			} else {
 				// Exact match found
@@ -2493,20 +2501,23 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 
 	/// Returns a reference to the value at the given position.
 	///
-	/// # Safety
+	/// # Concurrency Safety
 	///
-	/// Caller must ensure `pos < len`. Uses unchecked access for performance.
+	/// Uses safe bounds checking - returns `Err(Unwind)` if position is invalid
+	/// due to concurrent modification, triggering a retry.
 	#[inline]
 	pub(crate) fn value_at(&self, pos: u16) -> error::Result<&V> {
-		// SAFETY: Caller guarantees pos is valid
-		Ok(unsafe { self.values.get_unchecked(pos as usize) })
+		self.values.get(pos as usize).ok_or(error::Error::Unwind)
 	}
 
 	/// Returns a reference to the key at the given position.
+	///
+	/// # Concurrency Safety
+	///
+	/// Uses safe bounds checking - returns `Err(Unwind)` if position is invalid.
 	#[inline]
 	pub(crate) fn key_at(&self, pos: u16) -> error::Result<&K> {
-		// SAFETY: Caller guarantees pos is valid
-		Ok(unsafe { self.keys.get_unchecked(pos as usize) })
+		self.keys.get(pos as usize).ok_or(error::Error::Unwind)
 	}
 
 	/// Returns references to the key and value at the given position.
@@ -2516,11 +2527,19 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	}
 
 	/// Returns references to the key (immutable) and value (mutable) at position.
+	///
+	/// # Concurrency Safety
+	///
+	/// Uses safe bounds checking - returns `Err(Unwind)` if position is invalid.
 	#[inline]
 	pub(crate) fn kv_at_mut(&mut self, pos: u16) -> error::Result<(&K, &mut V)> {
-		// SAFETY: Caller guarantees pos is valid
+		let pos = pos as usize;
+		if pos >= self.keys.len() || pos >= self.values.len() {
+			return Err(error::Error::Unwind);
+		}
+		// SAFETY: We just checked bounds above
 		Ok(unsafe {
-			(self.keys.get_unchecked(pos as usize), self.values.get_unchecked_mut(pos as usize))
+			(self.keys.get_unchecked(pos), self.values.get_unchecked_mut(pos))
 		})
 	}
 
@@ -2764,6 +2783,10 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	/// - If `key < keys[0]`, return position 0 (leftmost child)
 	/// - If `key >= keys[len-1]`, return position len (upper_edge)
 	/// - Otherwise, find i where `keys[i-1] <= key < keys[i]`
+	///
+	/// # Concurrency Safety
+	///
+	/// Uses safe bounds checking to handle concurrent access.
 	#[inline]
 	pub(crate) fn lower_bound<Q>(&self, key: &Q) -> (u16, bool)
 	where
@@ -2781,17 +2804,23 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 			}
 		}
 
-		// Binary search for the correct child
+		// Use actual keys length for safe bounds - handles concurrent modifications
+		let keys_len = self.keys.len() as u16;
 		let mut lower = 0;
-		let mut upper = self.len;
+		let mut upper = self.len.min(keys_len);
 
 		while lower < upper {
 			let mid = ((upper - lower) / 2) + lower;
 
-			// SAFETY: mid is in valid range
-			if key < unsafe { self.keys.get_unchecked(mid as usize) }.borrow() {
+			// Safe bounds check - concurrent modifications may cause len > keys.len()
+			let Some(mid_key) = self.keys.get(mid as usize) else {
+				// Index out of bounds due to concurrent modification - return conservative result
+				return (lower, false);
+			};
+
+			if key < mid_key.borrow() {
 				upper = mid;
-			} else if key > unsafe { self.keys.get_unchecked(mid as usize) }.borrow() {
+			} else if key > mid_key.borrow() {
 				lower = mid + 1;
 			} else {
 				// Exact match on separator key
@@ -2821,7 +2850,12 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	///
 	/// # Errors
 	///
-	/// Returns `Error::Unwind` if `pos == len` but `upper_edge` is None.
+	/// Returns `Error::Unwind` if `pos == len` but `upper_edge` is None,
+	/// or if position is out of bounds due to concurrent modification.
+	///
+	/// # Concurrency Safety
+	///
+	/// Uses safe bounds checking to handle concurrent access.
 	#[inline]
 	pub(crate) fn edge_at(
 		&self,
@@ -2835,17 +2869,19 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 				Err(error::Error::Unwind)
 			}
 		} else {
-			// Regular child - use edges array
-			// SAFETY: Caller guarantees pos < len
-			Ok(unsafe { self.edges.get_unchecked(pos as usize) })
+			// Regular child - use edges array with safe bounds check
+			self.edges.get(pos as usize).ok_or(error::Error::Unwind)
 		}
 	}
 
 	/// Returns the separator key at the given position.
+	///
+	/// # Concurrency Safety
+	///
+	/// Uses safe bounds checking - returns `Err(Unwind)` if position is invalid.
 	#[inline]
 	pub(crate) fn key_at(&self, pos: u16) -> error::Result<&K> {
-		// SAFETY: Caller guarantees pos < len
-		Ok(unsafe { self.keys.get_unchecked(pos as usize) })
+		self.keys.get(pos as usize).ok_or(error::Error::Unwind)
 	}
 
 	/// Returns `true` if there's room for another key/edge pair.
@@ -3069,6 +3105,263 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	}
 }
 
+// ===========================================================================
+// Test-Only Validation Module
+// ===========================================================================
+
+/// Invariant validation for testing. Validates tree structure to ensure
+/// unreachable code paths are never reached.
+#[cfg(any(test, feature = "test-utils"))]
+impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
+	GenericTree<K, V, IC, LC>
+{
+	/// Validates all tree invariants. Panics with diagnostic info if any invariant is violated.
+	///
+	/// This function should be called after operations in tests to verify the tree
+	/// maintains its structural integrity.
+	///
+	/// # Invariants Checked
+	///
+	/// 1. Height consistency: All leaves at same depth
+	/// 2. Node type consistency: Internal nodes at internal levels, leaves at leaf level
+	/// 3. Key ordering: Keys sorted within each node
+	/// 4. Fence key consistency: Keys fall within fence bounds
+	/// 5. Upper edge presence: All internal nodes have upper_edge set
+	/// 6. Length consistency: len field matches actual key count
+	pub fn assert_invariants(&self) {
+		let eg = epoch::pin();
+		let height = self.height.load(Ordering::Acquire);
+
+		// Get root
+		let tree_guard = self.root.optimistic_or_spin();
+		let root_ptr = tree_guard.load(Ordering::Acquire, &eg);
+
+		if root_ptr.is_null() {
+			// Empty tree - only valid if height is 1
+			assert_eq!(height, 1, "Empty tree should have height 1");
+			return;
+		}
+
+		// SAFETY: We're in a test context and hold an epoch guard
+		let root_latch = unsafe { root_ptr.deref() };
+		let root_guard = root_latch.optimistic_or_spin();
+
+		// Validate recursively
+		self.validate_node_recursive(&root_guard, 0, height, None, None, &eg);
+	}
+
+	/// Recursively validates a node and its subtree.
+	///
+	/// # Arguments
+	/// * `node` - The node to validate
+	/// * `level` - Current level (0 = root)
+	/// * `height` - Total tree height
+	/// * `expected_lower` - Lower bound from parent (exclusive), None if leftmost
+	/// * `expected_upper` - Upper bound from parent (inclusive), None if rightmost
+	fn validate_node_recursive<'a>(
+		&self,
+		guard: &OptimisticGuard<'a, Node<K, V, IC, LC>>,
+		level: usize,
+		height: usize,
+		expected_lower: Option<&K>,
+		expected_upper: Option<&K>,
+		eg: &epoch::Guard,
+	) {
+		let is_leaf_level = level == height - 1;
+
+		match guard.inner() {
+			Node::Leaf(leaf) => {
+				// Invariant 2: Node type consistency
+				assert!(
+					is_leaf_level,
+					"Found leaf at level {} but expected internal (height={})",
+					level,
+					height
+				);
+
+				// Invariant 6: Length consistency
+				assert_eq!(
+					leaf.len as usize,
+					leaf.keys.len(),
+					"Leaf len {} != keys.len() {}",
+					leaf.len,
+					leaf.keys.len()
+				);
+				assert_eq!(
+					leaf.keys.len(),
+					leaf.values.len(),
+					"Leaf keys.len() {} != values.len() {}",
+					leaf.keys.len(),
+					leaf.values.len()
+				);
+
+				// Invariant 3: Key ordering
+				for i in 1..leaf.keys.len() {
+					assert!(
+						leaf.keys[i - 1] < leaf.keys[i],
+						"Keys not sorted at positions {} and {}: {:?} >= {:?}",
+						i - 1,
+						i,
+						leaf.keys[i - 1],
+						leaf.keys[i]
+					);
+				}
+
+				// Invariant 4: Fence key consistency
+				if let Some(lower) = &leaf.lower_fence {
+					for key in &leaf.keys[..] {
+						assert!(
+							key > lower,
+							"Key {:?} not greater than lower_fence {:?}",
+							key,
+							lower
+						);
+					}
+				}
+				if let Some(upper) = &leaf.upper_fence {
+					for key in &leaf.keys[..] {
+						assert!(
+							key <= upper,
+							"Key {:?} not <= upper_fence {:?}",
+							key,
+							upper
+						);
+					}
+				}
+
+				// Check against parent's expected bounds
+				if let Some(lower) = expected_lower {
+					for key in &leaf.keys[..] {
+						assert!(
+							key > lower,
+							"Key {:?} not greater than parent lower bound {:?}",
+							key,
+							lower
+						);
+					}
+				}
+				if let Some(upper) = expected_upper {
+					for key in &leaf.keys[..] {
+						assert!(
+							key <= upper,
+							"Key {:?} not <= parent upper bound {:?}",
+							key,
+							upper
+						);
+					}
+				}
+			}
+			Node::Internal(internal) => {
+				// Invariant 2: Node type consistency
+				assert!(
+					!is_leaf_level,
+					"Found internal node at leaf level {} (height={})",
+					level,
+					height
+				);
+
+				// Invariant 5: Upper edge presence
+				assert!(
+					internal.upper_edge.is_some(),
+					"Internal node at level {} has no upper_edge",
+					level
+				);
+
+				// Invariant 6: Length consistency
+				assert_eq!(
+					internal.len as usize,
+					internal.keys.len(),
+					"Internal len {} != keys.len() {}",
+					internal.len,
+					internal.keys.len()
+				);
+				assert_eq!(
+					internal.keys.len(),
+					internal.edges.len(),
+					"Internal keys.len() {} != edges.len() {}",
+					internal.keys.len(),
+					internal.edges.len()
+				);
+
+				// Invariant 3: Key ordering
+				for i in 1..internal.keys.len() {
+					assert!(
+						internal.keys[i - 1] < internal.keys[i],
+						"Internal keys not sorted at {} and {}: {:?} >= {:?}",
+						i - 1,
+						i,
+						internal.keys[i - 1],
+						internal.keys[i]
+					);
+				}
+
+				// Invariant 4: Fence key consistency
+				if let Some(lower) = &internal.lower_fence {
+					for key in &internal.keys[..] {
+						assert!(
+							key > lower,
+							"Internal key {:?} not > lower_fence {:?}",
+							key,
+							lower
+						);
+					}
+				}
+				if let Some(upper) = &internal.upper_fence {
+					for key in &internal.keys[..] {
+						assert!(
+							key <= upper,
+							"Internal key {:?} not <= upper_fence {:?}",
+							key,
+							upper
+						);
+					}
+				}
+
+				// Recurse into children
+				let mut prev_upper: Option<&K> = expected_lower;
+
+				for (i, edge) in internal.edges.iter().enumerate() {
+					let child_ptr = edge.load(Ordering::Acquire, eg);
+					if !child_ptr.is_null() {
+						// SAFETY: Test context with epoch guard
+						let child_latch = unsafe { child_ptr.deref() };
+						let child_guard = child_latch.optimistic_or_spin();
+
+						let child_upper = Some(&internal.keys[i]);
+						self.validate_node_recursive(
+							&child_guard,
+							level + 1,
+							height,
+							prev_upper,
+							child_upper,
+							eg,
+						);
+						prev_upper = child_upper;
+					}
+				}
+
+				// Validate upper_edge child
+				if let Some(upper_edge) = &internal.upper_edge {
+					let child_ptr = upper_edge.load(Ordering::Acquire, eg);
+					if !child_ptr.is_null() {
+						let child_latch = unsafe { child_ptr.deref() };
+						let child_guard = child_latch.optimistic_or_spin();
+
+						self.validate_node_recursive(
+							&child_guard,
+							level + 1,
+							height,
+							prev_upper,
+							expected_upper,
+							eg,
+						);
+					}
+				}
+			}
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -3085,6 +3378,8 @@ mod tests {
 		assert_eq!(tree.insert(2, "two"), None);
 		assert_eq!(tree.insert(3, "three"), None);
 
+		tree.assert_invariants();
+
 		assert_eq!(tree.lookup(&1, |v| *v), Some("one"));
 		assert_eq!(tree.lookup(&2, |v| *v), Some("two"));
 		assert_eq!(tree.lookup(&3, |v| *v), Some("three"));
@@ -3098,6 +3393,8 @@ mod tests {
 		assert_eq!(tree.insert(1, "one"), None);
 		assert_eq!(tree.insert(1, "uno"), Some("one"));
 		assert_eq!(tree.lookup(&1, |v| *v), Some("uno"));
+
+		tree.assert_invariants();
 	}
 
 	#[test]
@@ -3107,9 +3404,13 @@ mod tests {
 		tree.insert(1, "one");
 		tree.insert(2, "two");
 
+		tree.assert_invariants();
+
 		assert_eq!(tree.remove(&1), Some("one"));
 		assert_eq!(tree.lookup(&1, |v| *v), None);
 		assert_eq!(tree.lookup(&2, |v| *v), Some("two"));
+
+		tree.assert_invariants();
 	}
 
 	#[test]
@@ -3119,6 +3420,8 @@ mod tests {
 		for i in 0..100 {
 			tree.insert(i, i * 10);
 		}
+
+		tree.assert_invariants();
 
 		let mut iter = tree.raw_iter();
 		iter.seek_to_first();
@@ -3140,6 +3443,8 @@ mod tests {
 		for i in 0..100 {
 			tree.insert(i, i * 10);
 		}
+
+		tree.assert_invariants();
 
 		let mut iter = tree.raw_iter();
 		iter.seek_to_last();
@@ -3167,8 +3472,12 @@ mod tests {
 		tree.insert(2, 20);
 		assert_eq!(tree.len(), 2);
 
+		tree.assert_invariants();
+
 		tree.remove(&1);
 		assert_eq!(tree.len(), 1);
+
+		tree.assert_invariants();
 	}
 
 	// -----------------------------------------------------------------------
@@ -3513,6 +3822,7 @@ mod tests {
 			tree.insert(i, i);
 		}
 
+		tree.assert_invariants();
 		assert!(tree.height() > 1);
 
 		// Verify all entries are still findable
@@ -3529,6 +3839,8 @@ mod tests {
 		for i in 0..1000 {
 			tree.insert(i, i);
 		}
+
+		tree.assert_invariants();
 
 		assert!(tree.height() >= 2);
 		assert_eq!(tree.len(), 1000);
@@ -3547,6 +3859,8 @@ mod tests {
 		for i in (0..200).rev() {
 			tree.insert(i, i);
 		}
+
+		tree.assert_invariants();
 
 		// Verify all entries and order
 		let mut iter = tree.raw_iter();
@@ -3572,6 +3886,8 @@ mod tests {
 		for k in keys {
 			tree.insert(k, k * 10);
 		}
+
+		tree.assert_invariants();
 
 		// Verify all entries are findable
 		for i in 0..200 {
@@ -3601,10 +3917,13 @@ mod tests {
 			tree.insert(i, i);
 		}
 
+		tree.assert_invariants();
+
 		for i in 0..100 {
 			assert_eq!(tree.remove(&i), Some(i));
 		}
 
+		tree.assert_invariants();
 		assert!(tree.is_empty());
 	}
 
@@ -3616,10 +3935,13 @@ mod tests {
 			tree.insert(i, i);
 		}
 
+		tree.assert_invariants();
+
 		for i in (0..100).rev() {
 			assert_eq!(tree.remove(&i), Some(i));
 		}
 
+		tree.assert_invariants();
 		assert!(tree.is_empty());
 	}
 
@@ -3633,6 +3955,8 @@ mod tests {
 			tree.insert(i, i);
 		}
 
+		tree.assert_invariants();
+
 		let mut keys: Vec<i32> = (0..100).collect();
 		let mut rng = rand::thread_rng();
 		keys.shuffle(&mut rng);
@@ -3641,6 +3965,7 @@ mod tests {
 			assert_eq!(tree.remove(&k), Some(k));
 		}
 
+		tree.assert_invariants();
 		assert!(tree.is_empty());
 	}
 
@@ -3651,6 +3976,7 @@ mod tests {
 
 		assert_eq!(tree.remove(&999), None);
 		assert_eq!(tree.len(), 1);
+		tree.assert_invariants();
 	}
 
 	#[test]
@@ -3660,6 +3986,7 @@ mod tests {
 
 		let result = tree.remove_entry(&42);
 		assert_eq!(result, Some((42, 420)));
+		tree.assert_invariants();
 	}
 
 	#[test]
@@ -3671,10 +3998,14 @@ mod tests {
 			tree.insert(i, i);
 		}
 
+		tree.assert_invariants();
+
 		// Delete half
 		for i in 0..25 {
 			tree.remove(&i);
 		}
+
+		tree.assert_invariants();
 
 		// Insert more
 		for i in 50..100 {
@@ -3685,6 +4016,8 @@ mod tests {
 		for i in 50..75 {
 			tree.remove(&i);
 		}
+
+		tree.assert_invariants();
 
 		// Verify remaining entries
 		assert_eq!(tree.len(), 50); // 25-49 and 75-99
@@ -3734,13 +4067,16 @@ mod tests {
 	#[test]
 	fn empty_tree_lookup() {
 		let tree: Tree<i32, i32> = Tree::new();
+		tree.assert_invariants();
 		assert_eq!(tree.lookup(&1, |v| *v), None);
 	}
 
 	#[test]
 	fn empty_tree_remove() {
 		let tree: Tree<i32, i32> = Tree::new();
+		tree.assert_invariants();
 		assert_eq!(tree.remove(&1), None);
+		tree.assert_invariants();
 	}
 
 	#[test]
@@ -3751,6 +4087,7 @@ mod tests {
 		tree.insert(1, 20);
 		tree.insert(1, 30);
 
+		tree.assert_invariants();
 		assert_eq!(tree.lookup(&1, |v| *v), Some(30));
 		assert_eq!(tree.len(), 1);
 	}
@@ -3763,6 +4100,7 @@ mod tests {
 		tree.insert("banana".to_string(), 2);
 		tree.insert("cherry".to_string(), 3);
 
+		tree.assert_invariants();
 		assert_eq!(tree.lookup(&"banana".to_string(), |v| *v), Some(2));
 	}
 
@@ -3771,6 +4109,7 @@ mod tests {
 		let tree: Tree<String, i32> = Tree::new();
 		tree.insert("hello".to_string(), 42);
 
+		tree.assert_invariants();
 		// Lookup using &str instead of String
 		assert_eq!(tree.lookup("hello", |v| *v), Some(42));
 	}
@@ -3780,6 +4119,7 @@ mod tests {
 		let tree: Tree<String, i32> = Tree::new();
 		tree.insert("".to_string(), 42);
 
+		tree.assert_invariants();
 		assert_eq!(tree.lookup(&"".to_string(), |v| *v), Some(42));
 	}
 
@@ -3790,6 +4130,7 @@ mod tests {
 		let large_value = vec![0u8; 10000];
 		tree.insert(1, large_value.clone());
 
+		tree.assert_invariants();
 		let result = tree.lookup(&1, |v| v.len());
 		assert_eq!(result, Some(10000));
 	}
@@ -3801,6 +4142,7 @@ mod tests {
 	#[test]
 	fn tree_default_creates_empty_tree() {
 		let tree: Tree<i32, i32> = Tree::default();
+		tree.assert_invariants();
 		assert!(tree.is_empty());
 		assert_eq!(tree.height(), 1);
 	}

@@ -19,6 +19,7 @@ fn large_scale_insert_and_lookup() {
 		tree.insert(i, i * 10);
 	}
 
+	tree.assert_invariants();
 	assert_eq!(tree.len(), 10_000);
 
 	// Verify all entries are findable
@@ -36,11 +37,14 @@ fn large_scale_insert_and_remove() {
 		tree.insert(i, i);
 	}
 
+	tree.assert_invariants();
+
 	// Remove all entries
 	for i in 0..10_000 {
 		assert_eq!(tree.remove(&i), Some(i), "Failed to remove key {}", i);
 	}
 
+	tree.assert_invariants();
 	assert!(tree.is_empty());
 }
 
@@ -79,6 +83,8 @@ fn large_scale_random_operations() {
 		}
 	}
 
+	tree.assert_invariants();
+
 	// Verify final state matches
 	assert_eq!(tree.len(), expected.len());
 
@@ -99,6 +105,8 @@ fn sequential_keys_ascending() {
 		tree.insert(i, i);
 	}
 
+	tree.assert_invariants();
+
 	// Verify sorted order
 	let mut iter = tree.raw_iter();
 	iter.seek_to_first();
@@ -118,6 +126,8 @@ fn sequential_keys_descending() {
 	for i in (0..5000).rev() {
 		tree.insert(i, i);
 	}
+
+	tree.assert_invariants();
 
 	// Verify sorted order
 	let mut iter = tree.raw_iter();
@@ -142,6 +152,8 @@ fn random_keys() {
 	for k in &keys {
 		tree.insert(*k, *k * 10);
 	}
+
+	tree.assert_invariants();
 
 	// Verify all entries
 	for k in &keys {
@@ -170,6 +182,8 @@ fn sparse_keys() {
 		tree.insert(k, k);
 	}
 
+	tree.assert_invariants();
+
 	for k in keys {
 		assert_eq!(tree.lookup(&k, |v| *v), Some(k));
 	}
@@ -187,10 +201,13 @@ fn delete_all_forward() {
 		tree.insert(i, i);
 	}
 
+	tree.assert_invariants();
+
 	for i in 0..1000 {
 		tree.remove(&i);
 	}
 
+	tree.assert_invariants();
 	assert!(tree.is_empty());
 }
 
@@ -202,10 +219,13 @@ fn delete_all_reverse() {
 		tree.insert(i, i);
 	}
 
+	tree.assert_invariants();
+
 	for i in (0..1000).rev() {
 		tree.remove(&i);
 	}
 
+	tree.assert_invariants();
 	assert!(tree.is_empty());
 }
 
@@ -218,6 +238,8 @@ fn delete_all_random() {
 		tree.insert(i, i);
 	}
 
+	tree.assert_invariants();
+
 	let mut keys: Vec<i32> = (0..1000).collect();
 	keys.shuffle(&mut rng);
 
@@ -225,6 +247,7 @@ fn delete_all_random() {
 		tree.remove(&k);
 	}
 
+	tree.assert_invariants();
 	assert!(tree.is_empty());
 }
 
@@ -236,11 +259,14 @@ fn delete_every_other() {
 		tree.insert(i, i);
 	}
 
+	tree.assert_invariants();
+
 	// Delete even keys
 	for i in (0..1000).step_by(2) {
 		tree.remove(&i);
 	}
 
+	tree.assert_invariants();
 	assert_eq!(tree.len(), 500);
 
 	// Verify remaining keys
@@ -265,6 +291,8 @@ fn full_forward_scan() {
 		tree.insert(i, i * 2);
 	}
 
+	tree.assert_invariants();
+
 	let mut iter = tree.raw_iter();
 	iter.seek_to_first();
 
@@ -285,6 +313,8 @@ fn full_reverse_scan() {
 		tree.insert(i, i * 2);
 	}
 
+	tree.assert_invariants();
+
 	let mut iter = tree.raw_iter();
 	iter.seek_to_last();
 
@@ -304,6 +334,8 @@ fn forward_then_reverse_scan() {
 	for i in 0..100 {
 		tree.insert(i, i);
 	}
+
+	tree.assert_invariants();
 
 	let mut iter = tree.raw_iter();
 	iter.seek_to_first();
@@ -337,6 +369,8 @@ fn range_query_forward() {
 		tree.insert(i, i);
 	}
 
+	tree.assert_invariants();
+
 	// Query range [250, 750)
 	let mut iter = tree.raw_iter();
 	iter.seek(&250);
@@ -361,6 +395,8 @@ fn range_query_reverse() {
 	for i in 0..1000 {
 		tree.insert(i, i);
 	}
+
+	tree.assert_invariants();
 
 	// Query range (250, 750] in reverse
 	let mut iter = tree.raw_iter();
@@ -389,6 +425,8 @@ fn range_query_nonexistent_bounds() {
 		tree.insert(i, i);
 	}
 
+	tree.assert_invariants();
+
 	// Seek to 251 (doesn't exist, should position at 252)
 	let mut iter = tree.raw_iter();
 	iter.seek(&251);
@@ -409,6 +447,8 @@ fn remove_via_exclusive_iterator() {
 		tree.insert(i, i);
 	}
 
+	tree.assert_invariants();
+
 	// Remove every other element using exclusive iterator
 	{
 		let mut iter = tree.raw_iter_mut();
@@ -417,6 +457,7 @@ fn remove_via_exclusive_iterator() {
 		}
 	}
 
+	tree.assert_invariants();
 	assert_eq!(tree.len(), 50);
 
 	// Verify remaining elements
@@ -440,6 +481,7 @@ fn insert_via_exclusive_iterator() {
 		}
 	}
 
+	tree.assert_invariants();
 	assert_eq!(tree.len(), 100);
 
 	for i in 0..100 {
@@ -456,11 +498,13 @@ fn single_element_operations() {
 	let tree: Tree<i32, i32> = Tree::new();
 
 	tree.insert(42, 420);
+	tree.assert_invariants();
 	assert_eq!(tree.len(), 1);
 	assert_eq!(tree.height(), 1);
 	assert_eq!(tree.lookup(&42, |v| *v), Some(420));
 
 	tree.remove(&42);
+	tree.assert_invariants();
 	assert!(tree.is_empty());
 }
 
@@ -470,6 +514,7 @@ fn two_element_operations() {
 
 	tree.insert(1, 10);
 	tree.insert(2, 20);
+	tree.assert_invariants();
 
 	// Forward iteration
 	let mut iter = tree.raw_iter();
@@ -492,6 +537,8 @@ fn boundary_keys_i32() {
 	tree.insert(i32::MIN, 1);
 	tree.insert(0, 2);
 	tree.insert(i32::MAX, 3);
+
+	tree.assert_invariants();
 
 	assert_eq!(tree.lookup(&i32::MIN, |v| *v), Some(1));
 	assert_eq!(tree.lookup(&0, |v| *v), Some(2));
@@ -522,6 +569,8 @@ fn string_keys_various_lengths() {
 		tree.insert(k.clone(), i as i32);
 	}
 
+	tree.assert_invariants();
+
 	for (i, k) in keys.iter().enumerate() {
 		assert_eq!(tree.lookup(k, |v| *v), Some(i as i32));
 	}
@@ -536,6 +585,8 @@ fn consecutive_duplicates() {
 		tree.insert(42, i);
 	}
 
+	tree.assert_invariants();
+
 	// Only the last value should be stored
 	assert_eq!(tree.len(), 1);
 	assert_eq!(tree.lookup(&42, |v| *v), Some(99));
@@ -549,6 +600,7 @@ fn consecutive_duplicates() {
 fn height_increases_with_inserts() {
 	let tree: Tree<i32, i32> = Tree::new();
 
+	tree.assert_invariants();
 	assert_eq!(tree.height(), 1);
 
 	// Insert enough to cause at least one level of splits
@@ -556,6 +608,7 @@ fn height_increases_with_inserts() {
 		tree.insert(i, i);
 	}
 
+	tree.assert_invariants();
 	assert!(tree.height() >= 2);
 }
 
@@ -567,6 +620,8 @@ fn height_with_many_inserts() {
 	for i in 0..10_000 {
 		tree.insert(i, i);
 	}
+
+	tree.assert_invariants();
 
 	// With leaf capacity 64 and internal capacity 64,
 	// 10000 entries should result in height >= 3
@@ -600,6 +655,8 @@ fn complex_value_type() {
 		);
 	}
 
+	tree.assert_invariants();
+
 	let result = tree.lookup(&50, |v| v.clone());
 	assert!(result.is_some());
 	let value = result.unwrap();
@@ -616,6 +673,7 @@ fn zero_sized_value() {
 		tree.insert(i, ());
 	}
 
+	tree.assert_invariants();
 	assert_eq!(tree.len(), 100);
 	assert!(tree.lookup(&50, |_| true).unwrap());
 }

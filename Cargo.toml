@@ -5,6 +5,10 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Concurrent in-memory B+ Tree featuring optimistic lock coupling"
 
+[features]
+default = []
+test-utils = []
+
 [dependencies]
 crossbeam-epoch = "0.9"
 parking_lot = "0.12.5"
@@ -15,3 +19,5 @@ thiserror = "2.0.18"
 rand = "0.9.2"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1"
+# Enable test-utils feature for integration tests
+ferntree = { path = ".", features = ["test-utils"] }
