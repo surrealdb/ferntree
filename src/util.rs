@@ -293,8 +293,10 @@ fn translate_node(tree_node: TreeNode) -> Atomic<HybridLatch<DefaultNode>> {
 /// ```
 pub fn sample_tree<P: AsRef<std::path::Path>>(path: P) -> Tree<String, u64> {
 	// Read and parse the JSON file
-	let file = std::fs::File::open(path).expect("failed to find file");
-	let json_tree: SampleTree = serde_json::from_reader(file).unwrap();
+	let file = std::fs::File::open(&path)
+		.unwrap_or_else(|e| panic!("failed to open fixture file {:?}: {}", path.as_ref(), e));
+	let json_tree: SampleTree =
+		serde_json::from_reader(file).expect("failed to parse fixture JSON");
 
 	// Translate the JSON structure to actual tree nodes
 	let translated = translate_node(json_tree.root);

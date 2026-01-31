@@ -104,6 +104,19 @@ pub enum Error {
 	/// - `Reclaimed`: "This node doesn't exist anymore, start over"
 	#[error("called find_parent on reclaimed node")]
 	Reclaimed,
+
+	/// An internal invariant was violated - indicates a bug in ferntree.
+	///
+	/// This error occurs when the tree's internal state is inconsistent,
+	/// which should never happen during normal operation. If you encounter
+	/// this error, please report it as a bug.
+	///
+	/// # Response
+	///
+	/// This error indicates a serious problem with the tree implementation.
+	/// The tree may be in an inconsistent state and should not be trusted.
+	#[error("internal invariant violation: {0}")]
+	InvariantViolation(&'static str),
 }
 
 /// A Result type alias using our custom Error type.

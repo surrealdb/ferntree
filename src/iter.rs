@@ -282,7 +282,11 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 						// Past the end of this leaf
 						if leaf.len > 0 {
 							// Anchor after the last key in this leaf
-							Anchor::After(leaf.key_at(leaf.len - 1).expect("should exist").clone())
+							Anchor::After(
+								leaf.key_at(leaf.len - 1)
+									.expect("leaf.len > 0 implies key exists at len-1")
+									.clone(),
+							)
 						} else if let Some(k) = &leaf.lower_fence {
 							// Empty leaf - anchor at its lower bound
 							Anchor::After(k.clone())
@@ -292,7 +296,11 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 						}
 					} else {
 						// Normal case - anchor before the key at this position
-						Anchor::Before(leaf.key_at(pos).expect("should exist").clone())
+						Anchor::Before(
+							leaf.key_at(pos)
+								.expect("pos < leaf.len implies key exists at pos")
+								.clone(),
+						)
 					}
 				}
 				Cursor::After(pos) => {
@@ -300,7 +308,11 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 					if pos >= leaf.len {
 						// Position is past leaf bounds
 						if leaf.len > 0 {
-							Anchor::After(leaf.key_at(leaf.len - 1).expect("should exist").clone())
+							Anchor::After(
+								leaf.key_at(leaf.len - 1)
+									.expect("leaf.len > 0 implies key exists at len-1")
+									.clone(),
+							)
 						} else if let Some(k) = &leaf.upper_fence {
 							Anchor::After(k.clone())
 						} else {
@@ -308,7 +320,11 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 						}
 					} else {
 						// Normal case - anchor after the key at this position
-						Anchor::After(leaf.key_at(pos).expect("should exist").clone())
+						Anchor::After(
+							leaf.key_at(pos)
+								.expect("pos < leaf.len implies key exists at pos")
+								.clone(),
+						)
 					}
 				}
 			};
@@ -807,7 +823,9 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				let (guard, cursor) = self.leaf.as_mut().unwrap();
 				let leaf = guard.as_leaf();
 				*cursor = new_cursor;
-				return Some(leaf.kv_at(curr_pos).expect("should exist"));
+				return Some(
+					leaf.kv_at(curr_pos).expect("cursor position validated before access"),
+				);
 			} else {
 				// Current leaf exhausted - try to move to next leaf
 				match self.next_leaf() {
@@ -876,7 +894,9 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				let (guard, cursor) = self.leaf.as_mut().unwrap();
 				let leaf = guard.as_leaf();
 				*cursor = new_cursor;
-				return Some(leaf.kv_at(curr_pos).expect("should exist"));
+				return Some(
+					leaf.kv_at(curr_pos).expect("cursor position validated before access"),
+				);
 			} else {
 				// Current leaf exhausted - try to move to previous leaf
 				match self.prev_leaf() {
@@ -995,27 +1015,43 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				Cursor::Before(pos) => {
 					if pos >= leaf.len {
 						if leaf.len > 0 {
-							Anchor::After(leaf.key_at(leaf.len - 1).expect("should exist").clone())
+							Anchor::After(
+								leaf.key_at(leaf.len - 1)
+									.expect("leaf.len > 0 implies key exists at len-1")
+									.clone(),
+							)
 						} else if let Some(k) = &leaf.lower_fence {
 							Anchor::After(k.clone())
 						} else {
 							Anchor::Start
 						}
 					} else {
-						Anchor::Before(leaf.key_at(pos).expect("should exist").clone())
+						Anchor::Before(
+							leaf.key_at(pos)
+								.expect("pos < leaf.len implies key exists at pos")
+								.clone(),
+						)
 					}
 				}
 				Cursor::After(pos) => {
 					if pos >= leaf.len {
 						if leaf.len > 0 {
-							Anchor::After(leaf.key_at(leaf.len - 1).expect("should exist").clone())
+							Anchor::After(
+								leaf.key_at(leaf.len - 1)
+									.expect("leaf.len > 0 implies key exists at len-1")
+									.clone(),
+							)
 						} else if let Some(k) = &leaf.upper_fence {
 							Anchor::After(k.clone())
 						} else {
 							Anchor::End
 						}
 					} else {
-						Anchor::After(leaf.key_at(pos).expect("should exist").clone())
+						Anchor::After(
+							leaf.key_at(pos)
+								.expect("pos < leaf.len implies key exists at pos")
+								.clone(),
+						)
 					}
 				}
 			};
@@ -1600,7 +1636,9 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				let leaf = guard.as_leaf_mut();
 				*cursor = new_cursor;
 				// Return mutable reference to value
-				return Some(leaf.kv_at_mut(curr_pos).expect("should exist"));
+				return Some(
+					leaf.kv_at_mut(curr_pos).expect("cursor position validated before access"),
+				);
 			} else {
 				match self.next_leaf() {
 					LeafResult::Ok | LeafResult::Retry => {
@@ -1651,7 +1689,9 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				let (guard, cursor) = self.leaf.as_mut().unwrap();
 				let leaf = guard.as_leaf_mut();
 				*cursor = new_cursor;
-				return Some(leaf.kv_at_mut(curr_pos).expect("should exist"));
+				return Some(
+					leaf.kv_at_mut(curr_pos).expect("cursor position validated before access"),
+				);
 			} else {
 				match self.prev_leaf() {
 					LeafResult::Ok | LeafResult::Retry => {

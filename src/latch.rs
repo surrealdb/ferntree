@@ -662,7 +662,10 @@ impl<'a, T> ExclusiveGuard<'a, T> {
 	/// because the lock guarantees exclusive access.
 	#[inline]
 	pub fn recheck(&self) {
-		assert!(self.version == self.latch.version.load(Ordering::Relaxed));
+		assert!(
+			self.version == self.latch.version.load(Ordering::Relaxed),
+			"exclusive guard version mismatch - lock invariant violated"
+		);
 	}
 
 	/// Releases the write lock and returns an optimistic guard.
@@ -793,7 +796,10 @@ impl<'a, T> SharedGuard<'a, T> {
 	/// but it's useful as a sanity check.
 	#[inline]
 	pub fn recheck(&self) {
-		assert!(self.version == self.latch.version.load(Ordering::Relaxed));
+		assert!(
+			self.version == self.latch.version.load(Ordering::Relaxed),
+			"shared guard version mismatch - lock invariant violated"
+		);
 	}
 
 	/// Releases the shared lock and returns an optimistic guard.

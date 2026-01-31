@@ -889,7 +889,9 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 								break target_guard.to_shared()?;
 							} else {
 								// Should never happen - found leaf before expected level
-								panic!("got a leaf on the wrong level");
+								unreachable!(
+									"tree structure corruption: encountered leaf at internal level during traversal"
+								)
 							}
 						}
 					};
@@ -1038,7 +1040,9 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 							if p_guard.is_none() {
 								break target_guard.to_exclusive()?;
 							} else {
-								panic!("got a leaf on the wrong level");
+								unreachable!(
+									"tree structure corruption: encountered leaf at internal level during traversal"
+								)
 							}
 						}
 					};
@@ -1257,7 +1261,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 					}
 				} else {
 					// find_leaf should always return a leaf node
-					unreachable!("must be a leaf node");
+					unreachable!("find_leaf returned non-leaf node - tree traversal invariant violated")
 				}
 			};
 
@@ -1484,7 +1488,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 						// Choose the middle position for the split
 						let split_pos = root_internal_node.len / 2;
 						let split_key =
-							root_internal_node.key_at(split_pos).expect("should exist").clone();
+							root_internal_node.key_at(split_pos).expect("split position must be within node bounds").clone();
 
 						// Allocate the new right sibling (also internal)
 						let mut new_right_node_owned =
@@ -1521,7 +1525,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 						// Choose the middle position for the split
 						let split_pos = root_leaf_node.len / 2;
 						let split_key =
-							root_leaf_node.key_at(split_pos).expect("should exist").clone();
+							root_leaf_node.key_at(split_pos).expect("split position must be within node bounds").clone();
 
 						// Allocate the new right sibling (also a leaf)
 						let mut new_right_node_owned =
@@ -1597,7 +1601,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 							// Choose split position
 							let split_pos = left_internal.len / 2;
 							let split_key =
-								left_internal.key_at(split_pos).expect("should exist").clone();
+								left_internal.key_at(split_pos).expect("split position must be within node bounds").clone();
 
 							// Allocate the new right sibling
 							let mut new_right_node_owned =
@@ -1627,7 +1631,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 								let left_edge = parent_internal
 									.upper_edge
 									.replace(new_right_node_edge)
-									.expect("upper_edge must be populated");
+									.expect("internal node upper_edge must be set before split");
 								parent_internal.insert(split_key, left_edge);
 							} else {
 								// Node was at edges[pos] - keep it there (it's now the left).
@@ -1646,7 +1650,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 							// Choose split position
 							let split_pos = left_leaf.len / 2;
 							let split_key =
-								left_leaf.key_at(split_pos).expect("should exist").clone();
+								left_leaf.key_at(split_pos).expect("split position must be within node bounds").clone();
 
 							// Allocate the new right sibling
 							let mut new_right_node_owned =
@@ -1676,7 +1680,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 								let left_edge = parent_internal
 									.upper_edge
 									.replace(new_right_node_edge)
-									.expect("upper_edge must be populated");
+									.expect("internal node upper_edge must be set before split");
 								parent_internal.insert(split_key, left_edge);
 							} else {
 								// Node was at edges[pos] - keep it there (it's now the left).
@@ -1826,7 +1830,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 										let dropped_edge = parent_internal
 											.upper_edge
 											.replace(left_edge)
-											.expect("must exist");
+											.expect("parent upper_edge must exist during merge");
 
 										// Schedule the old target for deferred destruction
 										let shared = dropped_edge.load(Ordering::Relaxed, eg);
@@ -1871,7 +1875,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 										let dropped_edge = parent_internal
 											.upper_edge
 											.replace(left_edge)
-											.expect("must exist");
+											.expect("parent upper_edge must exist during merge");
 
 										let shared = dropped_edge.load(Ordering::Relaxed, eg);
 										if !shared.is_null() {
@@ -1941,7 +1945,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 											let dropped_edge = parent_internal
 												.upper_edge
 												.replace(left_edge)
-												.expect("must exist");
+												.expect("parent upper_edge must exist during merge");
 
 											let shared = dropped_edge.load(Ordering::Relaxed, eg);
 											if !shared.is_null() {
@@ -1981,7 +1985,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 											let dropped_edge = parent_internal
 												.upper_edge
 												.replace(left_edge)
-												.expect("must exist");
+												.expect("parent upper_edge must exist during merge");
 
 											let shared = dropped_edge.load(Ordering::Relaxed, eg);
 											if !shared.is_null() {
@@ -2172,18 +2176,43 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 		matches!(self, Node::Leaf(_))
 	}
 
+	/// Returns a reference to the inner leaf node, if this is a leaf.
+	///
+	/// Returns `None` if this is an internal node.
+	#[inline]
+	#[allow(dead_code)]
+	pub(crate) fn try_as_leaf(&self) -> Option<&LeafNode<K, V, LC>> {
+		match self {
+			Node::Leaf(ref leaf) => Some(leaf),
+			Node::Internal(_) => None,
+		}
+	}
+
 	/// Returns a reference to the inner leaf node.
 	///
 	/// # Panics
 	///
-	/// Panics if called on an internal node.
+	/// Panics if called on an internal node. Use `try_as_leaf()` for
+	/// a fallible alternative.
 	#[inline]
 	pub(crate) fn as_leaf(&self) -> &LeafNode<K, V, LC> {
 		match self {
 			Node::Leaf(ref leaf) => leaf,
 			Node::Internal(_) => {
-				panic!("expected leaf node");
+				unreachable!("as_leaf() called on internal node - this indicates a tree traversal bug")
 			}
+		}
+	}
+
+	/// Returns a mutable reference to the inner leaf node, if this is a leaf.
+	///
+	/// Returns `None` if this is an internal node.
+	#[inline]
+	#[allow(dead_code)]
+	pub(crate) fn try_as_leaf_mut(&mut self) -> Option<&mut LeafNode<K, V, LC>> {
+		match self {
+			Node::Leaf(ref mut leaf) => Some(leaf),
+			Node::Internal(_) => None,
 		}
 	}
 
@@ -2191,14 +2220,27 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 	///
 	/// # Panics
 	///
-	/// Panics if called on an internal node.
+	/// Panics if called on an internal node. Use `try_as_leaf_mut()` for
+	/// a fallible alternative.
 	#[inline]
 	pub(crate) fn as_leaf_mut(&mut self) -> &mut LeafNode<K, V, LC> {
 		match self {
 			Node::Leaf(ref mut leaf) => leaf,
 			Node::Internal(_) => {
-				panic!("expected leaf node");
+				unreachable!("as_leaf_mut() called on internal node - this indicates a tree traversal bug")
 			}
+		}
+	}
+
+	/// Returns a reference to the inner internal node, if this is an internal node.
+	///
+	/// Returns `None` if this is a leaf node.
+	#[inline]
+	#[allow(dead_code)]
+	pub(crate) fn try_as_internal(&self) -> Option<&InternalNode<K, V, IC, LC>> {
+		match self {
+			Node::Internal(ref internal) => Some(internal),
+			Node::Leaf(_) => None,
 		}
 	}
 
@@ -2206,14 +2248,27 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 	///
 	/// # Panics
 	///
-	/// Panics if called on a leaf node.
+	/// Panics if called on a leaf node. Use `try_as_internal()` for
+	/// a fallible alternative.
 	#[inline]
 	pub(crate) fn as_internal(&self) -> &InternalNode<K, V, IC, LC> {
 		match self {
 			Node::Internal(ref internal) => internal,
 			Node::Leaf(_) => {
-				panic!("expected internal node");
+				unreachable!("as_internal() called on leaf node - this indicates a tree traversal bug")
 			}
+		}
+	}
+
+	/// Returns a mutable reference to the inner internal node, if this is an internal node.
+	///
+	/// Returns `None` if this is a leaf node.
+	#[inline]
+	#[allow(dead_code)]
+	pub(crate) fn try_as_internal_mut(&mut self) -> Option<&mut InternalNode<K, V, IC, LC>> {
+		match self {
+			Node::Internal(ref mut internal) => Some(internal),
+			Node::Leaf(_) => None,
 		}
 	}
 
@@ -2221,13 +2276,14 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 	///
 	/// # Panics
 	///
-	/// Panics if called on a leaf node.
+	/// Panics if called on a leaf node. Use `try_as_internal_mut()` for
+	/// a fallible alternative.
 	#[inline]
 	pub(crate) fn as_internal_mut(&mut self) -> &mut InternalNode<K, V, IC, LC> {
 		match self {
 			Node::Internal(ref mut internal) => internal,
 			Node::Leaf(_) => {
-				panic!("expected internal node");
+				unreachable!("as_internal_mut() called on leaf node - this indicates a tree traversal bug")
 			}
 		}
 	}
@@ -2557,7 +2613,7 @@ impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
 	/// - `split_pos`: Position of the key that becomes the separator
 	pub(crate) fn split(&mut self, right: &mut LeafNode<K, V, LC>, split_pos: u16) {
 		// The key at split_pos becomes the boundary between left and right
-		let split_key = self.key_at(split_pos).expect("should exist").clone();
+		let split_key = self.key_at(split_pos).expect("split position must be within node bounds").clone();
 
 		// Update fence keys:
 		// - Right's lower fence is the split key (exclusive)
@@ -2912,7 +2968,7 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	/// the left node's upper_edge.
 	pub(crate) fn split(&mut self, right: &mut InternalNode<K, V, IC, LC>, split_pos: u16) {
 		// Get the split key - this will be pushed up to the parent
-		let split_key = self.key_at(split_pos).expect("should exist").clone();
+		let split_key = self.key_at(split_pos).expect("split position must be within node bounds").clone();
 
 		// Update fence keys
 		right.lower_fence = Some(split_key.clone());
@@ -2930,9 +2986,15 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 
 		// The edge at split_pos becomes our new upper_edge
 		// (it was pointing to children between K(split_pos-1) and K(split_pos))
-		self.upper_edge = Some(self.edges.pop().unwrap());
+		self.upper_edge = Some(
+			self.edges
+				.pop()
+				.expect("edges non-empty: split requires at least one edge"),
+		);
 		// Remove the key at split_pos (it's being pushed to parent)
-		self.keys.pop().unwrap();
+		self.keys
+			.pop()
+			.expect("keys non-empty: split requires at least one key");
 
 		// Set sample keys for node relocation
 		self.sample_key = Some(self.keys[0].clone());
@@ -2981,10 +3043,16 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 
 		// Re-insert the separator key (was in parent, stored as right's lower_fence)
 		// This key goes between our old content and right's content
-		self.keys.push(right.lower_fence.take().expect("right node must have lower fence"));
+		self.keys.push(
+		right
+			.lower_fence
+			.take()
+			.expect("merge requires right node to have lower_fence (separator key)"),
+	);
 
 		// Our old upper_edge becomes a regular edge (points to children < separator)
-		self.edges.push(left_upper_edge.expect("left node must have upper edge"));
+		self.edges
+			.push(left_upper_edge.expect("merge requires left node to have upper_edge"));
 
 		// Append all of right's content
 		self.keys.extend(right.keys.drain(..));
