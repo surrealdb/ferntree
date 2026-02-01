@@ -12,6 +12,7 @@ test-utils = []
 [dependencies]
 crossbeam-epoch = "0.9"
 parking_lot = "0.12.5"
+parking_lot_core = "0.9"
 smallvec = { version = "1.15.1", features = ["serde", "const_generics"] }
 thiserror = "2.0.18"
 

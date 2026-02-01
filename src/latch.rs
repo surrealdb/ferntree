@@ -85,66 +85,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::error;
 
 // ===========================================================================
-// Spin Wait Helper
-// ===========================================================================
-
-/// A simple spin-wait implementation with exponential backoff.
-///
-/// Used when acquiring optimistic access while a write is in progress.
-/// Instead of immediately blocking, we spin briefly hoping the writer finishes.
-///
-/// # Backoff Strategy
-///
-/// 1. First 10 iterations: CPU spin loop (`spin_loop()`)
-/// 2. Next 10 iterations: Thread yield (`yield_now()`)
-/// 3. After 20 iterations: Returns `false` to signal "give up spinning"
-///
-/// This balances low-latency (spinning is faster than sleeping) with
-/// fairness (eventually yielding to let other threads run).
-struct SpinWait {
-	/// Number of spin iterations performed.
-	counter: u32,
-}
-
-impl SpinWait {
-	/// Creates a new `SpinWait` with counter at 0.
-	fn new() -> Self {
-		SpinWait {
-			counter: 0,
-		}
-	}
-
-	/// Performs one spin iteration.
-	///
-	/// # Returns
-	///
-	/// - `true`: Keep spinning (more attempts available)
-	/// - `false`: Stop spinning (reached iteration limit)
-	fn spin(&mut self) -> bool {
-		if self.counter < 10 {
-			// Phase 1: CPU spin loop (fastest, no OS involvement)
-			self.counter += 1;
-			std::hint::spin_loop();
-			true
-		} else if self.counter < 20 {
-			// Phase 2: Yield to OS scheduler (slightly slower, fairer)
-			self.counter += 1;
-			std::thread::yield_now();
-			true
-		} else {
-			// Phase 3: Exhausted patience, but still yield once
-			std::thread::yield_now();
-			false
-		}
-	}
-
-	/// Resets the counter to start fresh spin-waiting.
-	fn reset(&mut self) {
-		self.counter = 0;
-	}
-}
-
-// ===========================================================================
 // HybridLatch
 // ===========================================================================
 
@@ -283,10 +223,9 @@ impl<T> HybridLatch<T> {
 	///
 	/// # Spin Behavior
 	///
-	/// If the latch is write-locked (version is odd), this method spins:
-	/// 1. First 10 iterations: CPU spin loop
-	/// 2. Next 10 iterations: Thread yield
-	/// 3. After that: Keeps yielding and retrying
+	/// If the latch is write-locked (version is odd), this method uses
+	/// `parking_lot_core::SpinWait` which provides exponential backoff:
+	/// spinning briefly, then yielding to the OS scheduler.
 	///
 	/// The spin is designed to be brief, as writes in the B+ tree are typically fast.
 	#[inline(never)]
@@ -297,17 +236,12 @@ impl<T> HybridLatch<T> {
 		// Check if write-locked (odd version)
 		if (version & 1) == 1 {
 			// Write in progress - spin until it completes
-			let mut spinwait = SpinWait::new();
+			let mut spinwait = parking_lot_core::SpinWait::new();
 			loop {
 				version = self.version.load(Ordering::Acquire);
 				if (version & 1) == 1 {
-					// Still locked - continue spinning
-					let result = spinwait.spin();
-					if !result {
-						// Exhausted spin budget - reset and keep trying
-						// (We don't give up because we need to acquire access)
-						spinwait.reset();
-					}
+					// Still locked - continue spinning with exponential backoff
+					spinwait.spin();
 					continue;
 				} else {
 					// Write completed - version is now even
@@ -1213,46 +1147,6 @@ mod tests {
 
 		let opt = latch.optimistic_or_spin();
 		assert_eq!(*opt, vec![1, 2, 3, 4]);
-	}
-
-	// -----------------------------------------------------------------------
-	// SpinWait Tests
-	// -----------------------------------------------------------------------
-
-	#[test]
-	fn spinwait_returns_true_initially() {
-		let mut sw = SpinWait::new();
-		// First 20 spins should return true
-		for _ in 0..20 {
-			assert!(sw.spin());
-		}
-	}
-
-	#[test]
-	fn spinwait_returns_false_after_exhaustion() {
-		let mut sw = SpinWait::new();
-		// Exhaust the spin budget
-		for _ in 0..20 {
-			sw.spin();
-		}
-		// After 20 spins, spin() returns false
-		assert!(!sw.spin());
-	}
-
-	#[test]
-	fn spinwait_reset_restarts_counter() {
-		let mut sw = SpinWait::new();
-		// Exhaust budget
-		for _ in 0..20 {
-			sw.spin();
-		}
-		assert!(!sw.spin());
-
-		// Reset
-		sw.reset();
-
-		// Should return true again
-		assert!(sw.spin());
 	}
 
 	// -----------------------------------------------------------------------
