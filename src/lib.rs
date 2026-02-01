@@ -2418,11 +2418,32 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 	/// Returns `true` if the tree contains no entries.
 	///
-	/// This is an O(1) operation that checks if the first leaf has any entries.
+	/// This is an O(height) operation that traverses to the first leaf
+	/// and checks if it has any entries. This is more efficient than
+	/// the full iterator approach as it avoids iterator allocation and
+	/// only needs optimistic locks.
 	pub fn is_empty(&self) -> bool {
-		let mut iter = self.raw_iter();
-		iter.seek_to_first();
-		iter.next().is_none()
+		let eg = epoch::pin();
+
+		loop {
+			let perform = || {
+				// Find the first (leftmost) leaf in the tree
+				let (leaf_guard, _parent_opt) = self.find_first_leaf_and_parent(&eg)?;
+
+				// Check if the first leaf has any entries
+				let is_empty = leaf_guard.as_leaf().len == 0;
+
+				// Validate our optimistic read
+				leaf_guard.recheck()?;
+
+				error::Result::Ok(is_empty)
+			};
+
+			match perform() {
+				Ok(result) => return result,
+				Err(_) => continue, // Retry on validation failure
+			}
+		}
 	}
 }
 
