@@ -2937,7 +2937,7 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	/// Returns `true` if the node is below minimum occupancy (40% of capacity).
 	#[inline]
 	pub(crate) fn is_underfull(&self) -> bool {
-		(self.len as usize) < (LC as f32 * 0.4) as usize
+		(self.len as usize) * 10 < LC * 4
 	}
 
 	/// Inserts a key-value pair at the specified position.
@@ -3279,7 +3279,7 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	/// Returns `true` if the node is below minimum occupancy (40%).
 	#[inline]
 	pub(crate) fn is_underfull(&self) -> bool {
-		(self.len as usize) < (IC as f32 * 0.4) as usize
+		(self.len as usize) * 10 < IC * 4
 	}
 
 	/// Inserts a key and its left child pointer.
