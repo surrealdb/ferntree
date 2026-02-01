@@ -27,7 +27,7 @@
 //! ## Anchor Recovery
 //!
 //! Because the tree uses optimistic concurrency, concurrent modifications can
-//! invalidate our position. The [`Anchor`] mechanism captures a logical position
+//! invalidate our position. The anchor mechanism captures a logical position
 //! that can survive structural changes:
 //!
 //! ```text
@@ -58,6 +58,7 @@ use crate::latch::{ExclusiveGuard, OptimisticGuard, SharedGuard};
 use crate::{Direction, GenericTree, Node};
 use crossbeam_epoch::{self as epoch};
 use std::borrow::Borrow;
+use std::ops::Bound;
 
 // ===========================================================================
 // Helper Enums
@@ -1701,6 +1702,241 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				}
 			}
 		}
+	}
+}
+
+// ===========================================================================
+// High-Level Iterator Wrappers
+// ===========================================================================
+
+/// A range iterator over the entries of a B+ tree.
+///
+/// This iterator yields key-value pairs within the specified bounds.
+/// It wraps `RawSharedIter` and provides bounds checking.
+///
+/// # Usage
+///
+/// ```
+/// use ferntree::Tree;
+/// use std::ops::Bound::{Included, Excluded, Unbounded};
+///
+/// let tree: Tree<i32, &str> = Tree::new();
+/// tree.insert(1, "one");
+/// tree.insert(2, "two");
+/// tree.insert(3, "three");
+///
+/// let mut range = tree.range(Included(&2), Unbounded);
+/// assert_eq!(range.next(), Some((&2, &"two")));
+/// assert_eq!(range.next(), Some((&3, &"three")));
+/// assert_eq!(range.next(), None);
+/// ```
+pub struct Range<'t, K, V, const IC: usize, const LC: usize> {
+	/// The underlying iterator.
+	iter: RawSharedIter<'t, K, V, IC, LC>,
+	/// The upper bound for iteration (owned).
+	upper_bound: Bound<K>,
+	/// Whether we've finished iterating.
+	finished: bool,
+}
+
+impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Range<'t, K, V, IC, LC> {
+	/// Creates a new range iterator.
+	///
+	/// The iterator is positioned based on the lower bound and will stop
+	/// when entries exceed the upper bound.
+	pub(crate) fn new<Q>(
+		tree: &'t GenericTree<K, V, IC, LC>,
+		min: Bound<&Q>,
+		max: Bound<&Q>,
+	) -> Range<'t, K, V, IC, LC>
+	where
+		K: Borrow<Q>,
+		Q: ?Sized + Ord,
+	{
+		let mut iter = tree.raw_iter();
+
+		// Position the iterator based on the lower bound
+		match min {
+			Bound::Unbounded => iter.seek_to_first(),
+			Bound::Included(k) => iter.seek(k),
+			Bound::Excluded(k) => {
+				// Seek to the key, then skip it if it exists
+				if iter.seek_exact(k) {
+					let _ = iter.next(); // Skip the excluded key
+				}
+			}
+		}
+
+		// Convert upper bound to owned by finding and cloning the boundary key
+		let upper_bound = match max {
+			Bound::Unbounded => Bound::Unbounded,
+			Bound::Included(k) => {
+				// Find a key at or after k to use as the bound
+				let mut temp = tree.raw_iter();
+				temp.seek(k);
+				match temp.next() {
+					Some((key, _)) if key.borrow() == k => Bound::Included(key.clone()),
+					Some((key, _)) => {
+						// k doesn't exist, use key > k as exclusive bound
+						Bound::Excluded(key.clone())
+					}
+					None => Bound::Unbounded, // No keys at or after k
+				}
+			}
+			Bound::Excluded(k) => {
+				// Find the key at k to use as the bound
+				let mut temp = tree.raw_iter();
+				temp.seek(k);
+				match temp.next() {
+					Some((key, _)) if key.borrow() == k => Bound::Excluded(key.clone()),
+					Some((key, _)) => {
+						// k doesn't exist, use key > k as exclusive bound
+						Bound::Excluded(key.clone())
+					}
+					None => Bound::Unbounded, // No keys at or after k
+				}
+			}
+		};
+
+		Range {
+			iter,
+			upper_bound,
+			finished: false,
+		}
+	}
+
+	/// Returns the next key-value pair within the range.
+	///
+	/// Returns `None` when iteration is complete or when entries
+	/// exceed the upper bound.
+	#[allow(clippy::should_implement_trait)]
+	pub fn next(&mut self) -> Option<(&K, &V)> {
+		if self.finished {
+			return None;
+		}
+
+		match self.iter.next() {
+			Some((k, v)) => {
+				// Check if we've exceeded the upper bound
+				let within_bounds = match &self.upper_bound {
+					Bound::Unbounded => true,
+					Bound::Included(max) => k <= max,
+					Bound::Excluded(max) => k < max,
+				};
+
+				if within_bounds {
+					Some((k, v))
+				} else {
+					self.finished = true;
+					None
+				}
+			}
+			None => {
+				self.finished = true;
+				None
+			}
+		}
+	}
+
+	/// Returns the previous key-value pair within the range.
+	///
+	/// Note: This does not check the lower bound - it simply iterates backwards.
+	pub fn prev(&mut self) -> Option<(&K, &V)> {
+		self.iter.prev()
+	}
+}
+
+/// An iterator over the keys of a B+ tree.
+///
+/// This iterator yields references to keys in ascending order.
+///
+/// # Usage
+///
+/// ```
+/// use ferntree::Tree;
+///
+/// let tree: Tree<i32, &str> = Tree::new();
+/// tree.insert(3, "three");
+/// tree.insert(1, "one");
+/// tree.insert(2, "two");
+///
+/// let mut keys = tree.keys();
+/// assert_eq!(keys.next(), Some(&1));
+/// assert_eq!(keys.next(), Some(&2));
+/// assert_eq!(keys.next(), Some(&3));
+/// assert_eq!(keys.next(), None);
+/// ```
+pub struct Keys<'t, K, V, const IC: usize, const LC: usize> {
+	/// The underlying iterator.
+	iter: RawSharedIter<'t, K, V, IC, LC>,
+}
+
+impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Keys<'t, K, V, IC, LC> {
+	/// Creates a new keys iterator positioned at the first key.
+	pub(crate) fn new(tree: &'t GenericTree<K, V, IC, LC>) -> Keys<'t, K, V, IC, LC> {
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+		Keys {
+			iter,
+		}
+	}
+
+	/// Returns the next key.
+	#[allow(clippy::should_implement_trait)]
+	pub fn next(&mut self) -> Option<&K> {
+		self.iter.next().map(|(k, _)| k)
+	}
+
+	/// Returns the previous key.
+	pub fn prev(&mut self) -> Option<&K> {
+		self.iter.prev().map(|(k, _)| k)
+	}
+}
+
+/// An iterator over the values of a B+ tree.
+///
+/// This iterator yields references to values in key-ascending order.
+///
+/// # Usage
+///
+/// ```
+/// use ferntree::Tree;
+///
+/// let tree: Tree<i32, &str> = Tree::new();
+/// tree.insert(3, "three");
+/// tree.insert(1, "one");
+/// tree.insert(2, "two");
+///
+/// let mut values = tree.values();
+/// assert_eq!(values.next(), Some(&"one"));
+/// assert_eq!(values.next(), Some(&"two"));
+/// assert_eq!(values.next(), Some(&"three"));
+/// assert_eq!(values.next(), None);
+/// ```
+pub struct Values<'t, K, V, const IC: usize, const LC: usize> {
+	/// The underlying iterator.
+	iter: RawSharedIter<'t, K, V, IC, LC>,
+}
+
+impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Values<'t, K, V, IC, LC> {
+	/// Creates a new values iterator positioned at the first value.
+	pub(crate) fn new(tree: &'t GenericTree<K, V, IC, LC>) -> Values<'t, K, V, IC, LC> {
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+		Values {
+			iter,
+		}
+	}
+
+	/// Returns the next value.
+	#[allow(clippy::should_implement_trait)]
+	pub fn next(&mut self) -> Option<&V> {
+		self.iter.next().map(|(_, v)| v)
+	}
+
+	/// Returns the previous value.
+	pub fn prev(&mut self) -> Option<&V> {
+		self.iter.prev().map(|(_, v)| v)
 	}
 }
 

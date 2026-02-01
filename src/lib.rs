@@ -89,6 +89,7 @@ use smallvec::{smallvec, SmallVec};
 
 use std::borrow::Borrow;
 use std::fmt;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub mod error;
@@ -1343,10 +1344,10 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// tree.insert(1, "one");
 	/// tree.insert(2, "two");
 	///
-	/// let first = tree.first_key_value(|k, v| (*k, *v));
+	/// let first = tree.first(|k, v| (*k, *v));
 	/// assert_eq!(first, Some((1, "one")));
 	/// ```
-	pub fn first_key_value<R, F>(&self, f: F) -> Option<R>
+	pub fn first<R, F>(&self, f: F) -> Option<R>
 	where
 		K: Ord,
 		F: Fn(&K, &V) -> R,
@@ -1371,10 +1372,10 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// tree.insert(3, "three");
 	/// tree.insert(2, "two");
 	///
-	/// let last = tree.last_key_value(|k, v| (*k, *v));
+	/// let last = tree.last(|k, v| (*k, *v));
 	/// assert_eq!(last, Some((3, "three")));
 	/// ```
-	pub fn last_key_value<R, F>(&self, f: F) -> Option<R>
+	pub fn last<R, F>(&self, f: F) -> Option<R>
 	where
 		K: Ord,
 		F: Fn(&K, &V) -> R,
@@ -1382,6 +1383,58 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		let mut iter = self.raw_iter();
 		iter.seek_to_last();
 		iter.prev().map(|(k, v)| f(k, v))
+	}
+
+	/// Removes and returns the first (minimum) key-value pair from the tree.
+	///
+	/// Returns `None` if the tree is empty.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, &str> = Tree::new();
+	/// tree.insert(3, "three");
+	/// tree.insert(1, "one");
+	/// tree.insert(2, "two");
+	///
+	/// assert_eq!(tree.pop_first(), Some((1, "one")));
+	/// assert_eq!(tree.pop_first(), Some((2, "two")));
+	/// assert_eq!(tree.pop_first(), Some((3, "three")));
+	/// assert_eq!(tree.pop_first(), None);
+	/// ```
+	pub fn pop_first(&self) -> Option<(K, V)>
+	where
+		K: Clone + Ord,
+	{
+		self.first(|k, _| k.clone()).and_then(|k| self.remove_entry(&k))
+	}
+
+	/// Removes and returns the last (maximum) key-value pair from the tree.
+	///
+	/// Returns `None` if the tree is empty.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, &str> = Tree::new();
+	/// tree.insert(1, "one");
+	/// tree.insert(3, "three");
+	/// tree.insert(2, "two");
+	///
+	/// assert_eq!(tree.pop_last(), Some((3, "three")));
+	/// assert_eq!(tree.pop_last(), Some((2, "two")));
+	/// assert_eq!(tree.pop_last(), Some((1, "one")));
+	/// assert_eq!(tree.pop_last(), None);
+	/// ```
+	pub fn pop_last(&self) -> Option<(K, V)>
+	where
+		K: Clone + Ord,
+	{
+		self.last(|k, _| k.clone()).and_then(|k| self.remove_entry(&k))
 	}
 
 	// -----------------------------------------------------------------------
@@ -2237,6 +2290,96 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		K: Ord,
 	{
 		iter::RawExclusiveIter::new(self)
+	}
+
+	/// Returns an iterator over the entries of the tree within the specified bounds.
+	///
+	/// The iterator yields key-value pairs in ascending key order, starting from
+	/// entries that satisfy the lower bound and stopping when entries exceed
+	/// the upper bound.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	/// use std::ops::Bound::{Included, Excluded, Unbounded};
+	///
+	/// let tree: Tree<i32, &str> = Tree::new();
+	/// tree.insert(1, "one");
+	/// tree.insert(2, "two");
+	/// tree.insert(3, "three");
+	/// tree.insert(4, "four");
+	/// tree.insert(5, "five");
+	///
+	/// // Range from 2 (inclusive) to 4 (exclusive)
+	/// let mut range = tree.range(Included(&2), Excluded(&4));
+	/// assert_eq!(range.next(), Some((&2, &"two")));
+	/// assert_eq!(range.next(), Some((&3, &"three")));
+	/// assert_eq!(range.next(), None);
+	///
+	/// // Range from 3 to end
+	/// let mut range = tree.range(Included(&3), Unbounded);
+	/// assert_eq!(range.next(), Some((&3, &"three")));
+	/// assert_eq!(range.next(), Some((&4, &"four")));
+	/// assert_eq!(range.next(), Some((&5, &"five")));
+	/// assert_eq!(range.next(), None);
+	/// ```
+	pub fn range<Q>(&self, min: Bound<&Q>, max: Bound<&Q>) -> iter::Range<'_, K, V, IC, LC>
+	where
+		K: Borrow<Q> + Clone + Ord,
+		Q: ?Sized + Ord,
+	{
+		iter::Range::new(self, min, max)
+	}
+
+	/// Returns an iterator over the keys of the tree in ascending order.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, &str> = Tree::new();
+	/// tree.insert(3, "three");
+	/// tree.insert(1, "one");
+	/// tree.insert(2, "two");
+	///
+	/// let mut keys = tree.keys();
+	/// assert_eq!(keys.next(), Some(&1));
+	/// assert_eq!(keys.next(), Some(&2));
+	/// assert_eq!(keys.next(), Some(&3));
+	/// assert_eq!(keys.next(), None);
+	/// ```
+	pub fn keys(&self) -> iter::Keys<'_, K, V, IC, LC>
+	where
+		K: Clone + Ord,
+	{
+		iter::Keys::new(self)
+	}
+
+	/// Returns an iterator over the values of the tree in key-ascending order.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, &str> = Tree::new();
+	/// tree.insert(3, "three");
+	/// tree.insert(1, "one");
+	/// tree.insert(2, "two");
+	///
+	/// let mut values = tree.values();
+	/// assert_eq!(values.next(), Some(&"one"));
+	/// assert_eq!(values.next(), Some(&"two"));
+	/// assert_eq!(values.next(), Some(&"three"));
+	/// assert_eq!(values.next(), None);
+	/// ```
+	pub fn values(&self) -> iter::Values<'_, K, V, IC, LC>
+	where
+		K: Clone + Ord,
+	{
+		iter::Values::new(self)
 	}
 
 	// -----------------------------------------------------------------------
@@ -4371,57 +4514,99 @@ mod tests {
 	}
 
 	#[test]
-	fn first_key_value_returns_minimum() {
+	fn first_returns_minimum() {
 		let tree: Tree<i32, &str> = Tree::new();
 		tree.insert(3, "three");
 		tree.insert(1, "one");
 		tree.insert(2, "two");
 
-		let first = tree.first_key_value(|k, v| (*k, *v));
+		let first = tree.first(|k, v| (*k, *v));
 		assert_eq!(first, Some((1, "one")));
 	}
 
 	#[test]
-	fn first_key_value_empty_tree() {
+	fn first_empty_tree() {
 		let tree: Tree<i32, &str> = Tree::new();
-		let first = tree.first_key_value(|k, v| (*k, *v));
+		let first = tree.first(|k, v| (*k, *v));
 		assert_eq!(first, None);
 	}
 
 	#[test]
-	fn first_key_value_single_entry() {
+	fn first_single_entry() {
 		let tree: Tree<i32, &str> = Tree::new();
 		tree.insert(42, "answer");
 
-		let first = tree.first_key_value(|k, v| (*k, *v));
+		let first = tree.first(|k, v| (*k, *v));
 		assert_eq!(first, Some((42, "answer")));
 	}
 
 	#[test]
-	fn last_key_value_returns_maximum() {
+	fn last_returns_maximum() {
 		let tree: Tree<i32, &str> = Tree::new();
 		tree.insert(1, "one");
 		tree.insert(3, "three");
 		tree.insert(2, "two");
 
-		let last = tree.last_key_value(|k, v| (*k, *v));
+		let last = tree.last(|k, v| (*k, *v));
 		assert_eq!(last, Some((3, "three")));
 	}
 
 	#[test]
-	fn last_key_value_empty_tree() {
+	fn last_empty_tree() {
 		let tree: Tree<i32, &str> = Tree::new();
-		let last = tree.last_key_value(|k, v| (*k, *v));
+		let last = tree.last(|k, v| (*k, *v));
 		assert_eq!(last, None);
 	}
 
 	#[test]
-	fn last_key_value_single_entry() {
+	fn last_single_entry() {
 		let tree: Tree<i32, &str> = Tree::new();
 		tree.insert(42, "answer");
 
-		let last = tree.last_key_value(|k, v| (*k, *v));
+		let last = tree.last(|k, v| (*k, *v));
 		assert_eq!(last, Some((42, "answer")));
+	}
+
+	#[test]
+	fn pop_first_returns_minimum() {
+		let tree: Tree<i32, &str> = Tree::new();
+		tree.insert(3, "three");
+		tree.insert(1, "one");
+		tree.insert(2, "two");
+
+		assert_eq!(tree.pop_first(), Some((1, "one")));
+		assert_eq!(tree.len(), 2);
+		assert_eq!(tree.pop_first(), Some((2, "two")));
+		assert_eq!(tree.len(), 1);
+		assert_eq!(tree.pop_first(), Some((3, "three")));
+		assert!(tree.is_empty());
+	}
+
+	#[test]
+	fn pop_first_empty_tree() {
+		let tree: Tree<i32, &str> = Tree::new();
+		assert_eq!(tree.pop_first(), None);
+	}
+
+	#[test]
+	fn pop_last_returns_maximum() {
+		let tree: Tree<i32, &str> = Tree::new();
+		tree.insert(1, "one");
+		tree.insert(3, "three");
+		tree.insert(2, "two");
+
+		assert_eq!(tree.pop_last(), Some((3, "three")));
+		assert_eq!(tree.len(), 2);
+		assert_eq!(tree.pop_last(), Some((2, "two")));
+		assert_eq!(tree.len(), 1);
+		assert_eq!(tree.pop_last(), Some((1, "one")));
+		assert!(tree.is_empty());
+	}
+
+	#[test]
+	fn pop_last_empty_tree() {
+		let tree: Tree<i32, &str> = Tree::new();
+		assert_eq!(tree.pop_last(), None);
 	}
 
 	#[test]
@@ -4492,7 +4677,7 @@ mod tests {
 	}
 
 	#[test]
-	fn first_key_value_multilevel_tree() {
+	fn first_multilevel_tree() {
 		let tree: Tree<i32, i32> = Tree::new();
 
 		// Insert enough to cause splits and create multiple levels
@@ -4503,12 +4688,12 @@ mod tests {
 		tree.assert_invariants();
 		assert!(tree.height() > 1);
 
-		let first = tree.first_key_value(|k, v| (*k, *v));
+		let first = tree.first(|k, v| (*k, *v));
 		assert_eq!(first, Some((0, 0)));
 	}
 
 	#[test]
-	fn last_key_value_multilevel_tree() {
+	fn last_multilevel_tree() {
 		let tree: Tree<i32, i32> = Tree::new();
 
 		// Insert enough to cause splits and create multiple levels
@@ -4519,7 +4704,7 @@ mod tests {
 		tree.assert_invariants();
 		assert!(tree.height() > 1);
 
-		let last = tree.last_key_value(|k, v| (*k, *v));
+		let last = tree.last(|k, v| (*k, *v));
 		assert_eq!(last, Some((199, 1990)));
 	}
 
@@ -4540,5 +4725,191 @@ mod tests {
 			tree.insert(i, i * 2);
 		}
 		tree.assert_invariants();
+	}
+
+	// -----------------------------------------------------------------------
+	// Range Iterator Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn range_full() {
+		use std::ops::Bound::Unbounded;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut range = tree.range(Unbounded, Unbounded);
+		for i in 0..10 {
+			let (k, v) = range.next().unwrap();
+			assert_eq!(*k, i);
+			assert_eq!(*v, i * 10);
+		}
+		assert!(range.next().is_none());
+	}
+
+	#[test]
+	fn range_included_bounds() {
+		use std::ops::Bound::Included;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut range = tree.range(Included(&3), Included(&6));
+		assert_eq!(range.next(), Some((&3, &30)));
+		assert_eq!(range.next(), Some((&4, &40)));
+		assert_eq!(range.next(), Some((&5, &50)));
+		assert_eq!(range.next(), Some((&6, &60)));
+		assert_eq!(range.next(), None);
+	}
+
+	#[test]
+	fn range_excluded_bounds() {
+		use std::ops::Bound::Excluded;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut range = tree.range(Excluded(&3), Excluded(&6));
+		assert_eq!(range.next(), Some((&4, &40)));
+		assert_eq!(range.next(), Some((&5, &50)));
+		assert_eq!(range.next(), None);
+	}
+
+	#[test]
+	fn range_mixed_bounds() {
+		use std::ops::Bound::{Excluded, Included, Unbounded};
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		// From start to 5 (exclusive)
+		let mut range = tree.range(Unbounded, Excluded(&5));
+		for i in 0..5 {
+			let (k, v) = range.next().unwrap();
+			assert_eq!(*k, i);
+			assert_eq!(*v, i * 10);
+		}
+		assert!(range.next().is_none());
+
+		// From 5 (included) to end
+		let mut range = tree.range(Included(&5), Unbounded);
+		for i in 5..10 {
+			let (k, v) = range.next().unwrap();
+			assert_eq!(*k, i);
+			assert_eq!(*v, i * 10);
+		}
+		assert!(range.next().is_none());
+	}
+
+	#[test]
+	fn range_empty_tree() {
+		use std::ops::Bound::Unbounded;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		let mut range = tree.range(Unbounded, Unbounded);
+		assert!(range.next().is_none());
+	}
+
+	#[test]
+	fn range_nonexistent_bounds() {
+		use std::ops::Bound::Included;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		tree.insert(0, 0);
+		tree.insert(2, 20);
+		tree.insert(4, 40);
+		tree.insert(6, 60);
+
+		// Range from 1 to 5 (neither exist)
+		let mut range = tree.range(Included(&1), Included(&5));
+		assert_eq!(range.next(), Some((&2, &20)));
+		assert_eq!(range.next(), Some((&4, &40)));
+		assert_eq!(range.next(), None);
+	}
+
+	// -----------------------------------------------------------------------
+	// Keys Iterator Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn keys_basic() {
+		let tree: Tree<i32, &str> = Tree::new();
+		tree.insert(3, "three");
+		tree.insert(1, "one");
+		tree.insert(2, "two");
+
+		let mut keys = tree.keys();
+		assert_eq!(keys.next(), Some(&1));
+		assert_eq!(keys.next(), Some(&2));
+		assert_eq!(keys.next(), Some(&3));
+		assert_eq!(keys.next(), None);
+	}
+
+	#[test]
+	fn keys_empty_tree() {
+		let tree: Tree<i32, i32> = Tree::new();
+		let mut keys = tree.keys();
+		assert!(keys.next().is_none());
+	}
+
+	#[test]
+	fn keys_large_tree() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..200 {
+			tree.insert(i, i);
+		}
+
+		let mut keys = tree.keys();
+		for i in 0..200 {
+			assert_eq!(keys.next(), Some(&i));
+		}
+		assert!(keys.next().is_none());
+	}
+
+	// -----------------------------------------------------------------------
+	// Values Iterator Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn values_basic() {
+		let tree: Tree<i32, &str> = Tree::new();
+		tree.insert(3, "three");
+		tree.insert(1, "one");
+		tree.insert(2, "two");
+
+		let mut values = tree.values();
+		assert_eq!(values.next(), Some(&"one"));
+		assert_eq!(values.next(), Some(&"two"));
+		assert_eq!(values.next(), Some(&"three"));
+		assert_eq!(values.next(), None);
+	}
+
+	#[test]
+	fn values_empty_tree() {
+		let tree: Tree<i32, i32> = Tree::new();
+		let mut values = tree.values();
+		assert!(values.next().is_none());
+	}
+
+	#[test]
+	fn values_large_tree() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..200 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut values = tree.values();
+		for i in 0..200 {
+			assert_eq!(values.next(), Some(&(i * 10)));
+		}
+		assert!(values.next().is_none());
 	}
 }
