@@ -125,6 +125,87 @@ enum Cursor {
 	Before(u16),
 }
 
+impl Cursor {
+	/// Compute the entry to return for `prev()` and the new cursor state.
+	///
+	/// Returns `Some((position, new_cursor))` if there's an entry to return,
+	/// or `None` if at the beginning of the leaf (should try prev_leaf).
+	///
+	/// # State Transitions
+	///
+	/// | Starting State | Returns | New State |
+	/// |---------------|---------|-----------|
+	/// | `After(n)` where n > 0 | `n` | `After(n-1)` |
+	/// | `After(0)` | `0` | `Before(0)` |
+	/// | `Before(n)` where n > 0 | `n-1` | `After(n-2)` or `Before(0)` |
+	/// | `Before(0)` | None | - |
+	#[inline]
+	fn prev_entry(self) -> Option<(u16, Cursor)> {
+		match self {
+			Cursor::After(pos) => {
+				// After(pos): return entry at pos, move cursor backward
+				let new = if pos == 0 {
+					Cursor::Before(0) // Can't go further back in this leaf
+				} else {
+					Cursor::After(pos - 1)
+				};
+				Some((pos, new))
+			}
+			Cursor::Before(0) => {
+				// At the very beginning - nothing to return from this leaf
+				None
+			}
+			Cursor::Before(pos) => {
+				// Before(pos) with pos > 0: return entry at pos-1
+				let curr = pos - 1;
+				let new = if curr == 0 {
+					Cursor::Before(0) // No more entries before in this leaf
+				} else {
+					Cursor::After(curr - 1)
+				};
+				Some((curr, new))
+			}
+		}
+	}
+
+	/// Compute the entry to return for `next()` and the new cursor state.
+	///
+	/// Returns `Some((position, new_cursor))` if there's an entry to return,
+	/// or `None` if past the end of the leaf (should try next_leaf).
+	///
+	/// # Parameters
+	///
+	/// - `leaf_len`: The number of entries in the current leaf
+	///
+	/// # State Transitions
+	///
+	/// | Starting State | Returns | New State |
+	/// |---------------|---------|-----------|
+	/// | `Before(n)` where n < len | `n` | `Before(n+1)` |
+	/// | `Before(n)` where n >= len | None | - |
+	/// | `After(n)` where n+1 < len | `n+1` | `Before(n+2)` |
+	/// | `After(n)` where n+1 >= len | None | - |
+	#[inline]
+	fn next_entry(self, leaf_len: u16) -> Option<(u16, Cursor)> {
+		match self {
+			Cursor::Before(pos) if pos < leaf_len => {
+				// Before(pos): return entry at pos
+				Some((pos, Cursor::Before(pos + 1)))
+			}
+			Cursor::After(pos) => {
+				// After(pos): return entry at pos+1 if it exists
+				let next = pos + 1;
+				if next < leaf_len {
+					Some((next, Cursor::Before(next + 1)))
+				} else {
+					None // Past end of leaf
+				}
+			}
+			_ => None, // Before(pos) where pos >= leaf_len
+		}
+	}
+}
+
 /// Result of attempting to move to the next/previous leaf.
 ///
 /// Used by `next_leaf()` and `prev_leaf()` to signal the outcome.
@@ -796,34 +877,8 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		loop {
 			// Determine what to return based on current cursor position
 			let opt = match self.leaf.as_ref() {
-				Some((guard, cursor)) => {
-					let leaf = guard.as_leaf();
-					match *cursor {
-						Cursor::Before(pos) => {
-							// Before position `pos` - return entry at `pos`
-							if pos < leaf.len {
-								Some((pos, Cursor::Before(pos + 1)))
-							} else {
-								// Past end of leaf
-								None
-							}
-						}
-						Cursor::After(pos) => {
-							// After position `pos` - return entry at `pos+1`
-							let curr_pos = pos + 1;
-							if curr_pos < leaf.len {
-								Some((curr_pos, Cursor::Before(curr_pos + 1)))
-							} else {
-								// Past end of leaf
-								None
-							}
-						}
-					}
-				}
-				None => {
-					// No current leaf - iteration not started or already finished
-					return None;
-				}
+				Some((guard, cursor)) => cursor.next_entry(guard.as_leaf().len),
+				None => return None,
 			};
 
 			if let Some((curr_pos, new_cursor)) = opt {
@@ -864,38 +919,8 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 	pub fn prev(&mut self) -> Option<(&K, &V)> {
 		loop {
 			let opt = match self.leaf.as_ref() {
-				Some((_guard, cursor)) => match *cursor {
-					Cursor::After(pos) => {
-						// After position `pos` - we can return `pos` and move backwards
-						if pos > 0 {
-							Some((pos, Cursor::After(pos - 1)))
-						} else if pos == 0 {
-							// At position 0 - return it but can't go further back in this leaf
-							Some((pos, Cursor::Before(pos)))
-						} else {
-							None
-						}
-					}
-					Cursor::Before(pos) => {
-						// Before position `pos` - return entry at `pos-1`
-						if pos > 0 {
-							let curr_pos = pos - 1;
-							if curr_pos == 0 {
-								// Returning entry 0 - no more entries before it
-								Some((curr_pos, Cursor::Before(curr_pos)))
-							} else {
-								// More entries before
-								Some((curr_pos, Cursor::After(curr_pos - 1)))
-							}
-						} else {
-							// At position 0 with Before - nothing to return
-							None
-						}
-					}
-				},
-				None => {
-					return None;
-				}
+				Some((_guard, cursor)) => cursor.prev_entry(),
+				None => return None,
 			};
 
 			if let Some((curr_pos, new_cursor)) = opt {
@@ -1602,31 +1627,8 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 	pub fn next(&mut self) -> Option<(&K, &mut V)> {
 		loop {
 			let opt = match self.leaf.as_ref() {
-				Some((guard, cursor)) => {
-					let leaf = guard.as_leaf();
-					match cursor {
-						Cursor::Before(pos) => {
-							let pos = *pos;
-							if pos < leaf.len {
-								Some((pos, Cursor::Before(pos + 1)))
-							} else {
-								None
-							}
-						}
-						Cursor::After(pos) => {
-							let pos = *pos;
-							let curr_pos = pos + 1;
-							if curr_pos < leaf.len {
-								Some((curr_pos, Cursor::Before(curr_pos + 1)))
-							} else {
-								None
-							}
-						}
-					}
-				}
-				None => {
-					return None;
-				}
+				Some((guard, cursor)) => cursor.next_entry(guard.as_leaf().len),
+				None => return None,
 			};
 
 			if let Some((curr_pos, new_cursor)) = opt {
@@ -1656,32 +1658,8 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 	pub fn prev(&mut self) -> Option<(&K, &mut V)> {
 		loop {
 			let opt = match self.leaf.as_ref() {
-				Some((_guard, cursor)) => match *cursor {
-					Cursor::After(pos) => {
-						if pos > 0 {
-							Some((pos, Cursor::After(pos - 1)))
-						} else if pos == 0 {
-							Some((pos, Cursor::Before(pos)))
-						} else {
-							None
-						}
-					}
-					Cursor::Before(pos) => {
-						if pos > 0 {
-							let curr_pos = pos - 1;
-							if curr_pos == 0 {
-								Some((curr_pos, Cursor::Before(curr_pos)))
-							} else {
-								Some((curr_pos, Cursor::After(curr_pos - 1)))
-							}
-						} else {
-							None
-						}
-					}
-				},
-				None => {
-					return None;
-				}
+				Some((_guard, cursor)) => cursor.prev_entry(),
+				None => return None,
 			};
 
 			if let Some((curr_pos, new_cursor)) = opt {
@@ -2510,5 +2488,293 @@ mod tests {
 
 		let (k, _) = iter.next().unwrap();
 		assert_eq!(*k, 7);
+	}
+
+	// -----------------------------------------------------------------------
+	// Cursor State Transition Unit Tests
+	// -----------------------------------------------------------------------
+	//
+	// These tests verify the Cursor::prev_entry() and Cursor::next_entry()
+	// helper methods in isolation, ensuring correct state transitions.
+
+	mod cursor_tests {
+		use super::super::Cursor;
+
+		// prev_entry() tests
+
+		#[test]
+		fn cursor_prev_from_after_middle() {
+			// After(2) should return entry 2 and transition to After(1)
+			let cursor = Cursor::After(2);
+			let (pos, new) = cursor.prev_entry().unwrap();
+			assert_eq!(pos, 2);
+			assert_eq!(new, Cursor::After(1));
+		}
+
+		#[test]
+		fn cursor_prev_from_after_one() {
+			// After(1) should return entry 1 and transition to After(0)
+			let cursor = Cursor::After(1);
+			let (pos, new) = cursor.prev_entry().unwrap();
+			assert_eq!(pos, 1);
+			assert_eq!(new, Cursor::After(0));
+		}
+
+		#[test]
+		fn cursor_prev_from_after_zero() {
+			// After(0) should return entry 0 and transition to Before(0)
+			// (can't go further back in this leaf)
+			let cursor = Cursor::After(0);
+			let (pos, new) = cursor.prev_entry().unwrap();
+			assert_eq!(pos, 0);
+			assert_eq!(new, Cursor::Before(0));
+		}
+
+		#[test]
+		fn cursor_prev_from_before_zero() {
+			// Before(0) means at the start - nothing to return
+			let cursor = Cursor::Before(0);
+			assert!(cursor.prev_entry().is_none());
+		}
+
+		#[test]
+		fn cursor_prev_from_before_one() {
+			// Before(1) should return entry 0 and transition to Before(0)
+			let cursor = Cursor::Before(1);
+			let (pos, new) = cursor.prev_entry().unwrap();
+			assert_eq!(pos, 0);
+			assert_eq!(new, Cursor::Before(0));
+		}
+
+		#[test]
+		fn cursor_prev_from_before_two() {
+			// Before(2) should return entry 1 and transition to After(0)
+			let cursor = Cursor::Before(2);
+			let (pos, new) = cursor.prev_entry().unwrap();
+			assert_eq!(pos, 1);
+			assert_eq!(new, Cursor::After(0));
+		}
+
+		#[test]
+		fn cursor_prev_from_before_middle() {
+			// Before(5) should return entry 4 and transition to After(3)
+			let cursor = Cursor::Before(5);
+			let (pos, new) = cursor.prev_entry().unwrap();
+			assert_eq!(pos, 4);
+			assert_eq!(new, Cursor::After(3));
+		}
+
+		// next_entry() tests
+
+		#[test]
+		fn cursor_next_from_before_start() {
+			// Before(0) with len=4 should return entry 0 and transition to Before(1)
+			let cursor = Cursor::Before(0);
+			let (pos, new) = cursor.next_entry(4).unwrap();
+			assert_eq!(pos, 0);
+			assert_eq!(new, Cursor::Before(1));
+		}
+
+		#[test]
+		fn cursor_next_from_before_middle() {
+			// Before(2) with len=4 should return entry 2 and transition to Before(3)
+			let cursor = Cursor::Before(2);
+			let (pos, new) = cursor.next_entry(4).unwrap();
+			assert_eq!(pos, 2);
+			assert_eq!(new, Cursor::Before(3));
+		}
+
+		#[test]
+		fn cursor_next_from_before_last() {
+			// Before(3) with len=4 should return entry 3 and transition to Before(4)
+			let cursor = Cursor::Before(3);
+			let (pos, new) = cursor.next_entry(4).unwrap();
+			assert_eq!(pos, 3);
+			assert_eq!(new, Cursor::Before(4));
+		}
+
+		#[test]
+		fn cursor_next_from_before_past_end() {
+			// Before(4) with len=4 means past end - nothing to return
+			let cursor = Cursor::Before(4);
+			assert!(cursor.next_entry(4).is_none());
+		}
+
+		#[test]
+		fn cursor_next_from_after_start() {
+			// After(0) with len=4 should return entry 1 and transition to Before(2)
+			let cursor = Cursor::After(0);
+			let (pos, new) = cursor.next_entry(4).unwrap();
+			assert_eq!(pos, 1);
+			assert_eq!(new, Cursor::Before(2));
+		}
+
+		#[test]
+		fn cursor_next_from_after_middle() {
+			// After(1) with len=4 should return entry 2 and transition to Before(3)
+			let cursor = Cursor::After(1);
+			let (pos, new) = cursor.next_entry(4).unwrap();
+			assert_eq!(pos, 2);
+			assert_eq!(new, Cursor::Before(3));
+		}
+
+		#[test]
+		fn cursor_next_from_after_second_to_last() {
+			// After(2) with len=4 should return entry 3 and transition to Before(4)
+			let cursor = Cursor::After(2);
+			let (pos, new) = cursor.next_entry(4).unwrap();
+			assert_eq!(pos, 3);
+			assert_eq!(new, Cursor::Before(4));
+		}
+
+		#[test]
+		fn cursor_next_from_after_last() {
+			// After(3) with len=4 means past end - nothing to return
+			let cursor = Cursor::After(3);
+			assert!(cursor.next_entry(4).is_none());
+		}
+
+		// Bidirectional consistency tests
+
+		#[test]
+		fn cursor_next_then_prev_returns_same() {
+			// Starting at Before(0), next() returns 0 -> Before(1)
+			// Then prev() should return 0 -> Before(0)
+			let cursor = Cursor::Before(0);
+			let (pos1, cursor) = cursor.next_entry(4).unwrap();
+			assert_eq!(pos1, 0);
+			assert_eq!(cursor, Cursor::Before(1));
+
+			let (pos2, cursor) = cursor.prev_entry().unwrap();
+			assert_eq!(pos2, 0);
+			assert_eq!(cursor, Cursor::Before(0));
+		}
+
+		#[test]
+		fn cursor_prev_then_next_returns_same() {
+			// Starting at After(2), prev() returns 2 -> After(1)
+			// Then next() returns 2 -> Before(3)
+			let cursor = Cursor::After(2);
+			let (pos1, cursor) = cursor.prev_entry().unwrap();
+			assert_eq!(pos1, 2);
+			assert_eq!(cursor, Cursor::After(1));
+
+			let (pos2, cursor) = cursor.next_entry(4).unwrap();
+			assert_eq!(pos2, 2);
+			assert_eq!(cursor, Cursor::Before(3));
+		}
+
+		#[test]
+		fn cursor_alternating_next_prev() {
+			// Verify alternating between next/prev behaves correctly
+			// Start at Before(2), next() -> 2, Before(3)
+			let cursor = Cursor::Before(2);
+			let (pos, cursor) = cursor.next_entry(5).unwrap();
+			assert_eq!(pos, 2);
+			assert_eq!(cursor, Cursor::Before(3));
+
+			// prev() -> 2, After(1)
+			let (pos, cursor) = cursor.prev_entry().unwrap();
+			assert_eq!(pos, 2);
+			assert_eq!(cursor, Cursor::After(1));
+
+			// next() -> 2, Before(3)
+			let (pos, cursor) = cursor.next_entry(5).unwrap();
+			assert_eq!(pos, 2);
+			assert_eq!(cursor, Cursor::Before(3));
+
+			// next() -> 3, Before(4)
+			let (pos, cursor) = cursor.next_entry(5).unwrap();
+			assert_eq!(pos, 3);
+			assert_eq!(cursor, Cursor::Before(4));
+
+			// prev() -> 3, After(2)
+			let (pos, cursor) = cursor.prev_entry().unwrap();
+			assert_eq!(pos, 3);
+			assert_eq!(cursor, Cursor::After(2));
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Integration Tests for Bidirectional Iteration
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn bidirectional_next_prev_consistency() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek(&5);
+
+		// next() returns 5
+		let (k1, _) = iter.next().unwrap();
+		assert_eq!(*k1, 5);
+
+		// prev() should return 5 (we just visited it)
+		let (k2, _) = iter.prev().unwrap();
+		assert_eq!(*k2, 5);
+
+		// next() should return 5 again
+		let (k3, _) = iter.next().unwrap();
+		assert_eq!(*k3, 5);
+
+		// next() should return 6
+		let (k4, _) = iter.next().unwrap();
+		assert_eq!(*k4, 6);
+	}
+
+	#[test]
+	fn bidirectional_from_start() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..5 {
+			tree.insert(i, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		// Get first entry
+		let (k, _) = iter.next().unwrap();
+		assert_eq!(*k, 0);
+
+		// prev() returns 0 (just visited)
+		let (k, _) = iter.prev().unwrap();
+		assert_eq!(*k, 0);
+
+		// prev() should return None (at start)
+		assert!(iter.prev().is_none());
+
+		// next() should return 0 again
+		let (k, _) = iter.next().unwrap();
+		assert_eq!(*k, 0);
+	}
+
+	#[test]
+	fn bidirectional_from_end() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..5 {
+			tree.insert(i, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_last();
+
+		// prev() returns 4 (last entry)
+		let (k, _) = iter.prev().unwrap();
+		assert_eq!(*k, 4);
+
+		// next() returns 4 (just visited)
+		let (k, _) = iter.next().unwrap();
+		assert_eq!(*k, 4);
+
+		// next() should return None (at end)
+		assert!(iter.next().is_none());
+
+		// prev() should return 4 again
+		let (k, _) = iter.prev().unwrap();
+		assert_eq!(*k, 4);
 	}
 }
