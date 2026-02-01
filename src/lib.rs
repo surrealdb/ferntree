@@ -4,13 +4,13 @@
 //! coupling**, a technique that enables high-throughput concurrent access with minimal
 //! blocking.
 //!
-//! ## Design Overview
+//! ## Design overview
 //!
 //! The implementation is based on research from:
 //! - [LeanStore](https://dbis1.github.io/leanstore.html) - Optimistic lock coupling for B-trees
 //! - [Umbra](https://umbra-db.com/#publications) - High-performance database engine techniques
 //!
-//! ### Key Concepts
+//! ### Key concepts
 //!
 //! **Optimistic Lock Coupling**: Instead of holding locks while traversing the tree, readers
 //! acquire "optimistic" access (no locks) and validate at the end that no concurrent
@@ -31,7 +31,7 @@
 //! **Sample Keys**: Each node stores a `sample_key` that can be used to relocate the node
 //! in the tree after an optimistic validation failure. This avoids restarting from the root.
 //!
-//! ### Tree Structure
+//! ### Tree structure
 //!
 //! ```text
 //!                    ┌─────────────────┐
@@ -56,7 +56,7 @@
 //!        └──────────┘  └──────────┘  └──────────┘
 //! ```
 //!
-//! ## Basic Usage
+//! ## Basic usage
 //!
 //! ```
 //! use ferntree::Tree;
@@ -75,11 +75,174 @@
 //! tree.remove(&"key1");
 //! ```
 //!
-//! ## Thread Safety
+//! ## Concurrent usage
 //!
-//! The tree is fully thread-safe and can be shared across threads via `Arc<Tree<K, V>>`.
-//! All operations use epoch-based memory reclamation via `crossbeam_epoch` to safely
-//! deallocate nodes that may still be accessed by concurrent readers.
+//! The tree is designed for high-concurrency workloads. Wrap it in an `Arc` to share
+//! across threads:
+//!
+//! ### Multi-threaded inserts
+//!
+//! ```
+//! use ferntree::Tree;
+//! use std::sync::Arc;
+//! use std::thread;
+//!
+//! let tree = Arc::new(Tree::<i32, i32>::new());
+//!
+//! // Spawn multiple writer threads
+//! let handles: Vec<_> = (0..4).map(|t| {
+//!     let tree = Arc::clone(&tree);
+//!     thread::spawn(move || {
+//!         for i in 0..1000 {
+//!             tree.insert(t * 1000 + i, i);
+//!         }
+//!     })
+//! }).collect();
+//!
+//! for h in handles {
+//!     h.join().unwrap();
+//! }
+//!
+//! assert_eq!(tree.len(), 4000);
+//! ```
+//!
+//! ### Concurrent readers and writers
+//!
+//! ```
+//! use ferntree::Tree;
+//! use std::sync::Arc;
+//! use std::thread;
+//!
+//! let tree = Arc::new(Tree::<i32, i32>::new());
+//!
+//! // Pre-populate some data
+//! for i in 0..100 {
+//!     tree.insert(i, i * 10);
+//! }
+//!
+//! let tree_writer = Arc::clone(&tree);
+//! let tree_reader = Arc::clone(&tree);
+//!
+//! // Writer thread adds new entries
+//! let writer = thread::spawn(move || {
+//!     for i in 100..200 {
+//!         tree_writer.insert(i, i * 10);
+//!     }
+//! });
+//!
+//! // Reader thread performs lookups concurrently
+//! let reader = thread::spawn(move || {
+//!     let mut found = 0;
+//!     for i in 0..100 {
+//!         if tree_reader.lookup(&i, |v| *v).is_some() {
+//!             found += 1;
+//!         }
+//!     }
+//!     found
+//! });
+//!
+//! writer.join().unwrap();
+//! let found = reader.join().unwrap();
+//! assert_eq!(found, 100); // Reader sees consistent data
+//! ```
+//!
+//! ### Iterator usage
+//!
+//! ```
+//! use ferntree::Tree;
+//! use std::sync::Arc;
+//! use std::thread;
+//!
+//! let tree = Arc::new(Tree::<i32, i32>::new());
+//!
+//! for i in 0..100 {
+//!     tree.insert(i, i);
+//! }
+//!
+//! // Iterators acquire locks on leaf nodes, ensuring consistent reads
+//! let tree_iter = Arc::clone(&tree);
+//! let handle = thread::spawn(move || {
+//!     let mut iter = tree_iter.raw_iter();
+//!     iter.seek_to_first();
+//!
+//!     let mut count = 0;
+//!     while iter.next().is_some() {
+//!         count += 1;
+//!     }
+//!     count
+//! });
+//!
+//! // Concurrent modifications are safe
+//! tree.insert(100, 100);
+//!
+//! let count = handle.join().unwrap();
+//! // Iterator sees a consistent snapshot
+//! assert!(count >= 100);
+//! ```
+//!
+//! ## Thread safety
+//!
+//! ### Send and Sync bounds
+//!
+//! `Tree<K, V>` implements `Send` and `Sync` when both `K` and `V` implement `Send + Sync`.
+//! This means the tree can be safely shared across threads and accessed concurrently.
+//!
+//! ```
+//! use ferntree::Tree;
+//!
+//! fn assert_send_sync<T: Send + Sync>() {}
+//!
+//! // Tree is Send + Sync for thread-safe key/value types
+//! assert_send_sync::<Tree<String, i32>>();
+//! assert_send_sync::<Tree<i32, Vec<u8>>>();
+//! ```
+//!
+//! ### Operation atomicity
+//!
+//! Individual operations (`insert`, `remove`, `lookup`) are atomic at the key level:
+//!
+//! - **Atomic reads**: `lookup()` always returns a consistent value for a key
+//! - **Atomic writes**: `insert()` and `remove()` complete atomically
+//! - **No cross-key transactions**: Multiple operations are NOT transactional; if you need
+//!   to update multiple keys atomically, you must use external synchronization
+//!
+//! ### Retry semantics
+//!
+//! The tree uses optimistic concurrency control internally:
+//!
+//! - Operations may retry automatically if concurrent modifications are detected
+//! - **Users don't need to handle retries** - this is managed internally
+//! - **Important**: Closures passed to `lookup()` may be called multiple times if retries
+//!   occur. Avoid side effects in lookup closures:
+//!
+//! ```
+//! use ferntree::Tree;
+//!
+//! let tree = Tree::<i32, i32>::new();
+//! tree.insert(1, 42);
+//!
+//! // Good: Pure closure that just extracts data
+//! let value = tree.lookup(&1, |v| *v);
+//!
+//! // Avoid: Side effects in lookup closure (may execute multiple times)
+//! // let mut counter = 0;
+//! // tree.lookup(&1, |v| { counter += 1; *v }); // counter may be > 1
+//! ```
+//!
+//! ### Memory safety
+//!
+//! The tree uses epoch-based memory reclamation via [`crossbeam_epoch`] to ensure safe
+//! concurrent access:
+//!
+//! - **Safe concurrent reads**: Readers never see freed memory, even during concurrent
+//!   modifications
+//! - **Deferred deallocation**: Nodes removed from the tree are not immediately freed;
+//!   they remain valid until all concurrent readers have finished
+//! - **No use-after-free**: The epoch system guarantees that memory is only reclaimed
+//!   when it's safe to do so
+//!
+//! This means you can safely perform concurrent reads and writes without worrying about
+//! memory safety - the tree handles all synchronization internally.
 
 // Complex types are intentional in this crate for expressing tree traversal results
 #![allow(clippy::type_complexity)]
