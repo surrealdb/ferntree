@@ -1540,6 +1540,77 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		iter.insert(key, value)
 	}
 
+	/// Returns a clone of the value for the key, inserting `default` if the key
+	/// was not present.
+	///
+	/// This is a convenience method that calls `get_or_insert_with` with a
+	/// closure that returns the default value.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, String> = Tree::new();
+	///
+	/// // Key doesn't exist - inserts and returns default
+	/// let value = tree.get_or_insert(1, "default".to_string());
+	/// assert_eq!(value, "default");
+	///
+	/// // Key exists - returns existing value without inserting
+	/// let value = tree.get_or_insert(1, "other".to_string());
+	/// assert_eq!(value, "default");
+	/// ```
+	pub fn get_or_insert(&self, key: K, default: V) -> V
+	where
+		K: Ord,
+		V: Clone,
+	{
+		self.get_or_insert_with(key, || default)
+	}
+
+	/// Returns a clone of the value for the key, inserting the result of `f`
+	/// if the key was not present.
+	///
+	/// The closure `f` is only called if the key does not exist in the tree.
+	/// This allows for lazy initialization of values.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, String> = Tree::new();
+	///
+	/// // Key doesn't exist - closure is called
+	/// let value = tree.get_or_insert_with(1, || "computed".to_string());
+	/// assert_eq!(value, "computed");
+	///
+	/// // Key exists - closure is NOT called
+	/// let value = tree.get_or_insert_with(1, || panic!("should not be called"));
+	/// assert_eq!(value, "computed");
+	/// ```
+	pub fn get_or_insert_with<F>(&self, key: K, f: F) -> V
+	where
+		K: Ord,
+		V: Clone,
+		F: FnOnce() -> V,
+	{
+		let mut iter = self.raw_iter_mut();
+
+		if iter.seek_exact(&key) {
+			// Key exists - return clone of existing value
+			let (_k, v) = iter.next().expect("seek_exact returned true");
+			v.clone()
+		} else {
+			// Key doesn't exist - compute value, insert, and return clone
+			let value = f();
+			let result = value.clone();
+			iter.insert(key, value);
+			result
+		}
+	}
+
 	/// Removes all entries from the tree.
 	///
 	/// After calling this method, the tree will be empty with height 1.
@@ -4932,5 +5003,109 @@ mod tests {
 			assert_eq!(values.next(), Some(&(i * 10)));
 		}
 		assert!(values.next().is_none());
+	}
+
+	// -----------------------------------------------------------------------
+	// get_or_insert Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn get_or_insert_new_key() {
+		let tree: Tree<i32, String> = Tree::new();
+
+		// Key doesn't exist - should insert and return the default
+		let value = tree.get_or_insert(1, "default".to_string());
+		assert_eq!(value, "default");
+
+		// Verify it was inserted
+		assert_eq!(tree.lookup(&1, |v| v.clone()), Some("default".to_string()));
+		assert_eq!(tree.len(), 1);
+
+		tree.assert_invariants();
+	}
+
+	#[test]
+	fn get_or_insert_existing_key() {
+		let tree: Tree<i32, String> = Tree::new();
+
+		// Pre-insert a value
+		tree.insert(1, "existing".to_string());
+
+		// Key exists - should return existing value without inserting
+		let value = tree.get_or_insert(1, "new_default".to_string());
+		assert_eq!(value, "existing");
+
+		// Verify the value wasn't changed
+		assert_eq!(tree.lookup(&1, |v| v.clone()), Some("existing".to_string()));
+		assert_eq!(tree.len(), 1);
+
+		tree.assert_invariants();
+	}
+
+	#[test]
+	fn get_or_insert_with_lazy_evaluation() {
+		let tree: Tree<i32, String> = Tree::new();
+
+		// Pre-insert a value
+		tree.insert(1, "existing".to_string());
+
+		// Closure should NOT be called when key exists
+		let value = tree.get_or_insert_with(1, || {
+			panic!("closure should not be called for existing key");
+		});
+		assert_eq!(value, "existing");
+
+		// Closure SHOULD be called when key doesn't exist
+		let value = tree.get_or_insert_with(2, || "computed".to_string());
+		assert_eq!(value, "computed");
+
+		assert_eq!(tree.len(), 2);
+		tree.assert_invariants();
+	}
+
+	#[test]
+	fn get_or_insert_triggers_split() {
+		let tree: Tree<i32, i32> = Tree::new();
+
+		// Insert enough entries to fill a leaf (capacity 64)
+		for i in 0..64 {
+			tree.get_or_insert(i, i * 10);
+		}
+
+		tree.assert_invariants();
+		assert_eq!(tree.len(), 64);
+
+		// This insertion should trigger a split
+		let value = tree.get_or_insert(64, 640);
+		assert_eq!(value, 640);
+
+		tree.assert_invariants();
+		assert_eq!(tree.len(), 65);
+		assert!(tree.height() >= 2, "Tree should have split");
+
+		// Verify all values are correct
+		for i in 0..=64 {
+			assert_eq!(tree.lookup(&i, |v| *v), Some(i * 10));
+		}
+	}
+
+	#[test]
+	fn get_or_insert_multiple_operations() {
+		let tree: Tree<i32, i32> = Tree::new();
+
+		// Mix of new insertions and lookups of existing keys
+		for i in 0..100 {
+			let value = tree.get_or_insert(i % 50, i);
+			if i < 50 {
+				// First 50 operations insert new keys
+				assert_eq!(value, i);
+			} else {
+				// Next 50 operations find existing keys
+				assert_eq!(value, i - 50);
+			}
+		}
+
+		tree.assert_invariants();
+		assert_eq!(tree.len(), 50);
 	}
 }
