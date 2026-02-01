@@ -247,17 +247,20 @@
 // Complex types are intentional in this crate for expressing tree traversal results
 #![allow(clippy::type_complexity)]
 
-use crossbeam_epoch::{self as epoch, Atomic, Owned};
 use smallvec::{smallvec, SmallVec};
 
 use std::borrow::Borrow;
 use std::fmt;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub mod alloc;
 pub mod error;
 pub mod iter;
 pub mod latch;
+pub(crate) mod sync;
+
+use sync::epoch::{self as epoch, Atomic, Owned};
+use sync::{AtomicUsize, Ordering};
 
 use latch::{ExclusiveGuard, HybridGuard, HybridLatch, OptimisticGuard, SharedGuard};
 
