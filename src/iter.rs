@@ -55,8 +55,8 @@
 
 use crate::error;
 use crate::latch::{ExclusiveGuard, OptimisticGuard, SharedGuard};
+use crate::sync::epoch::{self as epoch};
 use crate::{Direction, GenericTree, Node};
-use crossbeam_epoch::{self as epoch};
 use std::borrow::Borrow;
 use std::ops::Bound;
 

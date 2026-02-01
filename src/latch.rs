@@ -78,11 +78,8 @@
 //!
 //! This is safe because no side effects occurred before validation.
 
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use crate::error;
+use crate::sync::{AtomicUsize, Ordering, RwLock, RwLockReadGuard, RwLockWriteGuard, UnsafeCell};
 
 // ===========================================================================
 // HybridLatch
