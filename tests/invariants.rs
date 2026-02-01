@@ -513,3 +513,65 @@ fn tree_after_clearing_all() {
 	tree.assert_invariants();
 	assert_eq!(tree.len(), 1);
 }
+
+/// Test that sample_key is preserved after a chain of merge operations.
+///
+/// This test verifies that the sample_key field is correctly maintained
+/// during merge operations, preventing find_parent() from failing with
+/// Reclaimed errors due to missing sample_key.
+#[test]
+fn sample_key_preserved_after_chain_of_merges() {
+	let tree: Tree<i32, i32> = Tree::new();
+
+	// Insert enough entries to create multiple leaves
+	// With LEAF_CAPACITY = 64, 200 entries should create ~3-4 leaves
+	for i in 0..200 {
+		tree.insert(i, i);
+	}
+
+	tree.assert_invariants();
+	let initial_height = tree.height();
+	assert!(initial_height >= 2, "Expected at least 2 levels");
+
+	// Delete most entries to trigger multiple merges
+	// This should cause several leaves to merge together
+	for i in 0..150 {
+		tree.remove(&i);
+	}
+
+	tree.assert_invariants();
+
+	// Verify remaining entries are still accessible
+	// This would fail if sample_key is corrupted (find_parent would return Reclaimed)
+	for i in 150..200 {
+		assert_eq!(tree.lookup(&i, |v| *v), Some(i), "Key {} not found after merges", i);
+	}
+
+	// Continue deleting to trigger even more merges
+	for i in 150..190 {
+		tree.remove(&i);
+	}
+
+	tree.assert_invariants();
+
+	// Verify final entries
+	for i in 190..200 {
+		assert_eq!(tree.lookup(&i, |v| *v), Some(i), "Key {} not found after second merge wave", i);
+	}
+
+	// Insert more entries to verify the tree is still fully functional
+	for i in 0..50 {
+		tree.insert(i, i * 100);
+	}
+
+	tree.assert_invariants();
+	assert_eq!(tree.len(), 60); // 10 remaining + 50 new
+
+	// Final verification
+	for i in 0..50 {
+		assert_eq!(tree.lookup(&i, |v| *v), Some(i * 100));
+	}
+	for i in 190..200 {
+		assert_eq!(tree.lookup(&i, |v| *v), Some(i));
+	}
+}

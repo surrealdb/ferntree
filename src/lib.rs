@@ -3103,25 +3103,6 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 		(self.len as usize) * 10 < LC * 4
 	}
 
-	/// Inserts a key-value pair at the specified position.
-	///
-	/// # Returns
-	///
-	/// - `Some(pos)` if insertion succeeded
-	/// - `None` if the node is full
-	pub(crate) fn insert_at(&mut self, pos: u16, key: K, value: V) -> Option<u16> {
-		if !self.has_space() {
-			return None;
-		}
-
-		// Insert into both arrays at the same position
-		self.keys.insert(pos as usize, key);
-		self.values.insert(pos as usize, value);
-		self.len += 1;
-
-		Some(pos)
-	}
-
 	/// Removes and returns the key-value pair at the specified position.
 	pub(crate) fn remove_at(&mut self, pos: u16) -> (K, V) {
 		self.len -= 1;
@@ -3158,6 +3139,30 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 }
 
 impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
+	/// Inserts a key-value pair at the specified position.
+	///
+	/// # Returns
+	///
+	/// - `Some(pos)` if insertion succeeded
+	/// - `None` if the node is full
+	pub(crate) fn insert_at(&mut self, pos: u16, key: K, value: V) -> Option<u16> {
+		if !self.has_space() {
+			return None;
+		}
+
+		// Set sample_key if not already set (ensures find_parent can locate this node)
+		if self.sample_key.is_none() {
+			self.sample_key = Some(key.clone());
+		}
+
+		// Insert into both arrays at the same position
+		self.keys.insert(pos as usize, key);
+		self.values.insert(pos as usize, value);
+		self.len += 1;
+
+		Some(pos)
+	}
+
 	/// Splits this leaf node, moving entries after `split_pos` to `right`.
 	///
 	/// After split:
@@ -3231,9 +3236,13 @@ impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
 		self.keys.extend(right.keys.drain(..));
 		self.values.extend(right.values.drain(..));
 
-		// Update sample key to one from the absorbed node
-		// (useful if our original sample key was at the boundary)
-		self.sample_key = right.sample_key.take();
+		// Update sample_key: prefer right's sample_key if available,
+		// otherwise ensure we have one if we have keys (prevents find_parent failures)
+		if let Some(sample) = right.sample_key.take() {
+			self.sample_key = Some(sample);
+		} else if self.sample_key.is_none() && !self.keys.is_empty() {
+			self.sample_key = Some(self.keys[0].clone());
+		}
 
 		// Update length
 		self.len = self.keys.len() as u16;
@@ -3638,8 +3647,13 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 		self.keys.extend(right.keys.drain(..));
 		self.edges.extend(right.edges.drain(..));
 
-		// Update sample key
-		self.sample_key = right.sample_key.take();
+		// Update sample_key: prefer right's sample_key if available,
+		// otherwise ensure we have one if we have keys (prevents find_parent failures)
+		if let Some(sample) = right.sample_key.take() {
+			self.sample_key = Some(sample);
+		} else if self.sample_key.is_none() && !self.keys.is_empty() {
+			self.sample_key = Some(self.keys[0].clone());
+		}
 
 		// Update lengths
 		self.len = self.keys.len() as u16;
