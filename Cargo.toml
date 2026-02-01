@@ -16,6 +16,7 @@ smallvec = { version = "1.15.1", features = ["serde", "const_generics"] }
 thiserror = "2.0.18"
 
 [dev-dependencies]
+proptest = "1.6"
 rand = "0.9.2"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1"
