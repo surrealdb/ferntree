@@ -2569,6 +2569,46 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		iter::Range::new(self, min, max)
 	}
 
+	/// Returns a reverse iterator over the entries of the tree within the specified bounds.
+	///
+	/// The iterator yields key-value pairs in descending key order, starting from
+	/// entries that satisfy the upper bound and stopping when entries go below
+	/// the lower bound.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	/// use std::ops::Bound::{Included, Excluded, Unbounded};
+	///
+	/// let tree: Tree<i32, &str> = Tree::new();
+	/// tree.insert(1, "one");
+	/// tree.insert(2, "two");
+	/// tree.insert(3, "three");
+	/// tree.insert(4, "four");
+	/// tree.insert(5, "five");
+	///
+	/// // Reverse range from 2 (inclusive) to 4 (exclusive)
+	/// let mut range = tree.range_rev(Included(&2), Excluded(&4));
+	/// assert_eq!(range.next(), Some((&3, &"three")));
+	/// assert_eq!(range.next(), Some((&2, &"two")));
+	/// assert_eq!(range.next(), None);
+	///
+	/// // Reverse range from start to 3 (inclusive)
+	/// let mut range = tree.range_rev(Unbounded, Included(&3));
+	/// assert_eq!(range.next(), Some((&3, &"three")));
+	/// assert_eq!(range.next(), Some((&2, &"two")));
+	/// assert_eq!(range.next(), Some((&1, &"one")));
+	/// assert_eq!(range.next(), None);
+	/// ```
+	pub fn range_rev<Q>(&self, min: Bound<&Q>, max: Bound<&Q>) -> iter::RangeRev<'_, K, V, IC, LC>
+	where
+		K: Borrow<Q> + Clone + Ord,
+		Q: ?Sized + Ord,
+	{
+		iter::RangeRev::new(self, min, max)
+	}
+
 	/// Returns an iterator over the keys of the tree in ascending order.
 	///
 	/// # Example
@@ -5105,6 +5145,189 @@ mod tests {
 		assert_eq!(range.next(), Some((&2, &20)));
 		assert_eq!(range.next(), Some((&4, &40)));
 		assert_eq!(range.next(), None);
+	}
+
+	// -----------------------------------------------------------------------
+	// Reverse Range Iterator Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn range_rev_full() {
+		use std::ops::Bound::Unbounded;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut range = tree.range_rev(Unbounded, Unbounded);
+		for i in (0..10).rev() {
+			let (k, v) = range.next().unwrap();
+			assert_eq!(*k, i);
+			assert_eq!(*v, i * 10);
+		}
+		assert!(range.next().is_none());
+	}
+
+	#[test]
+	fn range_rev_included_bounds() {
+		use std::ops::Bound::Included;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut range = tree.range_rev(Included(&3), Included(&6));
+		assert_eq!(range.next(), Some((&6, &60)));
+		assert_eq!(range.next(), Some((&5, &50)));
+		assert_eq!(range.next(), Some((&4, &40)));
+		assert_eq!(range.next(), Some((&3, &30)));
+		assert_eq!(range.next(), None);
+	}
+
+	#[test]
+	fn range_rev_excluded_bounds() {
+		use std::ops::Bound::Excluded;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut range = tree.range_rev(Excluded(&3), Excluded(&6));
+		assert_eq!(range.next(), Some((&5, &50)));
+		assert_eq!(range.next(), Some((&4, &40)));
+		assert_eq!(range.next(), None);
+	}
+
+	#[test]
+	fn range_rev_mixed_bounds() {
+		use std::ops::Bound::{Excluded, Included, Unbounded};
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		// From 5 (exclusive) to end (descending)
+		let mut range = tree.range_rev(Excluded(&5), Unbounded);
+		for i in (6..10).rev() {
+			let (k, v) = range.next().unwrap();
+			assert_eq!(*k, i);
+			assert_eq!(*v, i * 10);
+		}
+		assert!(range.next().is_none());
+
+		// From start to 5 (included) (descending)
+		let mut range = tree.range_rev(Unbounded, Included(&5));
+		for i in (0..=5).rev() {
+			let (k, v) = range.next().unwrap();
+			assert_eq!(*k, i);
+			assert_eq!(*v, i * 10);
+		}
+		assert!(range.next().is_none());
+	}
+
+	#[test]
+	fn range_rev_empty_tree() {
+		use std::ops::Bound::Unbounded;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		let mut range = tree.range_rev(Unbounded, Unbounded);
+		assert!(range.next().is_none());
+	}
+
+	#[test]
+	fn range_rev_nonexistent_bounds() {
+		use std::ops::Bound::Included;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		tree.insert(0, 0);
+		tree.insert(2, 20);
+		tree.insert(4, 40);
+		tree.insert(6, 60);
+
+		// Reverse range from 1 to 5 (neither exist)
+		let mut range = tree.range_rev(Included(&1), Included(&5));
+		assert_eq!(range.next(), Some((&4, &40)));
+		assert_eq!(range.next(), Some((&2, &20)));
+		assert_eq!(range.next(), None);
+	}
+
+	#[test]
+	fn range_rev_single_element() {
+		use std::ops::Bound::Included;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		tree.insert(5, 50);
+
+		let mut range = tree.range_rev(Included(&5), Included(&5));
+		assert_eq!(range.next(), Some((&5, &50)));
+		assert_eq!(range.next(), None);
+	}
+
+	#[test]
+	fn range_rev_peek() {
+		use std::ops::Bound::{Included, Unbounded};
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut range = tree.range_rev(Included(&3), Unbounded);
+
+		// peek should return 9 (the largest key)
+		assert_eq!(range.peek(), Some((&9, &90)));
+		assert_eq!(range.peek(), Some((&9, &90))); // peek again returns same
+
+		// next should return 9 and advance
+		assert_eq!(range.next(), Some((&9, &90)));
+
+		// now peek should return 8
+		assert_eq!(range.peek(), Some((&8, &80)));
+	}
+
+	#[test]
+	fn range_rev_peek_respects_lower_bound() {
+		use std::ops::Bound::Included;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut range = tree.range_rev(Included(&7), Included(&9));
+
+		assert_eq!(range.peek(), Some((&9, &90)));
+		assert_eq!(range.next(), Some((&9, &90)));
+		assert_eq!(range.peek(), Some((&8, &80)));
+		assert_eq!(range.next(), Some((&8, &80)));
+		assert_eq!(range.peek(), Some((&7, &70)));
+		assert_eq!(range.next(), Some((&7, &70)));
+		// Should stop at lower bound
+		assert!(range.peek().is_none());
+		assert!(range.next().is_none());
+	}
+
+	#[test]
+	fn range_rev_large_tree() {
+		use std::ops::Bound::Unbounded;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..200 {
+			tree.insert(i, i);
+		}
+		assert!(tree.height() > 1, "Tree should have multiple levels");
+
+		let mut range = tree.range_rev(Unbounded, Unbounded);
+		for i in (0..200).rev() {
+			let (k, v) = range.next().unwrap();
+			assert_eq!(*k, i);
+			assert_eq!(*v, i);
+		}
+		assert!(range.next().is_none());
 	}
 
 	// -----------------------------------------------------------------------

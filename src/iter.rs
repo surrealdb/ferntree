@@ -204,6 +204,32 @@ impl Cursor {
 			_ => None, // Before(pos) where pos >= leaf_len
 		}
 	}
+
+	/// Returns the position for peek() without computing new cursor state.
+	///
+	/// This is used by `peek()` to inspect the next entry without advancing.
+	/// Returns `Some(position)` if there's an entry available, `None` if at end of leaf.
+	#[inline]
+	fn peek_next_pos(self, leaf_len: u16) -> Option<u16> {
+		match self {
+			Cursor::Before(pos) if pos < leaf_len => Some(pos),
+			Cursor::After(pos) if (pos + 1) < leaf_len => Some(pos + 1),
+			_ => None,
+		}
+	}
+
+	/// Returns the position for peek_prev() without computing new cursor state.
+	///
+	/// This is used by `peek_prev()` to inspect the previous entry without moving backward.
+	/// Returns `Some(position)` if there's an entry available, `None` if at start of leaf.
+	#[inline]
+	fn peek_prev_pos(self) -> Option<u16> {
+		match self {
+			Cursor::After(pos) => Some(pos),
+			Cursor::Before(pos) if pos > 0 => Some(pos - 1),
+			_ => None,
+		}
+	}
 }
 
 /// Result of attempting to move to the next/previous leaf.
@@ -941,6 +967,88 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 					LeafResult::End => {
 						return None;
 					}
+				}
+			}
+		}
+	}
+
+	/// Returns the next entry without advancing the cursor.
+	///
+	/// Repeated calls return the same entry until `next()` or `prev()` is called.
+	/// If at a leaf boundary, may advance to the next leaf (but not the cursor
+	/// position within that leaf).
+	///
+	/// # Usage
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, &str> = Tree::new();
+	/// tree.insert(1, "one");
+	/// tree.insert(2, "two");
+	///
+	/// let mut iter = tree.raw_iter();
+	/// iter.seek_to_first();
+	///
+	/// // peek() returns the same value repeatedly
+	/// assert_eq!(iter.peek(), Some((&1, &"one")));
+	/// assert_eq!(iter.peek(), Some((&1, &"one")));
+	///
+	/// // next() returns the same value and advances
+	/// assert_eq!(iter.next(), Some((&1, &"one")));
+	/// assert_eq!(iter.peek(), Some((&2, &"two")));
+	/// ```
+	#[inline]
+	pub fn peek(&mut self) -> Option<(&K, &V)> {
+		loop {
+			// Get position to return (or None if at end of leaf)
+			// This captures the position as a value, ending the borrow
+			let pos_opt = match self.leaf.as_ref() {
+				Some((guard, cursor)) => cursor.peek_next_pos(guard.as_leaf().len),
+				None => return None,
+			};
+
+			if let Some(pos) = pos_opt {
+				// Return entry at position (new borrow)
+				let (guard, _) = self.leaf.as_ref().unwrap();
+				return Some(
+					guard.as_leaf().kv_at(pos).expect("cursor position validated before access"),
+				);
+			} else {
+				// At end of current leaf - try to move to next leaf
+				match self.next_leaf() {
+					LeafResult::Ok | LeafResult::Retry => continue,
+					LeafResult::End => return None,
+				}
+			}
+		}
+	}
+
+	/// Returns the previous entry without moving the cursor backward.
+	///
+	/// Repeated calls return the same entry until `next()` or `prev()` is called.
+	/// If at a leaf boundary, may move to the previous leaf (but not the cursor
+	/// position within that leaf).
+	#[inline]
+	pub fn peek_prev(&mut self) -> Option<(&K, &V)> {
+		loop {
+			// Get position to return (or None if at start of leaf)
+			let pos_opt = match self.leaf.as_ref() {
+				Some((_, cursor)) => cursor.peek_prev_pos(),
+				None => return None,
+			};
+
+			if let Some(pos) = pos_opt {
+				// Return entry at position (new borrow)
+				let (guard, _) = self.leaf.as_ref().unwrap();
+				return Some(
+					guard.as_leaf().kv_at(pos).expect("cursor position validated before access"),
+				);
+			} else {
+				// At start of current leaf - try to move to previous leaf
+				match self.prev_leaf() {
+					LeafResult::Ok | LeafResult::Retry => continue,
+					LeafResult::End => return None,
 				}
 			}
 		}
@@ -1685,6 +1793,72 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			}
 		}
 	}
+
+	/// Returns the next entry without advancing the cursor (mutable value reference).
+	///
+	/// Repeated calls return the same entry until `next()` or `prev()` is called.
+	/// If at a leaf boundary, may advance to the next leaf (but not the cursor
+	/// position within that leaf).
+	#[inline]
+	pub fn peek(&mut self) -> Option<(&K, &mut V)> {
+		loop {
+			// Get position to return (or None if at end of leaf)
+			let pos_opt = match self.leaf.as_ref() {
+				Some((guard, cursor)) => cursor.peek_next_pos(guard.as_leaf().len),
+				None => return None,
+			};
+
+			if let Some(pos) = pos_opt {
+				// Return entry at position (new mutable borrow)
+				let (guard, _) = self.leaf.as_mut().unwrap();
+				return Some(
+					guard
+						.as_leaf_mut()
+						.kv_at_mut(pos)
+						.expect("cursor position validated before access"),
+				);
+			} else {
+				// At end of current leaf - try to move to next leaf
+				match self.next_leaf() {
+					LeafResult::Ok | LeafResult::Retry => continue,
+					LeafResult::End => return None,
+				}
+			}
+		}
+	}
+
+	/// Returns the previous entry without moving the cursor backward (mutable value reference).
+	///
+	/// Repeated calls return the same entry until `next()` or `prev()` is called.
+	/// If at a leaf boundary, may move to the previous leaf (but not the cursor
+	/// position within that leaf).
+	#[inline]
+	pub fn peek_prev(&mut self) -> Option<(&K, &mut V)> {
+		loop {
+			// Get position to return (or None if at start of leaf)
+			let pos_opt = match self.leaf.as_ref() {
+				Some((_, cursor)) => cursor.peek_prev_pos(),
+				None => return None,
+			};
+
+			if let Some(pos) = pos_opt {
+				// Return entry at position (new mutable borrow)
+				let (guard, _) = self.leaf.as_mut().unwrap();
+				return Some(
+					guard
+						.as_leaf_mut()
+						.kv_at_mut(pos)
+						.expect("cursor position validated before access"),
+				);
+			} else {
+				// At start of current leaf - try to move to previous leaf
+				match self.prev_leaf() {
+					LeafResult::Ok | LeafResult::Retry => continue,
+					LeafResult::End => return None,
+				}
+			}
+		}
+	}
 }
 
 // ===========================================================================
@@ -1825,6 +1999,245 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Range<'t, K, V, IC
 	/// Note: This does not check the lower bound - it simply iterates backwards.
 	pub fn prev(&mut self) -> Option<(&K, &V)> {
 		self.iter.prev()
+	}
+
+	/// Returns the next key-value pair within the range without advancing.
+	///
+	/// Repeated calls return the same entry until `next()` or `prev()` is called.
+	/// Returns `None` when the next entry would exceed the upper bound.
+	///
+	/// # Usage
+	///
+	/// ```
+	/// use ferntree::Tree;
+	/// use std::ops::Bound::{Included, Unbounded};
+	///
+	/// let tree: Tree<i32, &str> = Tree::new();
+	/// tree.insert(1, "one");
+	/// tree.insert(2, "two");
+	///
+	/// let mut range = tree.range(Included(&1), Unbounded);
+	///
+	/// // peek() returns the same value repeatedly
+	/// assert_eq!(range.peek(), Some((&1, &"one")));
+	/// assert_eq!(range.peek(), Some((&1, &"one")));
+	///
+	/// // next() returns the same value and advances
+	/// assert_eq!(range.next(), Some((&1, &"one")));
+	/// assert_eq!(range.peek(), Some((&2, &"two")));
+	/// ```
+	pub fn peek(&mut self) -> Option<(&K, &V)> {
+		if self.finished {
+			return None;
+		}
+
+		match self.iter.peek() {
+			Some((k, v)) => {
+				// Check if we've exceeded the upper bound
+				let within_bounds = match &self.upper_bound {
+					Bound::Unbounded => true,
+					Bound::Included(max) => k <= max,
+					Bound::Excluded(max) => k < max,
+				};
+
+				if within_bounds {
+					Some((k, v))
+				} else {
+					None
+				}
+			}
+			None => None,
+		}
+	}
+
+	/// Returns the previous key-value pair within the range without moving backward.
+	///
+	/// Repeated calls return the same entry until `next()` or `prev()` is called.
+	/// Note: This does not check the lower bound.
+	pub fn peek_prev(&mut self) -> Option<(&K, &V)> {
+		self.iter.peek_prev()
+	}
+}
+
+/// A reverse range iterator over the entries of a B+ tree.
+///
+/// This iterator yields key-value pairs within the specified bounds in
+/// descending key order. It wraps `RawSharedIter` and provides bounds checking.
+///
+/// # Usage
+///
+/// ```
+/// use ferntree::Tree;
+/// use std::ops::Bound::{Included, Excluded, Unbounded};
+///
+/// let tree: Tree<i32, &str> = Tree::new();
+/// tree.insert(1, "one");
+/// tree.insert(2, "two");
+/// tree.insert(3, "three");
+///
+/// let mut range = tree.range_rev(Included(&1), Unbounded);
+/// assert_eq!(range.next(), Some((&3, &"three")));
+/// assert_eq!(range.next(), Some((&2, &"two")));
+/// assert_eq!(range.next(), Some((&1, &"one")));
+/// assert_eq!(range.next(), None);
+/// ```
+pub struct RangeRev<'t, K, V, const IC: usize, const LC: usize> {
+	/// The underlying iterator.
+	iter: RawSharedIter<'t, K, V, IC, LC>,
+	/// The lower bound for iteration (owned).
+	lower_bound: Bound<K>,
+	/// Whether we've finished iterating.
+	finished: bool,
+}
+
+impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RangeRev<'t, K, V, IC, LC> {
+	/// Creates a new reverse range iterator.
+	///
+	/// The iterator is positioned based on the upper bound and will stop
+	/// when entries go below the lower bound.
+	pub(crate) fn new<Q>(
+		tree: &'t GenericTree<K, V, IC, LC>,
+		min: Bound<&Q>,
+		max: Bound<&Q>,
+	) -> RangeRev<'t, K, V, IC, LC>
+	where
+		K: Borrow<Q>,
+		Q: ?Sized + Ord,
+	{
+		let mut iter = tree.raw_iter();
+
+		// Position the iterator based on the upper bound
+		match max {
+			Bound::Unbounded => iter.seek_to_last(),
+			Bound::Included(k) => {
+				// Seek for prev positions so that prev() returns the largest key <= k
+				iter.seek_for_prev(k);
+			}
+			Bound::Excluded(k) => {
+				// Seek for prev, then we need to skip if we landed exactly on k
+				iter.seek_for_prev(k);
+				// Check if we're positioned at the excluded key and skip it
+				if let Some((key, _)) = iter.peek_prev() {
+					if key.borrow() == k {
+						let _ = iter.prev(); // Skip the excluded key
+					}
+				}
+			}
+		}
+
+		// Convert lower bound to owned by finding and cloning the boundary key
+		let lower_bound = match min {
+			Bound::Unbounded => Bound::Unbounded,
+			Bound::Included(k) => {
+				// Find a key at or after k to use as the bound
+				let mut temp = tree.raw_iter();
+				temp.seek(k);
+				match temp.next() {
+					Some((key, _)) if key.borrow() == k => Bound::Included(key.clone()),
+					Some((key, _)) => {
+						// k doesn't exist, use key > k as exclusive bound
+						// For lower bound, we want to include keys >= the next existing key
+						Bound::Included(key.clone())
+					}
+					None => Bound::Unbounded, // No keys at or after k
+				}
+			}
+			Bound::Excluded(k) => {
+				// Find the key at k to use as the bound
+				let mut temp = tree.raw_iter();
+				temp.seek(k);
+				match temp.next() {
+					Some((key, _)) if key.borrow() == k => Bound::Excluded(key.clone()),
+					Some((key, _)) => {
+						// k doesn't exist, use key > k as the bound (include it)
+						Bound::Included(key.clone())
+					}
+					None => Bound::Unbounded, // No keys at or after k
+				}
+			}
+		};
+
+		RangeRev {
+			iter,
+			lower_bound,
+			finished: false,
+		}
+	}
+
+	/// Returns the next key-value pair within the range (in descending order).
+	///
+	/// Returns `None` when iteration is complete or when entries
+	/// go below the lower bound.
+	#[allow(clippy::should_implement_trait)]
+	pub fn next(&mut self) -> Option<(&K, &V)> {
+		if self.finished {
+			return None;
+		}
+
+		match self.iter.prev() {
+			Some((k, v)) => {
+				// Check if we've gone below the lower bound
+				let within_bounds = match &self.lower_bound {
+					Bound::Unbounded => true,
+					Bound::Included(min) => k >= min,
+					Bound::Excluded(min) => k > min,
+				};
+
+				if within_bounds {
+					Some((k, v))
+				} else {
+					self.finished = true;
+					None
+				}
+			}
+			None => {
+				self.finished = true;
+				None
+			}
+		}
+	}
+
+	/// Returns the previous key-value pair within the range (going forward).
+	///
+	/// Note: This does not check the upper bound.
+	pub fn prev(&mut self) -> Option<(&K, &V)> {
+		self.iter.next()
+	}
+
+	/// Returns the next key-value pair within the range without advancing.
+	///
+	/// Repeated calls return the same entry until `next()` or `prev()` is called.
+	/// Returns `None` when the next entry would go below the lower bound.
+	pub fn peek(&mut self) -> Option<(&K, &V)> {
+		if self.finished {
+			return None;
+		}
+
+		match self.iter.peek_prev() {
+			Some((k, v)) => {
+				// Check if we've gone below the lower bound
+				let within_bounds = match &self.lower_bound {
+					Bound::Unbounded => true,
+					Bound::Included(min) => k >= min,
+					Bound::Excluded(min) => k > min,
+				};
+
+				if within_bounds {
+					Some((k, v))
+				} else {
+					None
+				}
+			}
+			None => None,
+		}
+	}
+
+	/// Returns the previous key-value pair within the range without moving backward.
+	///
+	/// Repeated calls return the same entry until `next()` or `prev()` is called.
+	/// Note: This does not check the upper bound.
+	pub fn peek_prev(&mut self) -> Option<(&K, &V)> {
+		self.iter.peek()
 	}
 }
 
@@ -2874,5 +3287,426 @@ mod tests {
 		iter.seek_for_prev(&35); // In gap between 20 and 40
 		let (k, _) = iter.prev().unwrap();
 		assert_eq!(*k, 20); // Largest key <= 35
+	}
+
+	// -----------------------------------------------------------------------
+	// Peek Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn peek_empty_tree() {
+		let tree: Tree<i32, i32> = Tree::new();
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+		assert!(iter.peek().is_none());
+	}
+
+	#[test]
+	fn peek_returns_same_as_next() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		// peek and next should return the same entry
+		// Compare by dereferencing to owned values to avoid borrow issues
+		let peek_key = iter.peek().map(|(k, v)| (*k, *v));
+		let next_key = iter.next().map(|(k, v)| (*k, *v));
+
+		assert_eq!(peek_key, next_key);
+		assert_eq!(peek_key.unwrap().0, 0);
+	}
+
+	#[test]
+	fn peek_does_not_advance() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		// Multiple peek calls should return the same entry
+		assert_eq!(iter.peek(), Some((&0, &0)));
+		assert_eq!(iter.peek(), Some((&0, &0)));
+		assert_eq!(iter.peek(), Some((&0, &0)));
+
+		// next() should also return the same entry
+		assert_eq!(iter.next(), Some((&0, &0)));
+
+		// Now peek should return the next entry
+		assert_eq!(iter.peek(), Some((&1, &10)));
+	}
+
+	#[test]
+	fn peek_then_next_returns_same() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		for expected in 0..10 {
+			let peeked = iter.peek().map(|(k, v)| (*k, *v));
+			let nexted = iter.next().map(|(k, v)| (*k, *v));
+			assert_eq!(peeked, nexted);
+			assert_eq!(peeked.unwrap().0, expected);
+		}
+
+		// Both should return None at end
+		assert!(iter.peek().is_none());
+		assert!(iter.next().is_none());
+	}
+
+	#[test]
+	fn peek_at_leaf_boundary() {
+		let tree: Tree<i32, i32> = Tree::new();
+		// Insert enough to cause splits (LEAF_CAPACITY is 64)
+		for i in 0..200 {
+			tree.insert(i, i);
+		}
+		assert!(tree.height() > 1, "Tree should have multiple levels");
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		// Iterate through all entries, checking peek at each step
+		let mut count = 0;
+		loop {
+			let peeked = iter.peek().map(|(k, v)| (*k, *v));
+			if peeked.is_none() {
+				break;
+			}
+			let nexted = iter.next().map(|(k, v)| (*k, *v)).unwrap();
+			assert_eq!(peeked.unwrap(), nexted);
+			assert_eq!(nexted.0, count);
+			count += 1;
+		}
+		assert_eq!(count, 200);
+	}
+
+	#[test]
+	fn peek_from_middle() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek(&5);
+
+		assert_eq!(iter.peek(), Some((&5, &5)));
+		assert_eq!(iter.next(), Some((&5, &5)));
+		assert_eq!(iter.peek(), Some((&6, &6)));
+	}
+
+	// -----------------------------------------------------------------------
+	// Peek Prev Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn peek_prev_empty_tree() {
+		let tree: Tree<i32, i32> = Tree::new();
+		let mut iter = tree.raw_iter();
+		iter.seek_to_last();
+		assert!(iter.peek_prev().is_none());
+	}
+
+	#[test]
+	fn peek_prev_returns_same_as_prev() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_last();
+
+		// peek_prev and prev should return the same entry
+		let peek_result = iter.peek_prev().map(|(k, v)| (*k, *v));
+		let prev_result = iter.prev().map(|(k, v)| (*k, *v));
+
+		assert_eq!(peek_result, prev_result);
+		assert_eq!(peek_result.unwrap().0, 9);
+	}
+
+	#[test]
+	fn peek_prev_does_not_advance() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_last();
+
+		// Multiple peek_prev calls should return the same entry
+		assert_eq!(iter.peek_prev(), Some((&9, &90)));
+		assert_eq!(iter.peek_prev(), Some((&9, &90)));
+		assert_eq!(iter.peek_prev(), Some((&9, &90)));
+
+		// prev() should also return the same entry
+		assert_eq!(iter.prev(), Some((&9, &90)));
+
+		// Now peek_prev should return the previous entry
+		assert_eq!(iter.peek_prev(), Some((&8, &80)));
+	}
+
+	#[test]
+	fn peek_prev_then_prev_returns_same() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_last();
+
+		for expected in (0..10).rev() {
+			let peeked = iter.peek_prev().map(|(k, v)| (*k, *v));
+			let preved = iter.prev().map(|(k, v)| (*k, *v));
+			assert_eq!(peeked, preved);
+			assert_eq!(peeked.unwrap().0, expected);
+		}
+
+		// Both should return None at start
+		assert!(iter.peek_prev().is_none());
+		assert!(iter.prev().is_none());
+	}
+
+	// -----------------------------------------------------------------------
+	// Peek Mut Tests (RawExclusiveIter)
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn peek_mut_does_not_advance() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut iter = tree.raw_iter_mut();
+		iter.seek_to_first();
+
+		// Multiple peek calls should return the same entry
+		assert_eq!(*iter.peek().unwrap().0, 0);
+		assert_eq!(*iter.peek().unwrap().0, 0);
+
+		// next() should also return the same entry
+		assert_eq!(*iter.next().unwrap().0, 0);
+
+		// Now peek should return the next entry
+		assert_eq!(*iter.peek().unwrap().0, 1);
+	}
+
+	#[test]
+	fn peek_mut_allows_modification() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i);
+		}
+
+		{
+			let mut iter = tree.raw_iter_mut();
+			iter.seek_to_first();
+
+			// Modify via peek
+			if let Some((_, v)) = iter.peek() {
+				*v = 100;
+			}
+		}
+
+		// Verify modification
+		assert_eq!(tree.lookup(&0, |v| *v), Some(100));
+	}
+
+	// -----------------------------------------------------------------------
+	// Range Peek Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn range_peek_within_bounds() {
+		use std::ops::Bound::Included;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut range = tree.range(Included(&3), Included(&7));
+
+		// peek should return first entry in range
+		assert_eq!(range.peek(), Some((&3, &30)));
+		assert_eq!(range.peek(), Some((&3, &30)));
+
+		// next should return same and advance
+		assert_eq!(range.next(), Some((&3, &30)));
+		assert_eq!(range.peek(), Some((&4, &40)));
+	}
+
+	#[test]
+	fn range_peek_respects_upper_bound() {
+		use std::ops::Bound::{Excluded, Included};
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut range = tree.range(Included(&7), Excluded(&9));
+
+		assert_eq!(range.peek(), Some((&7, &70)));
+		assert_eq!(range.next(), Some((&7, &70)));
+		assert_eq!(range.peek(), Some((&8, &80)));
+		assert_eq!(range.next(), Some((&8, &80)));
+		// 9 is excluded
+		assert!(range.peek().is_none());
+		assert!(range.next().is_none());
+	}
+
+	#[test]
+	fn range_peek_empty_range() {
+		use std::ops::Bound::{Excluded, Included};
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i);
+		}
+
+		// Empty range (5 to 5 excluded)
+		let mut range = tree.range(Included(&5), Excluded(&5));
+		assert!(range.peek().is_none());
+	}
+
+	// -----------------------------------------------------------------------
+	// Reverse Range Peek Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn range_rev_peek_within_bounds() {
+		use std::ops::Bound::Included;
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut range = tree.range_rev(Included(&3), Included(&7));
+
+		// peek should return last entry in range (descending order)
+		assert_eq!(range.peek(), Some((&7, &70)));
+		assert_eq!(range.peek(), Some((&7, &70)));
+
+		// next should return same and advance backwards
+		assert_eq!(range.next(), Some((&7, &70)));
+		assert_eq!(range.peek(), Some((&6, &60)));
+	}
+
+	#[test]
+	fn range_rev_peek_respects_lower_bound() {
+		use std::ops::Bound::{Excluded, Included};
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut range = tree.range_rev(Excluded(&1), Included(&3));
+
+		assert_eq!(range.peek(), Some((&3, &30)));
+		assert_eq!(range.next(), Some((&3, &30)));
+		assert_eq!(range.peek(), Some((&2, &20)));
+		assert_eq!(range.next(), Some((&2, &20)));
+		// 1 is excluded
+		assert!(range.peek().is_none());
+		assert!(range.next().is_none());
+	}
+
+	#[test]
+	fn range_rev_peek_empty_range() {
+		use std::ops::Bound::{Excluded, Included};
+
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i);
+		}
+
+		// Empty range (5 excluded to 5 included going backwards - impossible)
+		let mut range = tree.range_rev(Excluded(&5), Included(&5));
+		assert!(range.peek().is_none());
+	}
+
+	// -----------------------------------------------------------------------
+	// Cursor peek_next_pos and peek_prev_pos Unit Tests
+	// -----------------------------------------------------------------------
+
+	mod cursor_peek_tests {
+		use super::super::Cursor;
+
+		#[test]
+		fn peek_next_pos_before_start() {
+			let cursor = Cursor::Before(0);
+			assert_eq!(cursor.peek_next_pos(4), Some(0));
+		}
+
+		#[test]
+		fn peek_next_pos_before_middle() {
+			let cursor = Cursor::Before(2);
+			assert_eq!(cursor.peek_next_pos(4), Some(2));
+		}
+
+		#[test]
+		fn peek_next_pos_before_end() {
+			let cursor = Cursor::Before(4);
+			assert_eq!(cursor.peek_next_pos(4), None);
+		}
+
+		#[test]
+		fn peek_next_pos_after_start() {
+			let cursor = Cursor::After(0);
+			assert_eq!(cursor.peek_next_pos(4), Some(1));
+		}
+
+		#[test]
+		fn peek_next_pos_after_second_to_last() {
+			let cursor = Cursor::After(2);
+			assert_eq!(cursor.peek_next_pos(4), Some(3));
+		}
+
+		#[test]
+		fn peek_next_pos_after_last() {
+			let cursor = Cursor::After(3);
+			assert_eq!(cursor.peek_next_pos(4), None);
+		}
+
+		#[test]
+		fn peek_prev_pos_after_start() {
+			let cursor = Cursor::After(0);
+			assert_eq!(cursor.peek_prev_pos(), Some(0));
+		}
+
+		#[test]
+		fn peek_prev_pos_after_middle() {
+			let cursor = Cursor::After(2);
+			assert_eq!(cursor.peek_prev_pos(), Some(2));
+		}
+
+		#[test]
+		fn peek_prev_pos_before_start() {
+			let cursor = Cursor::Before(0);
+			assert_eq!(cursor.peek_prev_pos(), None);
+		}
+
+		#[test]
+		fn peek_prev_pos_before_middle() {
+			let cursor = Cursor::Before(2);
+			assert_eq!(cursor.peek_prev_pos(), Some(1));
+		}
 	}
 }
