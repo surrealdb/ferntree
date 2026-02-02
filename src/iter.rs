@@ -710,10 +710,12 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		}
 	}
 
-	/// Positions the cursor immediately after the given key (if it exists).
+	/// Positions the cursor so that `prev()` returns the largest key <= the given key.
 	///
-	/// If the key exists, cursor is positioned after it (so `prev()` returns it).
-	/// If the key doesn't exist, cursor is positioned before where it would be.
+	/// This follows RocksDB-style `SeekForPrev` semantics:
+	/// - If the key exists, `prev()` will return that key
+	/// - If the key doesn't exist, `prev()` will return the largest key less than it
+	/// - If no key <= the given key exists, `prev()` will return `None`
 	///
 	/// This is useful for reverse iteration starting from a specific key.
 	pub fn seek_for_prev<Q>(&mut self, key: &Q)
@@ -747,12 +749,12 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 			self.leaf = Some((guard, Cursor::Before(pos)));
 			self.parent = parent_opt;
 		} else if pos >= leaf_len {
-			// Key would be after all entries - position at end
-			self.leaf = Some((guard, Cursor::Before(leaf_len)));
+			// Key would be after all entries - position after last entry so prev() returns it
+			self.leaf = Some((guard, Cursor::After(leaf_len - 1)));
 			self.parent = parent_opt;
 		} else {
-			// Key not found but in range - position after the previous entry
-			self.leaf = Some((guard, Cursor::After(pos)));
+			// Key not found but in range - position after the previous entry so prev() returns largest key < seek_key
+			self.leaf = Some((guard, Cursor::After(pos - 1)));
 			self.parent = parent_opt;
 		}
 	}
@@ -1319,7 +1321,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		}
 	}
 
-	/// Positions the cursor immediately after the given key (exclusive lock).
+	/// Positions the cursor so that `prev()` returns the largest key <= the given key (exclusive lock).
 	///
 	/// See `RawSharedIter::seek_for_prev` for detailed documentation.
 	pub fn seek_for_prev<Q>(&mut self, key: &Q)
@@ -1350,10 +1352,12 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			self.leaf = Some((guard, Cursor::Before(pos)));
 			self.parent = parent_opt;
 		} else if pos >= leaf_len {
-			self.leaf = Some((guard, Cursor::Before(leaf_len)));
+			// Key would be after all entries - position after last entry so prev() returns it
+			self.leaf = Some((guard, Cursor::After(leaf_len - 1)));
 			self.parent = parent_opt;
 		} else {
-			self.leaf = Some((guard, Cursor::After(pos)));
+			// Key not found but in range - position after the previous entry so prev() returns largest key < seek_key
+			self.leaf = Some((guard, Cursor::After(pos - 1)));
 			self.parent = parent_opt;
 		}
 	}
@@ -2088,16 +2092,16 @@ mod tests {
 		let mut iter = tree.raw_iter();
 		// Seek for prev at 55 (doesn't exist)
 		// Keys are: 0, 10, 20, 30, 40, 50, 60, 70, 80, 90
-		// seek_for_prev positions us after the lower_bound position
+		// seek_for_prev positions so prev() returns the largest key <= 55
 		iter.seek_for_prev(&55);
 
-		// prev() should give us the key at lower_bound position (60)
-		let (k, _) = iter.prev().unwrap();
-		assert_eq!(*k, 60);
-
-		// And prev() again should give us 50
+		// prev() should return 50 (largest key <= 55)
 		let (k, _) = iter.prev().unwrap();
 		assert_eq!(*k, 50);
+
+		// And prev() again should give us 40
+		let (k, _) = iter.prev().unwrap();
+		assert_eq!(*k, 40);
 	}
 
 	#[test]
@@ -2776,5 +2780,99 @@ mod tests {
 		// prev() should return 4 again
 		let (k, _) = iter.prev().unwrap();
 		assert_eq!(*k, 4);
+	}
+
+	// -----------------------------------------------------------------------
+	// seek_for_prev Edge Case Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn seek_for_prev_empty_tree() {
+		let tree: Tree<i32, i32> = Tree::new();
+		let mut iter = tree.raw_iter();
+		iter.seek_for_prev(&100);
+		assert!(iter.prev().is_none());
+	}
+
+	#[test]
+	fn seek_for_prev_before_all_keys() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 10..20 {
+			tree.insert(i, i);
+		}
+		let mut iter = tree.raw_iter();
+		iter.seek_for_prev(&5); // Before any key
+		assert!(iter.prev().is_none());
+	}
+
+	#[test]
+	fn seek_for_prev_after_all_keys() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 10..20 {
+			tree.insert(i, i);
+		}
+		let mut iter = tree.raw_iter();
+		iter.seek_for_prev(&100); // After all keys
+		let (k, _) = iter.prev().unwrap();
+		assert_eq!(*k, 19); // Largest key
+	}
+
+	#[test]
+	fn seek_for_prev_middle_gap() {
+		let tree: Tree<i32, i32> = Tree::new();
+		tree.insert(10, 1);
+		tree.insert(20, 2);
+		tree.insert(40, 4);
+		tree.insert(50, 5);
+		// Gap at 30
+		let mut iter = tree.raw_iter();
+		iter.seek_for_prev(&35); // In gap between 20 and 40
+		let (k, _) = iter.prev().unwrap();
+		assert_eq!(*k, 20); // Largest key <= 35
+	}
+
+	#[test]
+	fn seek_for_prev_mut_empty_tree() {
+		let tree: Tree<i32, i32> = Tree::new();
+		let mut iter = tree.raw_iter_mut();
+		iter.seek_for_prev(&100);
+		assert!(iter.prev().is_none());
+	}
+
+	#[test]
+	fn seek_for_prev_mut_before_all_keys() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 10..20 {
+			tree.insert(i, i);
+		}
+		let mut iter = tree.raw_iter_mut();
+		iter.seek_for_prev(&5); // Before any key
+		assert!(iter.prev().is_none());
+	}
+
+	#[test]
+	fn seek_for_prev_mut_after_all_keys() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 10..20 {
+			tree.insert(i, i);
+		}
+		let mut iter = tree.raw_iter_mut();
+		iter.seek_for_prev(&100); // After all keys
+		let (k, _) = iter.prev().unwrap();
+		assert_eq!(*k, 19); // Largest key
+	}
+
+	#[test]
+	fn seek_for_prev_mut_middle_gap() {
+		let tree: Tree<i32, i32> = Tree::new();
+		tree.insert(10, 1);
+		tree.insert(20, 2);
+		tree.insert(40, 4);
+		tree.insert(50, 5);
+		// Gap at 30
+		let mut iter = tree.raw_iter_mut();
+		iter.seek_for_prev(&35); // In gap between 20 and 40
+		let (k, _) = iter.prev().unwrap();
+		assert_eq!(*k, 20); // Largest key <= 35
 	}
 }
