@@ -1,3 +1,7 @@
+// Explicit drops are used for clarity in memory leak tests, even when the type
+// doesn't implement Drop. This documents the point at which reclamation should occur.
+#![allow(clippy::drop_non_drop)]
+
 //! Memory leak detection tests for ferntree.
 //!
 //! These tests verify that memory is properly reclaimed after tree operations.

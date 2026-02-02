@@ -835,9 +835,9 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
 							}
 
 							// Spawn writer threads
-							for w in 0..*num_writers {
+							for keys in write_keys.iter().take(*num_writers) {
 								let tree = Arc::clone(&tree);
-								let keys = write_keys[w].clone();
+								let keys = keys.clone();
 								handles.push(thread::spawn(move || {
 									for k in keys {
 										black_box(tree.insert(k, k));
@@ -882,9 +882,9 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
 							}
 
 							// Spawn writer threads
-							for w in 0..*num_writers {
+							for keys in write_keys.iter().take(*num_writers) {
 								let map = Arc::clone(&map);
-								let keys = write_keys[w].clone();
+								let keys = keys.clone();
 								handles.push(thread::spawn(move || {
 									for k in keys {
 										black_box(map.insert(k, k));
@@ -933,9 +933,9 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
 							}
 
 							// Spawn writer threads
-							for w in 0..*num_writers {
+							for keys in write_keys.iter().take(*num_writers) {
 								let map = Arc::clone(&map);
-								let keys = write_keys[w].clone();
+								let keys = keys.clone();
 								handles.push(thread::spawn(move || {
 									for k in keys {
 										let mut guard = map.write();
@@ -985,9 +985,9 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
 							}
 
 							// Spawn writer threads
-							for w in 0..*num_writers {
+							for keys in write_keys.iter().take(*num_writers) {
 								let map = Arc::clone(&map);
-								let keys = write_keys[w].clone();
+								let keys = keys.clone();
 								handles.push(thread::spawn(move || {
 									for k in keys {
 										let mut guard = map.write();
