@@ -307,7 +307,9 @@ pub struct RawSharedIter<'t, K, V, const IC: usize, const LC: usize> {
 }
 
 impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, K, V, IC, LC> {
-	/// Creates a new iterator. The iterator starts in an unpositioned state;
+	/// Creates a new iterator, pinning a fresh epoch guard.
+	///
+	/// The iterator starts in an unpositioned state;
 	/// call `seek*` methods to position it before iterating.
 	pub(crate) fn new(tree: &'t GenericTree<K, V, IC, LC>) -> RawSharedIter<'t, K, V, IC, LC> {
 		RawSharedIter {
@@ -1107,7 +1109,9 @@ pub struct RawExclusiveIter<'t, K, V, const IC: usize, const LC: usize> {
 }
 
 impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'t, K, V, IC, LC> {
-	/// Creates a new exclusive iterator. Call `seek*` methods to position before iterating.
+	/// Creates a new exclusive iterator, pinning a fresh epoch guard.
+	///
+	/// Call `seek*` methods to position before iterating.
 	pub(crate) fn new(tree: &'t GenericTree<K, V, IC, LC>) -> RawExclusiveIter<'t, K, V, IC, LC> {
 		RawExclusiveIter {
 			tree,
@@ -1911,6 +1915,34 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Range<'t, K, V, IC
 	{
 		let mut iter = tree.raw_iter();
 
+		// Convert upper bound to owned by seeking and cloning the boundary key.
+		// We do this first, then reposition for the lower bound.
+		let upper_bound = match max {
+			Bound::Unbounded => Bound::Unbounded,
+			Bound::Included(k) => {
+				iter.seek(k);
+				match iter.next() {
+					Some((key, _)) if key.borrow() == k => Bound::Included(key.clone()),
+					Some((key, _)) => {
+						// k doesn't exist, use key > k as exclusive bound
+						Bound::Excluded(key.clone())
+					}
+					None => Bound::Unbounded, // No keys at or after k
+				}
+			}
+			Bound::Excluded(k) => {
+				iter.seek(k);
+				match iter.next() {
+					Some((key, _)) if key.borrow() == k => Bound::Excluded(key.clone()),
+					Some((key, _)) => {
+						// k doesn't exist, use key > k as exclusive bound
+						Bound::Excluded(key.clone())
+					}
+					None => Bound::Unbounded, // No keys at or after k
+				}
+			}
+		};
+
 		// Position the iterator based on the lower bound
 		match min {
 			Bound::Unbounded => iter.seek_to_first(),
@@ -1922,37 +1954,6 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Range<'t, K, V, IC
 				}
 			}
 		}
-
-		// Convert upper bound to owned by finding and cloning the boundary key
-		let upper_bound = match max {
-			Bound::Unbounded => Bound::Unbounded,
-			Bound::Included(k) => {
-				// Find a key at or after k to use as the bound
-				let mut temp = tree.raw_iter();
-				temp.seek(k);
-				match temp.next() {
-					Some((key, _)) if key.borrow() == k => Bound::Included(key.clone()),
-					Some((key, _)) => {
-						// k doesn't exist, use key > k as exclusive bound
-						Bound::Excluded(key.clone())
-					}
-					None => Bound::Unbounded, // No keys at or after k
-				}
-			}
-			Bound::Excluded(k) => {
-				// Find the key at k to use as the bound
-				let mut temp = tree.raw_iter();
-				temp.seek(k);
-				match temp.next() {
-					Some((key, _)) if key.borrow() == k => Bound::Excluded(key.clone()),
-					Some((key, _)) => {
-						// k doesn't exist, use key > k as exclusive bound
-						Bound::Excluded(key.clone())
-					}
-					None => Bound::Unbounded, // No keys at or after k
-				}
-			}
-		};
 
 		Range {
 			iter,
@@ -2106,6 +2107,35 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RangeRev<'t, K, V,
 	{
 		let mut iter = tree.raw_iter();
 
+		// Convert lower bound to owned by seeking and cloning the boundary key.
+		// We do this first, then reposition for the upper bound.
+		let lower_bound = match min {
+			Bound::Unbounded => Bound::Unbounded,
+			Bound::Included(k) => {
+				iter.seek(k);
+				match iter.next() {
+					Some((key, _)) if key.borrow() == k => Bound::Included(key.clone()),
+					Some((key, _)) => {
+						// k doesn't exist, use key > k as exclusive bound
+						// For lower bound, we want to include keys >= the next existing key
+						Bound::Included(key.clone())
+					}
+					None => Bound::Unbounded, // No keys at or after k
+				}
+			}
+			Bound::Excluded(k) => {
+				iter.seek(k);
+				match iter.next() {
+					Some((key, _)) if key.borrow() == k => Bound::Excluded(key.clone()),
+					Some((key, _)) => {
+						// k doesn't exist, use key > k as the bound (include it)
+						Bound::Included(key.clone())
+					}
+					None => Bound::Unbounded, // No keys at or after k
+				}
+			}
+		};
+
 		// Position the iterator based on the upper bound
 		match max {
 			Bound::Unbounded => iter.seek_to_last(),
@@ -2124,38 +2154,6 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RangeRev<'t, K, V,
 				}
 			}
 		}
-
-		// Convert lower bound to owned by finding and cloning the boundary key
-		let lower_bound = match min {
-			Bound::Unbounded => Bound::Unbounded,
-			Bound::Included(k) => {
-				// Find a key at or after k to use as the bound
-				let mut temp = tree.raw_iter();
-				temp.seek(k);
-				match temp.next() {
-					Some((key, _)) if key.borrow() == k => Bound::Included(key.clone()),
-					Some((key, _)) => {
-						// k doesn't exist, use key > k as exclusive bound
-						// For lower bound, we want to include keys >= the next existing key
-						Bound::Included(key.clone())
-					}
-					None => Bound::Unbounded, // No keys at or after k
-				}
-			}
-			Bound::Excluded(k) => {
-				// Find the key at k to use as the bound
-				let mut temp = tree.raw_iter();
-				temp.seek(k);
-				match temp.next() {
-					Some((key, _)) if key.borrow() == k => Bound::Excluded(key.clone()),
-					Some((key, _)) => {
-						// k doesn't exist, use key > k as the bound (include it)
-						Bound::Included(key.clone())
-					}
-					None => Bound::Unbounded, // No keys at or after k
-				}
-			}
-		};
 
 		RangeRev {
 			iter,
