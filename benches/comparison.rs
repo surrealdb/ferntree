@@ -440,7 +440,7 @@ fn bench_remove(c: &mut Criterion) {
 fn bench_range(c: &mut Criterion) {
 	let mut group = c.benchmark_group("range");
 
-	for count in [1_000, 10_000, 100_000] {
+	for count in [1_000, 10_000, 100_000, 1_000_000] {
 		let keys = sequential_keys(count);
 
 		// Pre-populate data structures
@@ -496,6 +496,65 @@ fn bench_range(c: &mut Criterion) {
 		});
 
 		// Note: HashMap does not support range iteration (unordered)
+	}
+	group.finish();
+}
+
+fn bench_raw_iter(c: &mut Criterion) {
+	let mut group = c.benchmark_group("iterator");
+
+	for count in [1_000, 10_000, 100_000, 1_000_000] {
+		let keys = sequential_keys(count);
+
+		// Pre-populate data structures
+		let ferntree: Tree<i64, i64> = Tree::new();
+		let skipmap: SkipMap<i64, i64> = SkipMap::new();
+		let mut btreemap: BTreeMap<i64, i64> = BTreeMap::new();
+
+		for &k in &keys {
+			ferntree.insert(k, k);
+			skipmap.insert(k, k);
+			btreemap.insert(k, k);
+		}
+
+		group.throughput(Throughput::Elements(count as u64));
+
+		// FernTree raw_iter
+		group.bench_function(BenchmarkId::new("ferntree", count), |b| {
+			b.iter(|| {
+				let mut sum = 0i64;
+				let mut iter = ferntree.raw_iter();
+				iter.seek_to_first();
+				while let Some((k, v)) = iter.next() {
+					sum = sum.wrapping_add(*k).wrapping_add(*v);
+				}
+				black_box(sum)
+			})
+		});
+
+		// SkipMap iterator
+		group.bench_function(BenchmarkId::new("skipmap", count), |b| {
+			b.iter(|| {
+				let mut sum = 0i64;
+				for entry in skipmap.iter() {
+					sum = sum.wrapping_add(*entry.key()).wrapping_add(*entry.value());
+				}
+				black_box(sum)
+			})
+		});
+
+		// BTreeMap iterator
+		group.bench_function(BenchmarkId::new("btreemap", count), |b| {
+			b.iter(|| {
+				let mut sum = 0i64;
+				for (&k, &v) in btreemap.iter() {
+					sum = sum.wrapping_add(k).wrapping_add(v);
+				}
+				black_box(sum)
+			})
+		});
+
+		// Note: HashMap does not support ordered iteration
 	}
 	group.finish();
 }
@@ -1022,6 +1081,7 @@ criterion_group!(
 	bench_lookup_miss,
 	bench_remove,
 	bench_range,
+	bench_raw_iter,
 );
 
 criterion_group!(
