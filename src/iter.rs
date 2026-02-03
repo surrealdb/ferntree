@@ -916,9 +916,8 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				let (guard, cursor) = self.leaf.as_mut().unwrap();
 				let leaf = guard.as_leaf();
 				*cursor = new_cursor;
-				return Some(
-					leaf.kv_at(curr_pos).expect("cursor position validated before access"),
-				);
+				// SAFETY: cursor.next_entry() already validated that curr_pos < leaf.len
+				return Some(unsafe { leaf.kv_at_unchecked(curr_pos) });
 			} else {
 				// Current leaf exhausted - try to move to next leaf
 				match self.next_leaf() {
@@ -957,9 +956,8 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				let (guard, cursor) = self.leaf.as_mut().unwrap();
 				let leaf = guard.as_leaf();
 				*cursor = new_cursor;
-				return Some(
-					leaf.kv_at(curr_pos).expect("cursor position validated before access"),
-				);
+				// SAFETY: cursor.prev_entry() already validated that curr_pos is valid
+				return Some(unsafe { leaf.kv_at_unchecked(curr_pos) });
 			} else {
 				// Current leaf exhausted - try to move to previous leaf
 				match self.prev_leaf() {
@@ -1013,9 +1011,8 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 			if let Some(pos) = pos_opt {
 				// Return entry at position (new borrow)
 				let (guard, _) = self.leaf.as_ref().unwrap();
-				return Some(
-					guard.as_leaf().kv_at(pos).expect("cursor position validated before access"),
-				);
+				// SAFETY: peek_next_pos() already validated that pos < leaf.len
+				return Some(unsafe { guard.as_leaf().kv_at_unchecked(pos) });
 			} else {
 				// At end of current leaf - try to move to next leaf
 				match self.next_leaf() {
@@ -1043,9 +1040,8 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 			if let Some(pos) = pos_opt {
 				// Return entry at position (new borrow)
 				let (guard, _) = self.leaf.as_ref().unwrap();
-				return Some(
-					guard.as_leaf().kv_at(pos).expect("cursor position validated before access"),
-				);
+				// SAFETY: peek_prev_pos() already validated that pos is valid
+				return Some(unsafe { guard.as_leaf().kv_at_unchecked(pos) });
 			} else {
 				// At start of current leaf - try to move to previous leaf
 				match self.prev_leaf() {
@@ -1752,10 +1748,8 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				// Get mutable access to the leaf
 				let leaf = guard.as_leaf_mut();
 				*cursor = new_cursor;
-				// Return mutable reference to value
-				return Some(
-					leaf.kv_at_mut(curr_pos).expect("cursor position validated before access"),
-				);
+				// SAFETY: cursor.next_entry() already validated that curr_pos < leaf.len
+				return Some(unsafe { leaf.kv_at_mut_unchecked(curr_pos) });
 			} else {
 				match self.next_leaf() {
 					LeafResult::Ok | LeafResult::Retry => {
@@ -1782,9 +1776,8 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				let (guard, cursor) = self.leaf.as_mut().unwrap();
 				let leaf = guard.as_leaf_mut();
 				*cursor = new_cursor;
-				return Some(
-					leaf.kv_at_mut(curr_pos).expect("cursor position validated before access"),
-				);
+				// SAFETY: cursor.prev_entry() already validated that curr_pos is valid
+				return Some(unsafe { leaf.kv_at_mut_unchecked(curr_pos) });
 			} else {
 				match self.prev_leaf() {
 					LeafResult::Ok | LeafResult::Retry => {
@@ -1815,12 +1808,8 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			if let Some(pos) = pos_opt {
 				// Return entry at position (new mutable borrow)
 				let (guard, _) = self.leaf.as_mut().unwrap();
-				return Some(
-					guard
-						.as_leaf_mut()
-						.kv_at_mut(pos)
-						.expect("cursor position validated before access"),
-				);
+				// SAFETY: peek_next_pos() already validated that pos < leaf.len
+				return Some(unsafe { guard.as_leaf_mut().kv_at_mut_unchecked(pos) });
 			} else {
 				// At end of current leaf - try to move to next leaf
 				match self.next_leaf() {
@@ -1848,12 +1837,8 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			if let Some(pos) = pos_opt {
 				// Return entry at position (new mutable borrow)
 				let (guard, _) = self.leaf.as_mut().unwrap();
-				return Some(
-					guard
-						.as_leaf_mut()
-						.kv_at_mut(pos)
-						.expect("cursor position validated before access"),
-				);
+				// SAFETY: peek_prev_pos() already validated that pos is valid
+				return Some(unsafe { guard.as_leaf_mut().kv_at_mut_unchecked(pos) });
 			} else {
 				// At start of current leaf - try to move to previous leaf
 				match self.prev_leaf() {

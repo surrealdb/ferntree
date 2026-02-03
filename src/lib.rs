@@ -3113,25 +3113,28 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 		self.keys.get(pos as usize).ok_or(error::Error::Unwind)
 	}
 
-	/// Returns references to the key and value at the given position.
+	/// Returns references to the key and value at the given position without bounds checking.
+	///
+	/// # Safety
+	///
+	/// Caller must ensure `pos < self.len` and `pos < self.keys.len()` and `pos < self.values.len()`.
+	/// This is intended for use in iterator hot paths where position has already been validated.
 	#[inline]
-	pub(crate) fn kv_at(&self, pos: u16) -> error::Result<(&K, &V)> {
-		Ok((self.key_at(pos)?, self.value_at(pos)?))
+	pub(crate) unsafe fn kv_at_unchecked(&self, pos: u16) -> (&K, &V) {
+		let pos = pos as usize;
+		(self.keys.get_unchecked(pos), self.values.get_unchecked(pos))
 	}
 
-	/// Returns references to the key (immutable) and value (mutable) at position.
+	/// Returns references to the key (immutable) and value (mutable) at position without bounds checking.
 	///
-	/// # Concurrency Safety
+	/// # Safety
 	///
-	/// Uses safe bounds checking - returns `Err(Unwind)` if position is invalid.
+	/// Caller must ensure `pos < self.len` and `pos < self.keys.len()` and `pos < self.values.len()`.
+	/// This is intended for use in iterator hot paths where position has already been validated.
 	#[inline]
-	pub(crate) fn kv_at_mut(&mut self, pos: u16) -> error::Result<(&K, &mut V)> {
+	pub(crate) unsafe fn kv_at_mut_unchecked(&mut self, pos: u16) -> (&K, &mut V) {
 		let pos = pos as usize;
-		if pos >= self.keys.len() || pos >= self.values.len() {
-			return Err(error::Error::Unwind);
-		}
-		// SAFETY: We just checked bounds above
-		Ok(unsafe { (self.keys.get_unchecked(pos), self.values.get_unchecked_mut(pos)) })
+		(self.keys.get_unchecked(pos), self.values.get_unchecked_mut(pos))
 	}
 
 	/// Returns `true` if there's room for another entry.
