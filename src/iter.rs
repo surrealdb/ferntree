@@ -1051,6 +1051,80 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 			}
 		}
 	}
+
+	/// Process all remaining entries in the current leaf with a closure.
+	///
+	/// This method iterates through all entries from the current cursor position
+	/// to the end of the current leaf, calling the provided closure for each entry.
+	/// After exhausting the leaf, the cursor is positioned at the end.
+	///
+	/// Returns `true` if more leaves may exist (for continued iteration),
+	/// `false` if this was the last leaf.
+	///
+	/// This is more efficient than repeated `next()` calls when processing
+	/// many sequential entries, as it avoids per-entry cursor bookkeeping.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, i32> = Tree::new();
+	/// for i in 0..100 {
+	///     tree.insert(i, i * 10);
+	/// }
+	///
+	/// let mut iter = tree.raw_iter();
+	/// iter.seek_to_first();
+	///
+	/// let mut sum = 0i64;
+	/// loop {
+	///     let has_more = iter.for_each_in_leaf(|k, v| {
+	///         sum += (*k as i64) + (*v as i64);
+	///     });
+	///     if !has_more {
+	///         break;
+	///     }
+	///     // Move to next leaf if exists
+	///     if iter.next().is_none() {
+	///         break;
+	///     }
+	/// }
+	/// ```
+	#[inline]
+	pub fn for_each_in_leaf<F>(&mut self, mut f: F) -> bool
+	where
+		F: FnMut(&K, &V),
+	{
+		let Some((guard, cursor)) = self.leaf.as_mut() else {
+			return false;
+		};
+
+		let leaf = guard.as_leaf();
+		let leaf_len = leaf.len;
+
+		// Determine starting position based on cursor state
+		let start = match *cursor {
+			Cursor::Before(pos) => pos,
+			Cursor::After(pos) => pos.saturating_add(1),
+		};
+
+		// Process all remaining entries in this leaf
+		// SAFETY: i is bounded by start..leaf_len where:
+		// - start comes from cursor state which tracks valid positions
+		// - leaf_len is the actual length of the leaf
+		// - the loop only iterates while i < leaf_len
+		for i in start..leaf_len {
+			let (k, v) = unsafe { leaf.kv_at_unchecked(i) };
+			f(k, v);
+		}
+
+		// Mark cursor as exhausted (positioned at end of leaf)
+		*cursor = Cursor::Before(leaf_len);
+
+		// Return whether more leaves may exist
+		leaf.upper_fence.is_some()
+	}
 }
 
 // ===========================================================================
@@ -1847,6 +1921,55 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				}
 			}
 		}
+	}
+
+	/// Process all remaining entries in the current leaf with a closure.
+	///
+	/// Similar to `RawSharedIter::for_each_in_leaf` but provides mutable
+	/// access to values.
+	///
+	/// This method iterates through all entries from the current cursor position
+	/// to the end of the current leaf, calling the provided closure for each entry.
+	/// After exhausting the leaf, the cursor is positioned at the end.
+	///
+	/// Returns `true` if more leaves may exist (for continued iteration),
+	/// `false` if this was the last leaf.
+	///
+	/// This is more efficient than repeated `next()` calls when processing
+	/// many sequential entries, as it avoids per-entry cursor bookkeeping.
+	#[inline]
+	pub fn for_each_in_leaf<F>(&mut self, mut f: F) -> bool
+	where
+		F: FnMut(&K, &mut V),
+	{
+		let Some((guard, cursor)) = self.leaf.as_mut() else {
+			return false;
+		};
+
+		let leaf = guard.as_leaf_mut();
+		let leaf_len = leaf.len;
+
+		// Determine starting position based on cursor state
+		let start = match *cursor {
+			Cursor::Before(pos) => pos,
+			Cursor::After(pos) => pos.saturating_add(1),
+		};
+
+		// Process all remaining entries in this leaf
+		// SAFETY: i is bounded by start..leaf_len where:
+		// - start comes from cursor state which tracks valid positions
+		// - leaf_len is the actual length of the leaf
+		// - the loop only iterates while i < leaf_len
+		for i in start..leaf_len {
+			let (k, v) = unsafe { leaf.kv_at_mut_unchecked(i) };
+			f(k, v);
+		}
+
+		// Mark cursor as exhausted (positioned at end of leaf)
+		*cursor = Cursor::Before(leaf_len);
+
+		// Return whether more leaves may exist
+		leaf.upper_fence.is_some()
 	}
 }
 
@@ -2689,6 +2812,174 @@ mod tests {
 			count -= 1;
 		}
 		assert_eq!(count, -1);
+	}
+
+	// -----------------------------------------------------------------------
+	// Batch Iteration Tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn for_each_in_leaf_processes_all_entries() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		let mut collected = Vec::new();
+		let has_more = iter.for_each_in_leaf(|k, v| {
+			collected.push((*k, *v));
+		});
+
+		// Should have collected all entries (single leaf for small tree)
+		assert_eq!(collected.len(), 10);
+		assert_eq!(collected[0], (0, 0));
+		assert_eq!(collected[9], (9, 90));
+		// Small tree has single leaf, so no more leaves
+		assert!(!has_more);
+	}
+
+	#[test]
+	fn for_each_in_leaf_respects_cursor_position() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek(&5);
+
+		let mut collected = Vec::new();
+		iter.for_each_in_leaf(|k, v| {
+			collected.push((*k, *v));
+		});
+
+		// Should start from key 5
+		assert_eq!(collected[0], (5, 50));
+		assert_eq!(collected.len(), 5); // 5, 6, 7, 8, 9
+	}
+
+	#[test]
+	fn for_each_in_leaf_after_next() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i * 10);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		// Consume first 3 entries
+		iter.next();
+		iter.next();
+		iter.next();
+
+		let mut collected = Vec::new();
+		iter.for_each_in_leaf(|k, v| {
+			collected.push((*k, *v));
+		});
+
+		// Should start from key 3
+		assert_eq!(collected[0], (3, 30));
+		assert_eq!(collected.len(), 7); // 3, 4, 5, 6, 7, 8, 9
+	}
+
+	#[test]
+	fn for_each_in_leaf_empty_after_exhausted() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..5 {
+			tree.insert(i, i);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		// Exhaust the leaf
+		iter.for_each_in_leaf(|_, _| {});
+
+		// Second call should process nothing
+		let mut count = 0;
+		iter.for_each_in_leaf(|_, _| {
+			count += 1;
+		});
+		assert_eq!(count, 0);
+	}
+
+	#[test]
+	fn for_each_in_leaf_unpositioned_iterator() {
+		let tree: Tree<i32, i32> = Tree::new();
+		tree.insert(1, 10);
+
+		let mut iter = tree.raw_iter();
+		// Don't seek - iterator is unpositioned
+
+		let has_more = iter.for_each_in_leaf(|_, _| {
+			panic!("Should not be called");
+		});
+		assert!(!has_more);
+	}
+
+	#[test]
+	fn for_each_in_leaf_mut_can_modify_values() {
+		let tree: Tree<i32, i32> = Tree::new();
+		for i in 0..10 {
+			tree.insert(i, i);
+		}
+
+		{
+			let mut iter = tree.raw_iter_mut();
+			iter.seek_to_first();
+
+			iter.for_each_in_leaf(|_, v| {
+				*v *= 2;
+			});
+		}
+
+		// Verify modifications
+		for i in 0..10 {
+			let val = tree.lookup(&i, |v| *v).unwrap();
+			assert_eq!(val, i * 2);
+		}
+	}
+
+	#[test]
+	fn for_each_in_leaf_crosses_multiple_leaves() {
+		let tree: Tree<i32, i32> = Tree::new();
+		// Insert enough to cause splits (LEAF_CAPACITY is 64)
+		for i in 0..200 {
+			tree.insert(i, i);
+		}
+		assert!(tree.height() > 1, "Tree should have multiple levels");
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+
+		let mut total_count = 0;
+		let mut leaf_count = 0;
+
+		loop {
+			let mut leaf_entries = 0;
+			let has_more = iter.for_each_in_leaf(|_, _| {
+				leaf_entries += 1;
+			});
+			total_count += leaf_entries;
+			leaf_count += 1;
+
+			if !has_more {
+				break;
+			}
+			// Move to next leaf - next() also returns the first entry of the new leaf
+			if iter.next().is_some() {
+				total_count += 1; // Count the entry returned by next()
+			} else {
+				break;
+			}
+		}
+
+		assert_eq!(total_count, 200);
+		assert!(leaf_count > 1, "Should have visited multiple leaves");
 	}
 
 	// -----------------------------------------------------------------------
