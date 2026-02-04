@@ -1649,71 +1649,105 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 	/// - After split, we re-seek because the key might now be in a different leaf
 	/// - This loop continues until we find a leaf with space
 	pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+		// Seek to the key's position
+		if self.seek_exact(&key) {
+			// Key exists - update the value
+			let (_k, v) = self.next().unwrap();
+			let old = std::mem::replace(v, value);
+			Some(old)
+		} else {
+			// Key doesn't exist - insert at cursor position
+			self.insert_here(key, value);
+			None
+		}
+	}
+
+	/// Inserts a key-value pair at the current cursor position.
+	///
+	/// This method should only be called after `seek_exact()` returned `false`,
+	/// indicating the key doesn't exist and the cursor is positioned at the
+	/// correct insertion point.
+	///
+	/// # Panics
+	///
+	/// Panics if called without a valid cursor position (i.e., without a
+	/// preceding `seek_exact()` call).
+	///
+	/// # Algorithm
+	///
+	/// 1. If leaf has space: Insert directly at cursor position
+	/// 2. If leaf is full:
+	///    a. Release the leaf lock
+	///    b. Trigger split operation
+	///    c. Re-seek and retry (tree structure may have changed)
+	pub fn insert_here(&mut self, key: K, value: V) {
 		'start: loop {
-			// Step 1: Find the position for this key
-			if self.seek_exact(&key) {
-				// Step 2: Key exists - update the value
-				let (_k, v) = self.next().unwrap();
-				let old = std::mem::replace(v, value);
-				break Some(old);
+			// Get the current leaf and cursor position
+			let (guard, cursor) = self.leaf.as_mut().expect("insert_here requires prior seek");
+
+			if guard.as_leaf().has_space() {
+				// Leaf has space - insert directly
+				let leaf = guard.as_leaf_mut();
+				match *cursor {
+					Cursor::Before(pos) => {
+						leaf.insert_at(pos, key, value).expect("just checked for space");
+					}
+					Cursor::After(_) => {
+						// seek_exact always positions Before
+						unreachable!("seek_exact always sets cursor to before");
+					}
+				}
+				break;
 			} else {
-				// Key doesn't exist - need to insert
-				let (guard, cursor) = self.leaf.as_mut().expect("just seeked");
+				// Leaf is full - need to split first
+				// Release our locks before splitting
+				self.parent.take();
+				let (guard, _cursor) = self.leaf.take().expect("just checked");
 
-				if guard.as_leaf().has_space() {
-					// Step 3: Leaf has space - insert directly
-					let leaf = guard.as_leaf_mut();
-					match *cursor {
-						Cursor::Before(pos) => {
-							leaf.insert_at(pos, key, value).expect("just checked for space");
+				// Unlock exclusive guard to get an optimistic guard for split
+				let mut guard = guard.unlock();
+
+				// Attempt to split the leaf
+				loop {
+					let perform_split = || {
+						// Double-check the leaf still needs splitting
+						if !guard.as_leaf().has_space() {
+							guard.recheck()?;
+							// Perform the split operation
+							self.tree.try_split(&guard, &self.eg)?;
 						}
-						Cursor::After(_) => {
-							// seek_exact always positions Before
-							unreachable!("seek_exact always sets cursor to before");
+						error::Result::Ok(())
+					};
+
+					match perform_split() {
+						Ok(_) => {
+							// Split succeeded (or wasn't needed) - break inner loop
+							break;
 						}
-					}
-					break None;
-				} else {
-					// Step 4: Leaf is full - need to split first
-					// Release our locks before splitting
-					self.parent.take();
-					let (guard, _cursor) = self.leaf.take().expect("just seeked");
-
-					// Unlock exclusive guard to get an optimistic guard for split
-					let mut guard = guard.unlock();
-
-					// Attempt to split the leaf
-					loop {
-						let perform_split = || {
-							// Double-check the leaf still needs splitting
-							if !guard.as_leaf().has_space() {
-								guard.recheck()?;
-								// Perform the split operation
-								self.tree.try_split(&guard, &self.eg)?;
-							}
-							error::Result::Ok(())
-						};
-
-						match perform_split() {
-							Ok(_) => {
-								// Split succeeded (or wasn't needed) - break inner loop
-								break;
-							}
-							Err(error::Error::Reclaimed) => {
-								// Tree structure changed significantly - restart from scratch
+						Err(error::Error::Reclaimed) => {
+							// Tree structure changed significantly - re-seek
+							if !self.seek_exact(&key) {
 								continue 'start;
-							}
-							Err(_) => {
-								// Optimistic validation failed - re-acquire and retry
-								guard = guard.latch().optimistic_or_spin();
-								continue;
+							} else {
+								// Key now exists (concurrent insert) - this shouldn't happen
+								// in single-threaded use, but handle gracefully
+								return;
 							}
 						}
+						Err(_) => {
+							// Optimistic validation failed - re-acquire and retry
+							guard = guard.latch().optimistic_or_spin();
+							continue;
+						}
 					}
+				}
 
-					// After split, restart the outer loop to re-seek
-					// (the key might now be in a different leaf)
-					continue;
+				// After split, re-seek to find the correct leaf
+				if !self.seek_exact(&key) {
+					continue 'start;
+				} else {
+					// Key now exists - concurrent insert happened
+					return;
 				}
 			}
 		}
@@ -1736,6 +1770,58 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		} else {
 			// Key doesn't exist
 			None
+		}
+	}
+
+	/// Removes the entry that was just returned by `next()`.
+	///
+	/// This should only be called after `next()` returned `Some(...)`.
+	/// The cursor must be in `After(pos)` state, meaning we just yielded
+	/// the entry at position `pos`.
+	///
+	/// # Returns
+	///
+	/// - `Some((key, value))` if an entry was removed
+	/// - `None` if the cursor wasn't in a valid state for removal
+	pub fn remove_here(&mut self) -> Option<(K, V)> {
+		match self.leaf.as_mut() {
+			Some((guard, cursor)) => {
+				// Only valid after next() which sets cursor to After(pos)
+				let pos = match cursor {
+					Cursor::After(pos) => *pos,
+					Cursor::Before(_) => return None, // Not after a next() call
+				};
+
+				let leaf = guard.as_leaf_mut();
+				if pos >= leaf.len {
+					return None;
+				}
+
+				let removed = leaf.remove_at(pos);
+
+				// Adjust cursor since we removed the entry at pos
+				*cursor = Cursor::Before(pos);
+
+				// Check if merge is needed after removal
+				if guard.is_underfull() {
+					let removed_key = removed.0.clone();
+					// Release locks before merge operation
+					self.parent.take();
+					let (guard, _cursor) = self.leaf.take().expect("just checked");
+
+					// Unlock to get optimistic guard for merge
+					let guard = guard.unlock();
+
+					// Attempt to merge with a sibling (best-effort, ignore result)
+					let _ = self.tree.try_merge(&guard, &self.eg);
+
+					// Re-position iterator after structural change
+					self.seek(&removed_key);
+				}
+
+				Some(removed)
+			}
+			None => None,
 		}
 	}
 
