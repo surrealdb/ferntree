@@ -519,19 +519,6 @@ fn bench_raw_iter(c: &mut Criterion) {
 
 		group.throughput(Throughput::Elements(count as u64));
 
-		// FernTree raw_iter
-		group.bench_function(BenchmarkId::new("ferntree", count), |b| {
-			b.iter(|| {
-				let mut sum = 0i64;
-				let mut iter = ferntree.raw_iter();
-				iter.seek_to_first();
-				while let Some((k, v)) = iter.next() {
-					sum = sum.wrapping_add(*k).wrapping_add(*v);
-				}
-				black_box(sum)
-			})
-		});
-
 		// SkipMap iterator
 		group.bench_function(BenchmarkId::new("skipmap", count), |b| {
 			b.iter(|| {
@@ -549,6 +536,43 @@ fn bench_raw_iter(c: &mut Criterion) {
 				let mut sum = 0i64;
 				for (&k, &v) in btreemap.iter() {
 					sum = sum.wrapping_add(k).wrapping_add(v);
+				}
+				black_box(sum)
+			})
+		});
+
+		// FernTree raw_iter
+		group.bench_function(BenchmarkId::new("ferntree", count), |b| {
+			b.iter(|| {
+				let mut sum = 0i64;
+				let mut iter = ferntree.raw_iter();
+				iter.seek_to_first();
+				while let Some((k, v)) = iter.next() {
+					sum = sum.wrapping_add(*k).wrapping_add(*v);
+				}
+				black_box(sum)
+			})
+		});
+
+		// FernTree raw_iter with batch leaf iteration
+		group.bench_function(BenchmarkId::new("ferntree-batch", count), |b| {
+			b.iter(|| {
+				let mut sum = 0i64;
+				let mut iter = ferntree.raw_iter();
+				iter.seek_to_first();
+				loop {
+					let has_more = iter.for_each_in_leaf(|k, v| {
+						sum = sum.wrapping_add(*k).wrapping_add(*v);
+					});
+					if !has_more {
+						break;
+					}
+					// Move to next leaf - next() returns first entry of new leaf
+					if let Some((k, v)) = iter.next() {
+						sum = sum.wrapping_add(*k).wrapping_add(*v);
+					} else {
+						break;
+					}
 				}
 				black_box(sum)
 			})

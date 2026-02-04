@@ -408,8 +408,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		GenericTree {
 			root: HybridLatch::new(Atomic::new(HybridLatch::new(Node::Leaf(LeafNode {
 				len: 0,
-				keys: smallvec![],
-				values: smallvec![],
+				entries: smallvec![],
 				// No fences for the root leaf - it covers the entire key space
 				lower_fence: None,
 				upper_fence: None,
@@ -2884,10 +2883,10 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 	/// Returns the keys stored in this node (for testing).
 	#[cfg(test)]
 	#[inline]
-	pub(crate) fn keys(&self) -> &[K] {
+	pub(crate) fn keys(&self) -> SmallVec<[&K; 64]> {
 		match self {
-			Node::Internal(ref internal) => &internal.keys,
-			Node::Leaf(ref leaf) => &leaf.keys,
+			Node::Internal(ref internal) => internal.keys.iter().collect(),
+			Node::Leaf(ref leaf) => leaf.entries.iter().map(|(k, _)| k).collect(),
 		}
 	}
 
@@ -2976,10 +2975,8 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 pub(crate) struct LeafNode<K, V, const LC: usize> {
 	/// Number of key-value pairs in this leaf.
 	pub(crate) len: u16,
-	/// Sorted array of keys.
-	pub(crate) keys: SmallVec<[K; LC]>,
-	/// Values corresponding to keys (same index).
-	pub(crate) values: SmallVec<[V; LC]>,
+	/// Sorted array of key-value pairs (interleaved for cache locality).
+	pub(crate) entries: SmallVec<[(K, V); LC]>,
 	/// Exclusive lower bound - keys in this leaf are > lower_fence.
 	/// None means this is the leftmost leaf (no lower bound).
 	pub(crate) lower_fence: Option<K>,
@@ -2994,8 +2991,7 @@ impl<K: fmt::Debug, V: fmt::Debug, const LC: usize> fmt::Debug for LeafNode<K, V
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("LeafNode")
 			.field("len", &self.len)
-			.field("keys", &self.keys)
-			.field("values", &self.values)
+			.field("entries", &self.entries)
 			.field("lower_fence", &self.lower_fence)
 			.field("upper_fence", &self.upper_fence)
 			.field("sample_key", &self.sample_key)
@@ -3008,8 +3004,7 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	pub fn new() -> LeafNode<K, V, LC> {
 		LeafNode {
 			len: 0,
-			keys: smallvec![],
-			values: smallvec![],
+			entries: smallvec![],
 			lower_fence: None,
 			upper_fence: None,
 			sample_key: None,
@@ -3025,12 +3020,12 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	///
 	/// `(position, exact_match)` where:
 	/// - `position`: Index where the key is or should be inserted
-	/// - `exact_match`: `true` if `keys[position] == key`
+	/// - `exact_match`: `true` if `entries[position].0 == key`
 	///
 	/// # Concurrency Safety
 	///
 	/// Uses safe bounds checking to handle concurrent access. Under optimistic
-	/// locking, `self.len` may be inconsistent with `self.keys.len()` during
+	/// locking, `self.len` may be inconsistent with `self.entries.len()` during
 	/// concurrent modifications. The caller's recheck will detect this, but
 	/// we must not cause undefined behavior in the meantime.
 	#[inline]
@@ -3052,16 +3047,16 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 			}
 		}
 
-		// Use actual keys length for safe bounds - handles concurrent modifications
-		let keys_len = self.keys.len() as u16;
+		// Use actual entries length for safe bounds - handles concurrent modifications
+		let entries_len = self.entries.len() as u16;
 		let mut lower = 0;
-		let mut upper = self.len.min(keys_len);
+		let mut upper = self.len.min(entries_len);
 
 		while lower < upper {
 			let mid = ((upper - lower) / 2) + lower;
 
-			// Safe bounds check - concurrent modifications may cause len > keys.len()
-			let Some(mid_key) = self.keys.get(mid as usize) else {
+			// Safe bounds check - concurrent modifications may cause len > entries.len()
+			let Some((mid_key, _)) = self.entries.get(mid as usize) else {
 				// Index out of bounds due to concurrent modification - return conservative result
 				return (lower, false);
 			};
@@ -3100,7 +3095,7 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	/// due to concurrent modification, triggering a retry.
 	#[inline]
 	pub(crate) fn value_at(&self, pos: u16) -> error::Result<&V> {
-		self.values.get(pos as usize).ok_or(error::Error::Unwind)
+		self.entries.get(pos as usize).map(|(_, v)| v).ok_or(error::Error::Unwind)
 	}
 
 	/// Returns a reference to the key at the given position.
@@ -3110,28 +3105,42 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	/// Uses safe bounds checking - returns `Err(Unwind)` if position is invalid.
 	#[inline]
 	pub(crate) fn key_at(&self, pos: u16) -> error::Result<&K> {
-		self.keys.get(pos as usize).ok_or(error::Error::Unwind)
+		self.entries.get(pos as usize).map(|(k, _)| k).ok_or(error::Error::Unwind)
 	}
 
 	/// Returns references to the key and value at the given position.
-	#[inline]
-	pub(crate) fn kv_at(&self, pos: u16) -> error::Result<(&K, &V)> {
-		Ok((self.key_at(pos)?, self.value_at(pos)?))
-	}
-
-	/// Returns references to the key (immutable) and value (mutable) at position.
 	///
 	/// # Concurrency Safety
 	///
 	/// Uses safe bounds checking - returns `Err(Unwind)` if position is invalid.
 	#[inline]
-	pub(crate) fn kv_at_mut(&mut self, pos: u16) -> error::Result<(&K, &mut V)> {
-		let pos = pos as usize;
-		if pos >= self.keys.len() || pos >= self.values.len() {
-			return Err(error::Error::Unwind);
-		}
-		// SAFETY: We just checked bounds above
-		Ok(unsafe { (self.keys.get_unchecked(pos), self.values.get_unchecked_mut(pos)) })
+	#[allow(dead_code)]
+	pub(crate) fn kv_at(&self, pos: u16) -> error::Result<(&K, &V)> {
+		self.entries.get(pos as usize).map(|(k, v)| (k, v)).ok_or(error::Error::Unwind)
+	}
+
+	/// Returns references to the key and value at the given position without bounds checking.
+	///
+	/// # Safety
+	///
+	/// Caller must ensure `pos < self.len` and `pos < self.entries.len()`.
+	/// This is intended for use in iterator hot paths where position has already been validated.
+	#[inline]
+	pub(crate) unsafe fn kv_at_unchecked(&self, pos: u16) -> (&K, &V) {
+		let entry = self.entries.get_unchecked(pos as usize);
+		(&entry.0, &entry.1)
+	}
+
+	/// Returns references to the key (immutable) and value (mutable) at position without bounds checking.
+	///
+	/// # Safety
+	///
+	/// Caller must ensure `pos < self.len` and `pos < self.entries.len()`.
+	/// This is intended for use in iterator hot paths where position has already been validated.
+	#[inline]
+	pub(crate) unsafe fn kv_at_mut_unchecked(&mut self, pos: u16) -> (&K, &mut V) {
+		let entry = self.entries.get_unchecked_mut(pos as usize);
+		(&entry.0, &mut entry.1)
 	}
 
 	/// Returns `true` if there's room for another entry.
@@ -3149,10 +3158,7 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	/// Removes and returns the key-value pair at the specified position.
 	pub(crate) fn remove_at(&mut self, pos: u16) -> (K, V) {
 		self.len -= 1;
-		let key = self.keys.remove(pos as usize);
-		let value = self.values.remove(pos as usize);
-
-		(key, value)
+		self.entries.remove(pos as usize)
 	}
 
 	/// Checks if a key falls within this leaf's fence boundaries.
@@ -3198,9 +3204,8 @@ impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
 			self.sample_key = Some(key.clone());
 		}
 
-		// Insert into both arrays at the same position
-		self.keys.insert(pos as usize, key);
-		self.values.insert(pos as usize, value);
+		// Insert the entry at the specified position
+		self.entries.insert(pos as usize, (key, value));
 		self.len += 1;
 
 		Some(pos)
@@ -3209,9 +3214,9 @@ impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
 	/// Splits this leaf node, moving entries after `split_pos` to `right`.
 	///
 	/// After split:
-	/// - `self` (left) contains keys `[0, split_pos]`
-	/// - `right` contains keys `[split_pos + 1, len)`
-	/// - `split_key = keys[split_pos]` becomes the separator
+	/// - `self` (left) contains entries `[0, split_pos]`
+	/// - `right` contains entries `[split_pos + 1, len)`
+	/// - `split_key = entries[split_pos].0` becomes the separator
 	///
 	/// # Fence Key Updates
 	///
@@ -3225,11 +3230,10 @@ impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
 	/// # Parameters
 	///
 	/// - `right`: An empty leaf node to receive the upper half
-	/// - `split_pos`: Position of the key that becomes the separator
+	/// - `split_pos`: Position of the entry whose key becomes the separator
 	pub(crate) fn split(&mut self, right: &mut LeafNode<K, V, LC>, split_pos: u16) {
 		// The key at split_pos becomes the boundary between left and right
-		let split_key =
-			self.key_at(split_pos).expect("split position must be within node bounds").clone();
+		let split_key = self.entries[split_pos as usize].0.clone();
 
 		// Update fence keys:
 		// - Right's lower fence is the split key (exclusive)
@@ -3240,19 +3244,17 @@ impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
 		self.upper_fence = Some(split_key);
 
 		// Move entries after split_pos to the right node
-		assert!(right.keys.is_empty());
-		assert!(right.values.is_empty());
-		right.keys.extend(self.keys.drain((split_pos + 1) as usize..));
-		right.values.extend(self.values.drain((split_pos + 1) as usize..));
+		assert!(right.entries.is_empty());
+		right.entries.extend(self.entries.drain((split_pos + 1) as usize..));
 
 		// Set sample keys for node relocation
 		// Use first key of each node (guaranteed to route to that node)
-		self.sample_key = Some(self.keys[0].clone());
-		right.sample_key = Some(right.keys[0].clone());
+		self.sample_key = Some(self.entries[0].0.clone());
+		right.sample_key = Some(right.entries[0].0.clone());
 
 		// Update lengths
-		right.len = right.keys.len() as u16;
-		self.len = self.keys.len() as u16;
+		right.len = right.entries.len() as u16;
+		self.len = self.entries.len() as u16;
 	}
 
 	/// Merges the `right` leaf into `self`.
@@ -3276,19 +3278,18 @@ impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
 		self.upper_fence = right.upper_fence.take();
 
 		// Move all entries from right to self
-		self.keys.extend(right.keys.drain(..));
-		self.values.extend(right.values.drain(..));
+		self.entries.extend(right.entries.drain(..));
 
 		// Update sample_key: prefer right's sample_key if available,
-		// otherwise ensure we have one if we have keys (prevents find_parent failures)
+		// otherwise ensure we have one if we have entries (prevents find_parent failures)
 		if let Some(sample) = right.sample_key.take() {
 			self.sample_key = Some(sample);
-		} else if self.sample_key.is_none() && !self.keys.is_empty() {
-			self.sample_key = Some(self.keys[0].clone());
+		} else if self.sample_key.is_none() && !self.entries.is_empty() {
+			self.sample_key = Some(self.entries[0].0.clone());
 		}
 
 		// Update length
-		self.len = self.keys.len() as u16;
+		self.len = self.entries.len() as u16;
 		true
 	}
 }
@@ -3782,34 +3783,27 @@ impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
 				// Invariant 6: Length consistency
 				assert_eq!(
 					leaf.len as usize,
-					leaf.keys.len(),
-					"Leaf len {} != keys.len() {}",
+					leaf.entries.len(),
+					"Leaf len {} != entries.len() {}",
 					leaf.len,
-					leaf.keys.len()
-				);
-				assert_eq!(
-					leaf.keys.len(),
-					leaf.values.len(),
-					"Leaf keys.len() {} != values.len() {}",
-					leaf.keys.len(),
-					leaf.values.len()
+					leaf.entries.len()
 				);
 
 				// Invariant 3: Key ordering
-				for i in 1..leaf.keys.len() {
+				for i in 1..leaf.entries.len() {
 					assert!(
-						leaf.keys[i - 1] < leaf.keys[i],
+						leaf.entries[i - 1].0 < leaf.entries[i].0,
 						"Keys not sorted at positions {} and {}: {:?} >= {:?}",
 						i - 1,
 						i,
-						leaf.keys[i - 1],
-						leaf.keys[i]
+						leaf.entries[i - 1].0,
+						leaf.entries[i].0
 					);
 				}
 
 				// Invariant 4: Fence key consistency
 				if let Some(lower) = &leaf.lower_fence {
-					for key in &leaf.keys[..] {
+					for (key, _) in &leaf.entries[..] {
 						assert!(
 							key > lower,
 							"Key {:?} not greater than lower_fence {:?}",
@@ -3819,14 +3813,14 @@ impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
 					}
 				}
 				if let Some(upper) = &leaf.upper_fence {
-					for key in &leaf.keys[..] {
+					for (key, _) in &leaf.entries[..] {
 						assert!(key <= upper, "Key {:?} not <= upper_fence {:?}", key, upper);
 					}
 				}
 
 				// Check against parent's expected bounds
 				if let Some(lower) = expected_lower {
-					for key in &leaf.keys[..] {
+					for (key, _) in &leaf.entries[..] {
 						assert!(
 							key > lower,
 							"Key {:?} not greater than parent lower bound {:?}",
@@ -3836,7 +3830,7 @@ impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
 					}
 				}
 				if let Some(upper) = expected_upper {
-					for key in &leaf.keys[..] {
+					for (key, _) in &leaf.entries[..] {
 						assert!(
 							key <= upper,
 							"Key {:?} not <= parent upper bound {:?}",
@@ -4755,7 +4749,7 @@ mod tests {
 		let node: Node<i32, i32, 64, 64> = Node::Leaf(leaf);
 		let keys = node.keys();
 
-		assert_eq!(keys, &[10, 20, 30]);
+		assert_eq!(keys.as_slice(), &[&10, &20, &30]);
 	}
 
 	// -----------------------------------------------------------------------
