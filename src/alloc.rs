@@ -54,6 +54,11 @@ pub static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// on each allocation operation.
 pub struct TrackingAllocator;
 
+// SAFETY: `TrackingAllocator` simply forwards every operation to the `System`
+// allocator after updating counters. All pointer manipulation is delegated to
+// `System`, which is itself a sound `GlobalAlloc`. The counter updates use
+// relaxed atomics and never read or write through the caller's pointers, so
+// they cannot introduce undefined behaviour of their own.
 unsafe impl GlobalAlloc for TrackingAllocator {
 	unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
 		ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -66,13 +71,18 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 			PEAK_BYTES.store(current as usize, Ordering::Relaxed);
 		}
 
-		System.alloc(layout)
+		// SAFETY: `layout` is forwarded unchanged from the caller, who is
+		// already responsible for upholding `GlobalAlloc::alloc`'s contract.
+		unsafe { System.alloc(layout) }
 	}
 
 	unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
 		DEALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
 		BYTES_ALLOCATED.fetch_sub(layout.size() as isize, Ordering::Relaxed);
-		System.dealloc(ptr, layout)
+		// SAFETY: `ptr` and `layout` are forwarded unchanged from the caller,
+		// who is responsible for ensuring `ptr` was previously returned by a
+		// matching `alloc` call with the same `layout`.
+		unsafe { System.dealloc(ptr, layout) }
 	}
 
 	unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -85,7 +95,8 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 			PEAK_BYTES.store(current as usize, Ordering::Relaxed);
 		}
 
-		System.alloc_zeroed(layout)
+		// SAFETY: `layout` is forwarded unchanged from the caller.
+		unsafe { System.alloc_zeroed(layout) }
 	}
 
 	unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -101,7 +112,9 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 			}
 		}
 
-		System.realloc(ptr, layout, new_size)
+		// SAFETY: `ptr`, `layout`, and `new_size` are forwarded unchanged from
+		// the caller, who is responsible for `GlobalAlloc::realloc`'s contract.
+		unsafe { System.realloc(ptr, layout, new_size) }
 	}
 }
 

@@ -50,7 +50,13 @@ mod mock_epoch {
 
 		/// Defers destruction of the given shared pointer until it's safe.
 		/// In our mock, we don't actually defer - the Arc handles cleanup.
-		pub fn defer_destroy<T>(&self, _ptr: Shared<'_, T>) {
+		///
+		/// # Safety
+		///
+		/// Marked `unsafe` to match the signature of `crossbeam_epoch::Guard::defer_destroy`
+		/// so call sites compile identically under both real and loom builds.
+		#[allow(clippy::missing_safety_doc)]
+		pub unsafe fn defer_destroy<T>(&self, _ptr: Shared<'_, T>) {
 			// Arc's Drop handles cleanup when all references are gone.
 			// The Shared pointer doesn't own the data, so nothing to do here.
 		}
@@ -108,7 +114,8 @@ mod mock_epoch {
 		///
 		/// The pointer must be non-null and the data must be valid.
 		pub unsafe fn deref(&self) -> &'g T {
-			&*self.ptr
+			// SAFETY: Caller upholds non-null + valid data.
+			unsafe { &*self.ptr }
 		}
 
 		/// Dereferences the pointer, returning None if null.
@@ -120,7 +127,8 @@ mod mock_epoch {
 			if self.is_null() {
 				None
 			} else {
-				Some(&*self.ptr)
+				// SAFETY: Non-null branch; caller upholds data validity.
+				Some(unsafe { &*self.ptr })
 			}
 		}
 

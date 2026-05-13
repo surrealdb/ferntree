@@ -109,10 +109,22 @@ use crate::sync::{AtomicUsize, Ordering, RwLock, RwLockReadGuard, RwLockWriteGua
 /// # Thread Safety
 ///
 /// The latch is `Send` if `T: Send` and `Sync` if `T: Send + Sync`.
+///
+/// # Layout
+///
+/// The struct is aligned to a 64-byte cache line so that adjacent latches
+/// (e.g. those embedded in an array of nodes) do not share a cache line. The
+/// hot `version` field is placed first to minimise the chance of false
+/// sharing between the version counter and the `RwLock`'s internal state.
+#[repr(C, align(64))]
 pub struct HybridLatch<T> {
 	/// Version counter for optimistic validation.
 	/// - Odd values indicate write lock is held
 	/// - Each exclusive lock acquire/release increments by 1
+	///
+	/// Placed first so it sits at the start of the cache line; readers
+	/// touch this every traversal step and writers update it on
+	/// acquire/release.
 	version: AtomicUsize,
 
 	/// Traditional RwLock for shared and exclusive access.
@@ -124,11 +136,20 @@ pub struct HybridLatch<T> {
 	data: UnsafeCell<T>,
 }
 
-// SAFETY: HybridLatch can be sent between threads if T can be sent.
+// SAFETY: The latch owns the `T` via an `UnsafeCell`. Sending the latch to
+// another thread moves ownership of the data, so `T: Send` is sufficient. The
+// version counter (`AtomicUsize`) and `RwLock` are themselves `Send`.
 unsafe impl<T: Send> Send for HybridLatch<T> {}
 
-// SAFETY: HybridLatch can be shared between threads if T is Send+Sync.
-// The latch provides its own synchronization.
+// SAFETY: To share `&HybridLatch<T>` between threads, two threads must be
+// able to access the underlying `T` simultaneously.
+//   - `ExclusiveGuard` hands out `&mut T`; only one writer is ever live (the
+//     `RwLock` write lock guarantees this), so it needs `T: Send`.
+//   - `SharedGuard` hands out `&T`; multiple readers may exist concurrently,
+//     so it needs `T: Sync`.
+//   - `OptimisticGuard::deref()` also yields `&T` (with caller-side version
+//     validation), which again needs `T: Sync`.
+// The combined bound is therefore `T: Send + Sync`.
 unsafe impl<T: Send + Sync> Sync for HybridLatch<T> {}
 
 impl<T> HybridLatch<T> {

@@ -112,3 +112,103 @@ jobs:
         env:
           RUSTFLAGS: "-Zsanitizer=leak"
         run: cargo +nightly test --target x86_64-unknown-linux-gnu --verbose -- memory_tests
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Miri
+        run: cargo miri setup
+
+      # Run a focused subset of integration tests under Miri. The full
+      # property/proptest and concurrency suites are too slow for CI under
+      # Miri, but the targeted unsafe-coverage tests and the invariant tests
+      # exercise every unsafe code path we care about.
+      - name: Run Miri on unsafe-coverage and invariant tests
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks"
+        run: |
+          cargo miri test --all-features --lib
+          cargo miri test --all-features --test invariants
+          cargo miri test --all-features --test unsafe_coverage
+
+  asan:
+    name: AddressSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests under AddressSanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+          RUSTDOCFLAGS: "-Zsanitizer=address"
+          ASAN_OPTIONS: "detect_leaks=0:detect_stack_use_after_return=1"
+        run: |
+          cargo +nightly test --all-features --target x86_64-unknown-linux-gnu --verbose -- \
+            --skip memory_tests
+
+  tsan:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # TSan focuses on the concurrent test suite, which is where data races
+      # would surface. Single-threaded suites are skipped to keep wall time
+      # reasonable. We don't run the loom test under TSan because loom builds
+      # its own scheduler.
+      - name: Run concurrency tests under ThreadSanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+        run: |
+          cargo +nightly test --all-features --target x86_64-unknown-linux-gnu --verbose \
+            --test concurrency --test deadlock_tests --test unsafe_coverage
+
+  fuzz-smoke:
+    name: Fuzz smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run oracle fuzz target for 60s
+        run: cargo +nightly fuzz run tree_oracle -- -max_total_time=60
