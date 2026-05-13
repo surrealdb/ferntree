@@ -13,6 +13,8 @@ arbitrary = { version = "1", features = ["derive"] }
 
 [dependencies.ferntree]
 path = ".."
+# `assert_invariants` is gated behind the `test-utils` feature.
+features = ["test-utils"]
 
 [[bin]]
 name = "tree_oracle"

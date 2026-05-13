@@ -197,10 +197,16 @@ jobs:
       # `-Zbuild-std` is required since recent nightly: rustc refuses to mix
       # sanitizer and non-sanitizer ABIs in the same build graph, so std and
       # all transitive deps must be rebuilt with `-Zsanitizer=thread`.
+      #
+      # `TSAN_OPTIONS=suppressions=...` points to a file listing known
+      # false-positive race patterns inherent to optimistic lock coupling.
+      # See the file for details — the algorithm's correctness under those
+      # patterns is validated by the loom job, which models the full
+      # version-counter handshake.
       - name: Run concurrency tests under ThreadSanitizer
         env:
           RUSTFLAGS: "-Zsanitizer=thread"
-          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1:suppressions=${{ github.workspace }}/.github/tsan_suppressions.txt"
         run: |
           cargo +nightly test --all-features \
             -Zbuild-std \

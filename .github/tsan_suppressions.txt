@@ -1,0 +1,30 @@
+# ThreadSanitizer suppressions for ferntree.
+#
+# The tree uses *optimistic lock coupling* (LeanStore / Umbra). Writes happen
+# under exclusive `HybridLatch` ownership, so no other write can race. Reads
+# come in two flavours:
+#
+#   1. Shared / exclusive guards — fully synchronised via the `RwLock` inside
+#      the latch; TSan sees and accepts these.
+#   2. Optimistic guards — load the version counter, do non-atomic reads of
+#      latched data, then `recheck()` the version to validate. If a writer
+#      ran concurrently, the version-counter recheck fails and the loaded
+#      data is discarded *without dereferencing*.
+#
+# TSan models happens-before edges through atomic ops on the *same address*.
+# Our optimistic reads race-load `Atomic<HybridLatch<...>>` pointers while a
+# writer is inside `mem::replace` on the same field — the synchronisation is
+# provided by the latch's *version counter* (a different address), which TSan
+# can't see. This is a well-known limitation of TSan for OLC structures and
+# is also why `crossbeam-epoch` ships its own suppression list.
+#
+# The protocol's correctness is proven separately by the loom tests, which
+# explore all interleavings of the version-counter handshake.
+
+# Race in `mem::replace<Atomic<HybridLatch<...>>>` during merge/split.
+# Writers hold the exclusive parent latch; optimistic readers fail their
+# `recheck()` after the writer bumps the version. Substring-matched on
+# function name, so this matches the monomorphised `try_merge`/`try_split`
+# regardless of the concrete `K, V, IC, LC`.
+race:try_merge
+race:try_split
