@@ -234,5 +234,12 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
 
+      # libFuzzer runs under AddressSanitizer, which also enables LeakSanitizer
+      # by default. At fuzz exit, `crossbeam-epoch`'s thread-local deferred
+      # bag still holds objects waiting for epoch advancement — these are
+      # not leaks but LSan can't tell. `detect_leaks=0` matches the
+      # convention used by `crossbeam-*` crates in their own CI.
       - name: Run oracle fuzz target for 60s
+        env:
+          ASAN_OPTIONS: "detect_leaks=0"
         run: cargo +nightly fuzz run tree_oracle -- -max_total_time=60

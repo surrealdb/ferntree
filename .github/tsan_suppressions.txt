@@ -28,3 +28,15 @@
 # regardless of the concrete `K, V, IC, LC`.
 race:try_merge
 race:try_split
+
+# Race in `SmallVec::insert`/`SmallVec::remove`/`SmallVec::push` during
+# node mutation. The mutation happens under the node's exclusive latch;
+# optimistic readers may load and then fail validation. The `SmallVec`
+# inline storage is not internally synchronised — the latch provides the
+# ordering.
+race:smallvec::SmallVec
+
+# Race on the version counter / RwLock bits via optimistic loads in the
+# latch itself. Reads pair with the version counter check rather than
+# any acquire on the racing field directly.
+race:ferntree::latch::HybridLatch
