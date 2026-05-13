@@ -135,9 +135,16 @@ jobs:
       # property/proptest and concurrency suites are too slow for CI under
       # Miri, but the targeted unsafe-coverage tests and the invariant tests
       # exercise every unsafe code path we care about.
+      #
+      # `-Zmiri-tree-borrows` is required because the `crossbeam-epoch`
+      # dependency has known Stacked-Borrows issues (its own pinned-thread
+      # list manipulation). Tree Borrows is strictly more permissive for
+      # the aliasing patterns that crate uses and is on track to become
+      # Rust's default aliasing model. Ferntree's own unsafe code is sound
+      # under both models.
       - name: Run Miri on unsafe-coverage and invariant tests
         env:
-          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks"
+          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks"
         run: |
           cargo miri test --all-features --lib
           cargo miri test --all-features --test invariants
@@ -186,12 +193,18 @@ jobs:
       # would surface. Single-threaded suites are skipped to keep wall time
       # reasonable. We don't run the loom test under TSan because loom builds
       # its own scheduler.
+      #
+      # `-Zbuild-std` is required since recent nightly: rustc refuses to mix
+      # sanitizer and non-sanitizer ABIs in the same build graph, so std and
+      # all transitive deps must be rebuilt with `-Zsanitizer=thread`.
       - name: Run concurrency tests under ThreadSanitizer
         env:
           RUSTFLAGS: "-Zsanitizer=thread"
           TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
         run: |
-          cargo +nightly test --all-features --target x86_64-unknown-linux-gnu --verbose \
+          cargo +nightly test --all-features \
+            -Zbuild-std \
+            --target x86_64-unknown-linux-gnu --verbose \
             --test concurrency --test deadlock_tests --test unsafe_coverage
 
   fuzz-smoke:
@@ -207,8 +220,13 @@ jobs:
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
+      # `--locked` pins cargo-fuzz's published lockfile, which depends on an
+      # old `rustix` that no longer compiles on recent nightly (it uses
+      # internal `rustc_layout_scalar_valid_range_*` attributes that the
+      # compiler reserved). Installing without `--locked` lets cargo
+      # resolve a compatible newer `rustix`.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz
 
       - name: Run oracle fuzz target for 60s
         run: cargo +nightly fuzz run tree_oracle -- -max_total_time=60
