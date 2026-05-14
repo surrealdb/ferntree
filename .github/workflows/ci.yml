@@ -131,23 +131,24 @@ jobs:
       - name: Setup Miri
         run: cargo miri setup
 
-      # Miri is ~100-1000× slower than debug. The `unsafe_coverage` suite is
-      # purpose-built to drive every `unsafe` site in the crate with a
-      # small deterministic test per site — running it under Miri gives
-      # full UB coverage for the unsafe code in single-digit minutes.
-      # Running the full `--lib` (226 tests) and the invariants/property
-      # suites under Miri took hours and added little UB-detection value
-      # over the targeted suite, so they are skipped here.
+      # Miri runs ~100-1000× slower than debug. We deliberately limit it to
+      # `--lib` — the 226 unit tests inside the crate, which exercise every
+      # unsafe code path with small deterministic data and finish in ~14
+      # minutes. The `invariants.rs` integration tests (5,000-10,000 entry
+      # workloads) and `unsafe_coverage.rs` concurrent scenarios push Miri
+      # wall time into hours without meaningfully extending UB coverage,
+      # so they are skipped here. The full integration suite still runs
+      # under regular cargo test, ASan, TSan, and loom.
       #
       # `-Zmiri-tree-borrows` is required because the `crossbeam-epoch`
       # dependency has known Stacked-Borrows issues (its pinned-thread
       # list manipulation). Tree Borrows is strictly more permissive for
       # those aliasing patterns and is on track to become Rust's default
       # aliasing model. Ferntree's own unsafe code is sound under both.
-      - name: Run Miri on unsafe-coverage tests
+      - name: Run Miri on lib unit tests
         env:
           MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks"
-        run: cargo miri test --all-features --test unsafe_coverage
+        run: cargo miri test --all-features --lib
 
   asan:
     name: AddressSanitizer
