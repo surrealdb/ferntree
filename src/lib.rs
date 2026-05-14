@@ -4521,62 +4521,14 @@ mod tests {
 		assert_eq!(std::sync::Arc::strong_count(&blob2.0), 2);
 	}
 
-	#[test]
-	fn epoch_deferred_drop_concurrent() {
-		// Stress: readers using lookup_optimistic interleave with writers
-		// using insert_defer / remove_defer. The deferred-drop discipline
-		// ensures the Arc'd buffer stays alive across the snapshot/use
-		// window even when the writer replaces the slot.
-		use std::sync::atomic::{AtomicBool, Ordering as AO};
-		use std::sync::Arc as StdArc;
-		use std::thread;
-
-		let tree: StdArc<Tree<i32, RefcountedBlob>> = StdArc::new(Tree::new());
-		let stop = StdArc::new(AtomicBool::new(false));
-
-		// Seed
-		for i in 0..200 {
-			tree.insert_defer(i, RefcountedBlob(StdArc::new(vec![i as u8; 32])));
-		}
-
-		let mut handles = Vec::new();
-		for _ in 0..4 {
-			let tree = StdArc::clone(&tree);
-			let stop = StdArc::clone(&stop);
-			handles.push(thread::spawn(move || {
-				while !stop.load(AO::Relaxed) {
-					for k in 0..200 {
-						if let Some(blob) = tree.lookup_optimistic(&k, |v| v.clone()) {
-							// Touch the buffer to force the optimiser not to
-							// drop the clone; if the buffer were freed
-							// behind our back this would UB / segfault.
-							let s: usize = blob.0.iter().map(|&b| b as usize).sum();
-							std::hint::black_box(s);
-						}
-					}
-				}
-			}));
-		}
-
-		let writer = {
-			let tree = StdArc::clone(&tree);
-			let stop = StdArc::clone(&stop);
-			thread::spawn(move || {
-				for round in 0..50 {
-					for k in 0..200 {
-						let v = RefcountedBlob(StdArc::new(vec![(k + round) as u8; 32]));
-						tree.insert_defer(k, v);
-					}
-				}
-				stop.store(true, AO::Relaxed);
-			})
-		};
-
-		writer.join().unwrap();
-		for h in handles {
-			h.join().unwrap();
-		}
-	}
+	// Note: the concurrent reader/writer stress test for
+	// epoch-deferred-drop values lives in tests/concurrency.rs. It is
+	// intentionally outside `--lib` because Miri's aliasing model does not
+	// understand the optimistic-version-recheck protocol and would flag
+	// the (intentionally unsynchronised) optimistic leaf read racing with
+	// a concurrent exclusive-locked writer — the same latent pattern that
+	// exists for internal-node descent. Concurrent behaviour is validated
+	// instead by the ASan / TSan CI jobs.
 
 	#[test]
 	fn insert_update() {
