@@ -264,12 +264,14 @@ pub mod alloc;
 pub mod error;
 pub mod iter;
 pub mod latch;
+pub mod optimistic;
 pub(crate) mod sync;
 
 use sync::epoch::{self as epoch, Atomic, Owned};
 use sync::{AtomicUsize, Ordering};
 
 use latch::{ExclusiveGuard, HybridGuard, HybridLatch, OptimisticGuard, SharedGuard};
+pub use optimistic::OptimisticRead;
 
 // ---------------------------------------------------------------------------
 // Configuration Constants
@@ -1088,8 +1090,22 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 						}
 					};
 
-					// Check if next level is the leaf level
-					if (level + 1) as usize == self.height.load(Ordering::Acquire) {
+					// Check if next level is the leaf level.
+					//
+					// `Relaxed` is sufficient here: correctness of the
+					// optimistic-to-shared transition is ultimately gated by
+					// the parent's version `recheck()` performed inside
+					// `lock_coupling_shared` / `lock_coupling`. A stale
+					// height load either causes us to take a shared lock on
+					// an internal node (which then fails the leaf-pattern
+					// match and triggers retry) or an optimistic lock on a
+					// leaf (which is sound for OptimisticRead values but
+					// would fall through to the post-loop assertion for the
+					// shared path — so we ALSO validate the height after
+					// reading it by relying on the parent recheck). Either
+					// way the structural change is detected and the
+					// operation retries.
+					if (level + 1) as usize == self.height.load(Ordering::Relaxed) {
 						// About to access leaf - use shared lock coupling
 						if let Some(tree_guard) = t_guard.take() {
 							tree_guard.recheck()?;
@@ -1125,6 +1141,71 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 					// Validation failed - retry from beginning
 					continue;
 				}
+			}
+		}
+	}
+
+	/// Descends to the leaf that should contain `key` using **only optimistic
+	/// access** all the way down. The returned leaf guard is optimistic — the
+	/// caller must `recheck()` it before trusting any data read from the leaf.
+	///
+	/// This is the read-only fast path for point lookups when the value type
+	/// is [`crate::OptimisticRead`]. Unlike
+	/// [`find_shared_leaf_and_optimistic_parent`](Self::find_shared_leaf_and_optimistic_parent),
+	/// it never acquires the leaf's blocking shared lock, so writers are
+	/// never blocked by readers (and vice versa) on the leaf level either.
+	///
+	/// # Safety
+	///
+	/// The returned leaf is held under an optimistic guard; the caller MUST
+	/// validate any data read from it with `recheck()` before acting on it.
+	#[inline]
+	pub(crate) fn find_optimistic_leaf<'e, Q>(
+		&self,
+		key: &Q,
+		eg: &'e epoch::Guard,
+	) -> error::Result<OptimisticGuard<'e, Node<K, V, IC, LC>>>
+	where
+		K: Borrow<Q> + Ord,
+		Q: ?Sized + Ord,
+	{
+		// Start traversal from root
+		let tree_guard = self.root.optimistic_or_spin();
+		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be
+		// reclaimed for the lifetime of `root_latch`.
+		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+		let root_guard = root_latch.optimistic_or_spin();
+		tree_guard.recheck()?;
+
+		let mut t_guard = Some(tree_guard);
+		let mut target_guard = root_guard;
+
+		// Descend until we land on a leaf. We do not need to track the
+		// transition to the leaf level because we never upgrade the leaf to
+		// a shared lock — the entire descent stays optimistic.
+		loop {
+			let c_swip = match *target_guard {
+				Node::Internal(ref internal) => {
+					let (pos, _) = internal.lower_bound(key);
+					internal.edge_at(pos)?
+				}
+				Node::Leaf(_) => {
+					// Root is a leaf (single-node tree) or we've reached a
+					// leaf via lock coupling. Either way, we're done.
+					if let Some(tree_guard) = t_guard.take() {
+						tree_guard.recheck()?;
+					}
+					return Ok(target_guard);
+				}
+			};
+
+			// Optimistic lock coupling: acquire child optimistically and
+			// validate parent.
+			let guard = GenericTree::lock_coupling(&target_guard, c_swip, eg)?;
+			target_guard = guard;
+
+			if let Some(tree_guard) = t_guard.take() {
+				tree_guard.recheck()?;
 			}
 		}
 	}
@@ -1241,7 +1322,10 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 						}
 					};
 
-					if (level + 1) as usize == self.height.load(Ordering::Acquire) {
+					// `Relaxed` is sufficient — see the matching note in
+					// `find_shared_leaf_and_optimistic_parent`. Correctness
+					// is gated by the parent's `recheck()`.
+					if (level + 1) as usize == self.height.load(Ordering::Relaxed) {
 						// About to access leaf - use exclusive lock coupling
 						if let Some(tree_guard) = t_guard.take() {
 							tree_guard.recheck()?;
@@ -1461,7 +1545,11 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 	/// Returns `true` if the tree contains the specified key.
 	///
-	/// This is a convenience method equivalent to `lookup(key, |_| ()).is_some()`.
+	/// Uses the optimistic read fast path: the leaf is never shared-locked,
+	/// so concurrent writers are never blocked by this call (and vice versa).
+	/// The presence check only inspects key bytes that are already read
+	/// optimistically during tree descent, so no extra safety bound on `V`
+	/// is needed.
 	///
 	/// # Example
 	///
@@ -1479,7 +1567,153 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		K: Borrow<Q> + Ord,
 		Q: ?Sized + Ord,
 	{
-		self.lookup(key, |_| ()).is_some()
+		let eg = &epoch::pin();
+
+		// Retry loop for optimistic validation failures
+		loop {
+			let perform = || -> error::Result<bool> {
+				let leaf_guard = self.find_optimistic_leaf(key, eg)?;
+
+				let Node::Leaf(ref leaf) = *leaf_guard else {
+					unreachable!(
+						"find_optimistic_leaf returned non-leaf node - tree traversal invariant violated"
+					)
+				};
+
+				let (_, exact) = leaf.lower_bound(key);
+
+				// Validate the descent and the position we observed
+				leaf_guard.recheck()?;
+				Ok(exact)
+			};
+
+			match perform() {
+				Ok(result) => return result,
+				Err(_) => {
+					// Retry is the cold path — in the uncontended case
+					// the first attempt succeeds.
+					std::hint::cold_path();
+					continue;
+				}
+			}
+		}
+	}
+
+	/// Looks up a value using the optimistic read fast path.
+	///
+	/// Like [`lookup`](Self::lookup), but skips the leaf's shared lock. The
+	/// value is snapshotted bitwise into a stack-local copy, the version is
+	/// validated, and then the closure is invoked with a borrow of the
+	/// validated snapshot. The snapshot's `Drop` is suppressed, so the
+	/// original value in the leaf is the only one that gets dropped (when
+	/// the writer eventually replaces or removes it).
+	///
+	/// This avoids the atomic acquire/release on the leaf's `RwLock` and the
+	/// writer-blocking section that `lookup` holds across the closure.
+	///
+	/// # Trait bound
+	///
+	/// Requires [`V: OptimisticRead`](crate::OptimisticRead). Every [`Copy`]
+	/// type satisfies this automatically. For values containing heap-owned
+	/// interior pointers (e.g. `Vec<T>`, `String`, `SmallVec<…>`), use
+	/// [`lookup`](Self::lookup) instead — its safety contract relies on the
+	/// shared lock and is not relaxed by a marker trait.
+	///
+	/// # Closure execution
+	///
+	/// As with [`lookup`](Self::lookup), the closure may be invoked more
+	/// than once if optimistic validation fails and the operation retries.
+	/// Avoid side effects in the closure.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, u64> = Tree::new();
+	/// tree.insert(1, 42);
+	///
+	/// let doubled = tree.lookup_optimistic(&1, |v| *v * 2);
+	/// assert_eq!(doubled, Some(84));
+	/// ```
+	pub fn lookup_optimistic<Q, R, F>(&self, key: &Q, f: F) -> Option<R>
+	where
+		K: Borrow<Q> + Ord,
+		Q: ?Sized + Ord,
+		V: OptimisticRead,
+		F: Fn(&V) -> R,
+	{
+		let eg = &epoch::pin();
+
+		// Retry loop for optimistic validation failures
+		loop {
+			let perform = || -> error::Result<Option<R>> {
+				let leaf_guard = self.find_optimistic_leaf(key, eg)?;
+
+				let Node::Leaf(ref leaf) = *leaf_guard else {
+					unreachable!(
+						"find_optimistic_leaf returned non-leaf node - tree traversal invariant violated"
+					)
+				};
+
+				let (pos, exact) = leaf.lower_bound(key);
+
+				if !exact {
+					// Validate that the negative result is real.
+					leaf_guard.recheck()?;
+					return Ok(None);
+				}
+
+				// Bitwise-snapshot the value into a stack local. The
+				// snapshot may be torn at this point; the version recheck
+				// below confirms whether it is.
+				//
+				// SAFETY: `entries` is a `SmallVec<[(K, V); LC]>`. We use
+				// `as_ptr()` plus an index rather than `entries[pos]` so
+				// that we never invoke the user's `Index` panic path with
+				// a potentially-torn `len`. The pointer arithmetic is
+				// bounded by a `Result` check below.
+				let snapshot = {
+					let entries_ptr = leaf.entries.as_ptr();
+					let entries_cap = leaf.entries.capacity();
+					if (pos as usize) >= entries_cap {
+						// Length / position is inconsistent with the
+						// backing storage; retry.
+						return Err(error::Error::Unwind);
+					}
+					// SAFETY: `pos` is in-bounds of the SmallVec's
+					// allocation (which has at least `entries_cap`
+					// addressable slots). The read is bitwise; the
+					// snapshot's drop is suppressed below if used, or
+					// after the recheck-fail unwind.
+					unsafe { core::ptr::read(&(*entries_ptr.add(pos as usize)).1) }
+				};
+
+				// Validate that the snapshot is internally consistent.
+				// If recheck fails, the snapshot may be torn; we forget
+				// it without running `Drop`. `V: OptimisticRead` makes
+				// `mem::forget` on a torn snapshot sound.
+				if let Err(err) = leaf_guard.recheck() {
+					core::mem::forget(snapshot);
+					return Err(err);
+				}
+
+				// The snapshot is validated. Hand a borrow to the user
+				// closure, then forget the snapshot so its `Drop` does
+				// not run (the live copy still lives in the leaf).
+				let result = f(&snapshot);
+				core::mem::forget(snapshot);
+				Ok(Some(result))
+			};
+
+			match perform() {
+				Ok(result) => return result,
+				Err(_) => {
+					std::hint::cold_path();
+					continue;
+				}
+			}
+		}
 	}
 
 	/// Returns a clone of the value corresponding to the key.
@@ -1505,6 +1739,33 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		V: Clone,
 	{
 		self.lookup(key, |v| v.clone())
+	}
+
+	/// Returns a clone of the value using the optimistic read fast path.
+	///
+	/// Convenience wrapper around [`lookup_optimistic`](Self::lookup_optimistic)
+	/// for the common "get a copy of the value" use case. Faster than
+	/// [`get`](Self::get) for [`Copy`] / [`OptimisticRead`] values because
+	/// it never blocks on the leaf's shared lock.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use ferntree::Tree;
+	///
+	/// let tree: Tree<i32, u64> = Tree::new();
+	/// tree.insert(1, 42);
+	///
+	/// assert_eq!(tree.get_optimistic(&1), Some(42));
+	/// assert_eq!(tree.get_optimistic(&2), None);
+	/// ```
+	pub fn get_optimistic<Q>(&self, key: &Q) -> Option<V>
+	where
+		K: Borrow<Q> + Ord,
+		Q: ?Sized + Ord,
+		V: OptimisticRead + Clone,
+	{
+		self.lookup_optimistic(key, |v| v.clone())
 	}
 
 	/// Returns the first (minimum) key-value pair in the tree.
@@ -1655,6 +1916,49 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		self.remove_entry(key).map(|(_, v)| v)
 	}
 
+	/// Removes a key from the tree, deferring the value's `Drop` via the
+	/// epoch GC.
+	///
+	/// This is the epoch-aware companion to [`remove`](Self::remove), used
+	/// when the tree stores values that are read via the optimistic fast
+	/// path ([`lookup_optimistic`](Self::lookup_optimistic),
+	/// [`get_optimistic`](Self::get_optimistic)) AND whose `Drop` would
+	/// free a shared heap buffer (e.g. `bytes::Bytes`, `Arc<T>`). Without
+	/// deferring, a concurrent reader could hold a validated snapshot
+	/// whose interior pointer is invalidated by the synchronous drop.
+	///
+	/// The behavioural contract:
+	///
+	/// - returns `true` if the key was present and the entry was removed;
+	/// - the removed value is NOT returned — it is moved into an epoch
+	///   deferral and dropped at the next epoch reclamation tick;
+	/// - for `V` with [`EPOCH_DEFERRED_DROP`](OptimisticRead::EPOCH_DEFERRED_DROP)
+	///   `= false`, the value is dropped immediately (the monomorphised
+	///   defer branch is dead code and elided).
+	///
+	/// If you need both the old value AND epoch-safe reclamation, do an
+	/// optimistic read first to obtain a clone, then call this method.
+	pub fn remove_defer<Q>(&self, key: &Q) -> bool
+	where
+		K: Borrow<Q> + Ord,
+		Q: ?Sized + Ord,
+		V: OptimisticRead + Send + 'static,
+	{
+		// We need to share the same epoch pin between the removal and the
+		// defer so the deferred closure is registered against the same
+		// epoch the reader could currently be in.
+		let eg = epoch::pin();
+		let removed = self.remove_entry(key);
+		if let Some((_k, v)) = removed {
+			optimistic::drop_or_defer(v, &eg);
+			drop(eg);
+			true
+		} else {
+			drop(eg);
+			false
+		}
+	}
+
 	/// Removes a key from the tree, returning the stored key and value.
 	///
 	/// This is useful when you need to recover the owned key (e.g., for
@@ -1730,6 +2034,47 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		// This handles splits automatically
 		let mut iter = self.raw_iter_mut();
 		iter.insert(key, value)
+	}
+
+	/// Inserts a key-value pair, deferring the `Drop` of any displaced old
+	/// value via the epoch GC.
+	///
+	/// This is the epoch-aware companion to [`insert`](Self::insert), used
+	/// when the tree stores values that are read via the optimistic fast
+	/// path ([`lookup_optimistic`](Self::lookup_optimistic),
+	/// [`get_optimistic`](Self::get_optimistic)) AND whose `Drop` would
+	/// free a shared heap buffer (e.g. `bytes::Bytes`, `Arc<T>`). Without
+	/// deferring, a concurrent reader could hold a validated snapshot
+	/// whose interior pointer is invalidated by the synchronous drop.
+	///
+	/// The behavioural contract:
+	///
+	/// - returns `true` if the key was previously present (the displaced
+	///   old value was deferred for epoch-safe drop);
+	/// - returns `false` if the key was new;
+	/// - the old value is NOT returned — it is moved into an epoch
+	///   deferral and dropped at the next epoch reclamation tick;
+	/// - for `V` with [`EPOCH_DEFERRED_DROP`](OptimisticRead::EPOCH_DEFERRED_DROP)
+	///   `= false`, the displaced value is dropped immediately (the
+	///   monomorphised defer branch is dead code and elided).
+	pub fn insert_defer(&self, key: K, value: V) -> bool
+	where
+		K: Ord,
+		V: OptimisticRead + Send + 'static,
+	{
+		let eg = epoch::pin();
+		let displaced = {
+			let mut iter = self.raw_iter_mut();
+			iter.insert(key, value)
+		};
+		if let Some(old_v) = displaced {
+			optimistic::drop_or_defer(old_v, &eg);
+			drop(eg);
+			true
+		} else {
+			drop(eg);
+			false
+		}
 	}
 
 	/// Returns a clone of the value for the key, inserting `default` if the key
@@ -3154,7 +3499,10 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 
 			// Safe bounds check - concurrent modifications may cause len > entries.len()
 			let Some((mid_key, _)) = self.entries.get(mid as usize) else {
-				// Index out of bounds due to concurrent modification - return conservative result
+				// Index out of bounds due to concurrent modification - return conservative result.
+				// This is the cold path; the optimiser uses the hint to keep the hot
+				// binary-search body straight-line.
+				std::hint::cold_path();
 				return (lower, false);
 			};
 
@@ -3515,7 +3863,10 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 
 			// Safe bounds check - concurrent modifications may cause len > keys.len()
 			let Some(mid_key) = self.keys.get(mid as usize) else {
-				// Index out of bounds due to concurrent modification - return conservative result
+				// Index out of bounds due to concurrent modification - return
+				// conservative result. Cold-path hint keeps the hot binary
+				// search body straight-line.
+				std::hint::cold_path();
 				return (lower, false);
 			};
 
@@ -4079,6 +4430,152 @@ mod tests {
 		assert_eq!(tree.lookup(&2, |v| *v), Some("two"));
 		assert_eq!(tree.lookup(&3, |v| *v), Some("three"));
 		assert_eq!(tree.lookup(&4, |v| *v), None);
+	}
+
+	#[test]
+	fn optimistic_lookup_basic() {
+		let tree: Tree<i32, u64> = Tree::new();
+		tree.insert(1, 10);
+		tree.insert(2, 20);
+		tree.insert(3, 30);
+
+		// lookup_optimistic on hits and misses
+		assert_eq!(tree.lookup_optimistic(&1, |v| *v), Some(10));
+		assert_eq!(tree.lookup_optimistic(&2, |v| *v), Some(20));
+		assert_eq!(tree.lookup_optimistic(&3, |v| *v), Some(30));
+		assert_eq!(tree.lookup_optimistic(&4, |v| *v), None);
+
+		// get_optimistic
+		assert_eq!(tree.get_optimistic(&1), Some(10));
+		assert_eq!(tree.get_optimistic(&99), None);
+
+		// contains_key uses the optimistic path now
+		assert!(tree.contains_key(&1));
+		assert!(!tree.contains_key(&99));
+	}
+
+	#[test]
+	fn optimistic_lookup_across_splits() {
+		// Force multiple splits / multi-level tree to exercise the
+		// optimistic descent through internal nodes.
+		let tree: Tree<i64, u64> = Tree::new();
+		let n: i64 = 5_000;
+		for i in 0..n {
+			tree.insert(i, i as u64);
+		}
+		tree.assert_invariants();
+
+		for i in (0..n).step_by(37) {
+			assert_eq!(tree.get_optimistic(&i), Some(i as u64));
+			assert!(tree.contains_key(&i));
+		}
+		assert_eq!(tree.get_optimistic(&(n + 1)), None);
+		assert!(!tree.contains_key(&(n + 1)));
+	}
+
+	// Mock refcounted type that opts into EPOCH_DEFERRED_DROP. The interior
+	// `Arc<Vec<u8>>` makes clones cheap and exercises the deferred-drop
+	// machinery used by `bytes::Bytes` etc.
+	#[derive(Clone)]
+	struct RefcountedBlob(std::sync::Arc<Vec<u8>>);
+
+	// SAFETY: `RefcountedBlob` wraps `Arc<Vec<u8>>` which is `Send + Sync`.
+	// A bitwise snapshot followed by a successful version recheck yields a
+	// valid `Arc`. The implementor opts into `EPOCH_DEFERRED_DROP = true`,
+	// which (combined with using `insert_defer`/`remove_defer` for all
+	// writes) keeps the `Vec`'s buffer alive until the epoch tick.
+	unsafe impl OptimisticRead for RefcountedBlob {
+		const EPOCH_DEFERRED_DROP: bool = true;
+	}
+
+	#[test]
+	fn epoch_deferred_drop_basic() {
+		let tree: Tree<i32, RefcountedBlob> = Tree::new();
+		let blob = RefcountedBlob(std::sync::Arc::new(b"hello world".to_vec()));
+
+		// insert_defer reports key was new
+		assert!(!tree.insert_defer(1, blob.clone()));
+		// Strong count: tree leaf has one, our local `blob` has one
+		assert_eq!(std::sync::Arc::strong_count(&blob.0), 2);
+
+		// Optimistic lookup returns a clone, bumping the refcount
+		let got =
+			tree.lookup_optimistic(&1, |v| v.clone()).expect("inserted value should be present");
+		assert_eq!(std::sync::Arc::strong_count(&blob.0), 3);
+		assert_eq!(&got.0[..], b"hello world");
+		drop(got);
+		assert_eq!(std::sync::Arc::strong_count(&blob.0), 2);
+
+		// Overwriting: insert_defer returns true (was present), defers old drop
+		let blob2 = RefcountedBlob(std::sync::Arc::new(b"replaced".to_vec()));
+		assert!(tree.insert_defer(1, blob2.clone()));
+		// Tree leaf now holds blob2's Arc, the old blob's leaf-side refcount
+		// is parked inside the epoch deferral (still alive until tick).
+		assert_eq!(std::sync::Arc::strong_count(&blob.0), 2);
+		assert_eq!(std::sync::Arc::strong_count(&blob2.0), 2);
+
+		// remove_defer reports presence and defers the drop
+		assert!(tree.remove_defer(&1));
+		assert!(!tree.remove_defer(&1));
+		// blob2's leaf refcount is now in epoch deferral.
+		assert_eq!(std::sync::Arc::strong_count(&blob2.0), 2);
+	}
+
+	#[test]
+	fn epoch_deferred_drop_concurrent() {
+		// Stress: readers using lookup_optimistic interleave with writers
+		// using insert_defer / remove_defer. The deferred-drop discipline
+		// ensures the Arc'd buffer stays alive across the snapshot/use
+		// window even when the writer replaces the slot.
+		use std::sync::atomic::{AtomicBool, Ordering as AO};
+		use std::sync::Arc as StdArc;
+		use std::thread;
+
+		let tree: StdArc<Tree<i32, RefcountedBlob>> = StdArc::new(Tree::new());
+		let stop = StdArc::new(AtomicBool::new(false));
+
+		// Seed
+		for i in 0..200 {
+			tree.insert_defer(i, RefcountedBlob(StdArc::new(vec![i as u8; 32])));
+		}
+
+		let mut handles = Vec::new();
+		for _ in 0..4 {
+			let tree = StdArc::clone(&tree);
+			let stop = StdArc::clone(&stop);
+			handles.push(thread::spawn(move || {
+				while !stop.load(AO::Relaxed) {
+					for k in 0..200 {
+						if let Some(blob) = tree.lookup_optimistic(&k, |v| v.clone()) {
+							// Touch the buffer to force the optimiser not to
+							// drop the clone; if the buffer were freed
+							// behind our back this would UB / segfault.
+							let s: usize = blob.0.iter().map(|&b| b as usize).sum();
+							std::hint::black_box(s);
+						}
+					}
+				}
+			}));
+		}
+
+		let writer = {
+			let tree = StdArc::clone(&tree);
+			let stop = StdArc::clone(&stop);
+			thread::spawn(move || {
+				for round in 0..50 {
+					for k in 0..200 {
+						let v = RefcountedBlob(StdArc::new(vec![(k + round) as u8; 32]));
+						tree.insert_defer(k, v);
+					}
+				}
+				stop.store(true, AO::Relaxed);
+			})
+		};
+
+		writer.join().unwrap();
+		for h in handles {
+			h.join().unwrap();
+		}
 	}
 
 	#[test]
