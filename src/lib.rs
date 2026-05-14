@@ -1381,18 +1381,22 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	// Public API: Read Operations
 	// -----------------------------------------------------------------------
 
-	/// Looks up a value in the tree using optimistic concurrency.
+	/// Looks up a value in the tree and applies a closure to it.
 	///
-	/// This method uses a closure-based API because the underlying access is
-	/// optimistic and may be retried. The closure receives a reference to the
-	/// value and should extract/clone whatever data is needed.
+	/// This method uses a closure-based API so the borrowed reference does not
+	/// escape the locked region. The closure receives a reference to the value
+	/// and should extract/clone whatever data is needed.
 	///
-	/// # Important
+	/// # Concurrency
 	///
-	/// The closure `f` may be executed multiple times if concurrent modifications
-	/// cause validation failures. **Do not perform side effects in the closure.**
-	/// The value reference passed to `f` may contain inconsistent data during
-	/// retries; only the final successful call's result is returned.
+	/// A shared lock is held on the containing leaf for the duration of the
+	/// closure. This blocks concurrent writers to that leaf but allows other
+	/// readers, so `f` always observes a consistent `&V`. The closure runs
+	/// exactly once.
+	///
+	/// Because writers are blocked while the closure runs, `f` should be
+	/// short-running — avoid expensive work or operations that could call back
+	/// into the tree.
 	///
 	/// # Parameters
 	///
@@ -1429,47 +1433,29 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		// Pin the current epoch for memory safety
 		let eg = &epoch::pin();
 
-		// Retry loop for optimistic validation failures
-		loop {
-			let perform = || {
-				// Find the leaf that would contain this key
-				let guard = self.find_leaf(key, eg)?;
+		// Acquire a shared lock on the target leaf. The user's closure runs
+		// while the lock is held, which blocks concurrent writers from
+		// mutating `V` during the read. Optimistic reads are unsound for
+		// values with interior pointers (e.g. SmallVec/Vec/String): a torn
+		// read of length/tag/pointer bytes can trigger UB inside the value
+		// type's own methods before recheck() ever runs.
+		let (guard, _parent) = self.find_shared_leaf_and_optimistic_parent(key, eg);
 
-				if let Node::Leaf(ref leaf) = *guard {
-					// Binary search for the key within the leaf
-					let (pos, exact) = leaf.lower_bound(key);
+		if let Node::Leaf(ref leaf) = *guard {
+			// Binary search for the key within the leaf
+			let (pos, exact) = leaf.lower_bound(key);
 
-					if exact {
-						// Key found - call the user's closure
-						// Note: This read might be invalid if the tree changed
-						let result = f(leaf.value_at(pos)?);
-
-						// Validate that our reads were consistent
-						guard.recheck()?;
-
-						error::Result::Ok(Some(result))
-					} else {
-						// Key not found in this leaf
-						guard.recheck()?;
-						error::Result::Ok(None)
-					}
-				} else {
-					// find_leaf should always return a leaf node
-					unreachable!(
-						"find_leaf returned non-leaf node - tree traversal invariant violated"
-					)
-				}
-			};
-
-			match perform() {
-				Ok(opt) => {
-					return opt;
-				}
-				Err(_) => {
-					// Validation failed - retry
-					continue;
-				}
+			if exact {
+				// Safe to call user code: the shared guard blocks writers,
+				// so `V` cannot be mutated for the duration of `f`.
+				leaf.value_at(pos).ok().map(&f)
+			} else {
+				None
 			}
+		} else {
+			unreachable!(
+				"find_shared_leaf_and_optimistic_parent returned non-leaf node - tree traversal invariant violated"
+			)
 		}
 	}
 
