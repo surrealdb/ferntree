@@ -142,11 +142,20 @@ mod loom_unsafe_cell {
 		/// Gets a raw pointer to the underlying data.
 		///
 		/// # Safety Note
-		/// Under loom, this extracts the raw pointer from loom's tracked ConstPtr.
-		/// The caller must ensure proper synchronization.
+		/// Under loom, this extracts the raw pointer from loom's tracked
+		/// `ConstPtr`. The caller must ensure that any access through the
+		/// resulting raw pointer satisfies the usual aliasing rules: no `&mut`
+		/// while another reference exists, and no concurrent reads/writes
+		/// without synchronisation. The `HybridLatch` enforces this by going
+		/// through its guard types.
 		pub fn get(&self) -> *mut T {
-			// SAFETY: We're converting loom's tracked pointer to a raw pointer.
-			// The caller is responsible for ensuring this is used correctly.
+			// SAFETY: `LoomUnsafeCell::get()` returns a `ConstPtr<T>` and
+			// `deref()` on that yields a `*const T` whose validity is tracked
+			// by loom. The cast to `*mut T` is sound here because the only
+			// real-build counterpart (`std::cell::UnsafeCell`) also produces a
+			// `*mut T` for the same memory; loom is checking aliasing on our
+			// behalf, and any actual write through the returned pointer is
+			// gated by the `HybridLatch` lock state above.
 			unsafe { self.0.get().deref() as *const T as *mut T }
 		}
 

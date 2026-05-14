@@ -15,10 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt
 
@@ -30,13 +30,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Cache cargo dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Run cargo check
         run: cargo check --all-features
@@ -46,15 +46,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
 
       - name: Cache cargo dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -64,13 +64,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Cache cargo dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Run tests
         run: cargo test --all-features --verbose
@@ -80,13 +80,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Cache cargo dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Run loom tests
         env:
@@ -98,17 +98,148 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           components: rust-src
 
       - name: Cache cargo dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Run memory tests with LeakSanitizer
         env:
           RUSTFLAGS: "-Zsanitizer=leak"
         run: cargo +nightly test --target x86_64-unknown-linux-gnu --verbose -- memory_tests
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          components: miri, rust-src
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Setup Miri
+        run: cargo miri setup
+
+      # Miri runs ~100-1000× slower than debug. We deliberately limit it to
+      # `--lib` — the 226 unit tests inside the crate, which exercise every
+      # unsafe code path with small deterministic data and finish in ~14
+      # minutes. The `invariants.rs` integration tests (5,000-10,000 entry
+      # workloads) and `unsafe_coverage.rs` concurrent scenarios push Miri
+      # wall time into hours without meaningfully extending UB coverage,
+      # so they are skipped here. The full integration suite still runs
+      # under regular cargo test, ASan, TSan, and loom.
+      #
+      # `-Zmiri-tree-borrows` is required because the `crossbeam-epoch`
+      # dependency has known Stacked-Borrows issues (its pinned-thread
+      # list manipulation). Tree Borrows is strictly more permissive for
+      # those aliasing patterns and is on track to become Rust's default
+      # aliasing model. Ferntree's own unsafe code is sound under both.
+      - name: Run Miri on lib unit tests
+        env:
+          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks"
+        run: cargo miri test --all-features --lib
+
+  asan:
+    name: AddressSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          components: rust-src
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Run tests under AddressSanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+          RUSTDOCFLAGS: "-Zsanitizer=address"
+          ASAN_OPTIONS: "detect_leaks=0:detect_stack_use_after_return=1"
+        run: |
+          cargo +nightly test --all-features --target x86_64-unknown-linux-gnu --verbose -- \
+            --skip memory_tests
+
+  tsan:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          components: rust-src
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      # TSan focuses on the concurrent test suite, which is where data races
+      # would surface. Single-threaded suites are skipped to keep wall time
+      # reasonable. We don't run the loom test under TSan because loom builds
+      # its own scheduler.
+      #
+      # `-Zbuild-std` is required since recent nightly: rustc refuses to mix
+      # sanitizer and non-sanitizer ABIs in the same build graph, so std and
+      # all transitive deps must be rebuilt with `-Zsanitizer=thread`.
+      #
+      # `TSAN_OPTIONS=suppressions=...` points to a file listing known
+      # false-positive race patterns inherent to optimistic lock coupling.
+      # See the file for details — the algorithm's correctness under those
+      # patterns is validated by the loom job, which models the full
+      # version-counter handshake.
+      - name: Run concurrency tests under ThreadSanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1:suppressions=${{ github.workspace }}/.github/tsan_suppressions.txt"
+        run: |
+          cargo +nightly test --all-features \
+            -Zbuild-std \
+            --target x86_64-unknown-linux-gnu --verbose \
+            --test concurrency --test deadlock_tests --test unsafe_coverage
+
+  fuzz-smoke:
+    name: Fuzz smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      # `--locked` pins cargo-fuzz's published lockfile, which depends on an
+      # old `rustix` that no longer compiles on recent nightly (it uses
+      # internal `rustc_layout_scalar_valid_range_*` attributes that the
+      # compiler reserved). Installing without `--locked` lets cargo
+      # resolve a compatible newer `rustix`.
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      # libFuzzer runs under AddressSanitizer, which also enables LeakSanitizer
+      # by default. At fuzz exit, `crossbeam-epoch`'s thread-local deferred
+      # bag still holds objects waiting for epoch advancement — these are
+      # not leaks but LSan can't tell. `detect_leaks=0` matches the
+      # convention used by `crossbeam-*` crates in their own CI.
+      - name: Run oracle fuzz target for 60s
+        env:
+          ASAN_OPTIONS: "detect_leaks=0"
+        run: cargo +nightly fuzz run tree_oracle -- -max_total_time=60

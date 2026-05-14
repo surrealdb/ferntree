@@ -246,6 +246,13 @@
 
 // Complex types are intentional in this crate for expressing tree traversal results
 #![allow(clippy::type_complexity)]
+// Force every operation in an `unsafe fn` to be wrapped in its own `unsafe`
+// block, so each pointer dereference / reclamation is individually justified.
+#![deny(unsafe_op_in_unsafe_fn)]
+// Require a `// SAFETY:` comment for every `unsafe` block. Combined with
+// `unsafe_op_in_unsafe_fn` above, this guarantees every unsafe operation in
+// the crate has a documented justification.
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 use smallvec::{smallvec, SmallVec};
 
@@ -477,7 +484,9 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		let tree_guard = self.root.optimistic_or_spin();
 
 		// Step 2: Load the root node through the Atomic pointer
-		// SAFETY: The epoch guard ensures the pointer remains valid
+		// SAFETY: `eg` is pinned for the lifetime of this borrow, so crossbeam-epoch
+		// cannot reclaim the loaded `HybridLatch` while we hold the reference. The
+		// root pointer is always non-null after `Tree::new` initialises it.
 		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 		let root_latch_ptr = root_latch as *const _;
 
@@ -535,7 +544,9 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 			};
 
 			// Load the child node
-			// SAFETY: Epoch guard ensures the pointer is valid
+			// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
+			// before this reference is dropped. The swip is non-null because internal
+			// nodes always have populated child pointers for `pos <= len`.
 			let c_latch = unsafe { c_swip.load(Ordering::Acquire, eg).deref() };
 			let c_latch_ptr = c_latch as *const _;
 
@@ -615,6 +626,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	{
 		// Check if needle is the root (no siblings possible)
 		let tree_guard = self.root.optimistic_or_spin();
+		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
+		// for the lifetime of `root_latch`.
 		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 		let root_latch_ptr = root_latch as *const _;
 		let root_guard = root_latch.optimistic_or_spin();
@@ -759,7 +772,9 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		eg: &'e epoch::Guard,
 	) -> error::Result<OptimisticGuard<'e, Node<K, V, IC, LC>>> {
 		// Step 1: Load the child pointer and dereference to get the latch
-		// SAFETY: Epoch guard protects the pointer from being freed
+		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
+		// before this reference is dropped. The swip is populated under the parent
+		// latch before being made reachable by other threads.
 		let c_latch = unsafe { swip.load(Ordering::Acquire, eg).deref() };
 
 		// Step 2: Acquire optimistic access to the child
@@ -782,7 +797,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		swip: &Atomic<HybridLatch<Node<K, V, IC, LC>>>,
 		eg: &'e epoch::Guard,
 	) -> error::Result<SharedGuard<'e, Node<K, V, IC, LC>>> {
-		// SAFETY: Epoch guard protects the pointer
+		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
+		// before `c_latch` is dropped.
 		let c_latch = unsafe { swip.load(Ordering::Acquire, eg).deref() };
 
 		// Acquire shared (blocking) access to the child
@@ -803,7 +819,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		swip: &Atomic<HybridLatch<Node<K, V, IC, LC>>>,
 		eg: &'e epoch::Guard,
 	) -> error::Result<ExclusiveGuard<'e, Node<K, V, IC, LC>>> {
-		// SAFETY: Epoch guard protects the pointer
+		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
+		// before `c_latch` is dropped.
 		let c_latch = unsafe { swip.load(Ordering::Acquire, eg).deref() };
 
 		// Acquire exclusive (blocking) access to the child
@@ -886,6 +903,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	)> {
 		// Start from the root
 		let tree_guard = self.root.optimistic_or_spin();
+		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
+		// for the lifetime of `root_latch`.
 		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
@@ -906,6 +925,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	)> {
 		// Start from the root
 		let tree_guard = self.root.optimistic_or_spin();
+		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
+		// for the lifetime of `root_latch`.
 		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
@@ -939,6 +960,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	{
 		// Acquire access to the root
 		let tree_guard = self.root.optimistic_or_spin();
+		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
+		// for the lifetime of `root_latch`.
 		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
@@ -1026,6 +1049,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 			let perform = || {
 				// Start traversal from root
 				let tree_guard = self.root.optimistic_or_spin();
+				// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be
+				// reclaimed for the lifetime of `root_latch`.
 				let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 				let root_guard = root_latch.optimistic_or_spin();
 				tree_guard.recheck()?;
@@ -1181,6 +1206,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 			let perform = || {
 				// Start traversal from root
 				let tree_guard = self.root.optimistic_or_spin();
+				// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be
+				// reclaimed for the lifetime of `root_latch`.
 				let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 				let root_guard = root_latch.optimistic_or_spin();
 				tree_guard.recheck()?;
@@ -1499,6 +1526,13 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// The closure receives references to the key and value and should extract
 	/// whatever data is needed. Returns `None` if the tree is empty.
 	///
+	/// # Important
+	///
+	/// The closure `f` may be executed multiple times if concurrent
+	/// modifications cause optimistic-validation failures. **Do not perform
+	/// side effects in `f`.** Only the result of the final successful call is
+	/// returned.
+	///
 	/// # Example
 	///
 	/// ```
@@ -1526,6 +1560,13 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	///
 	/// The closure receives references to the key and value and should extract
 	/// whatever data is needed. Returns `None` if the tree is empty.
+	///
+	/// # Important
+	///
+	/// The closure `f` may be executed multiple times if concurrent
+	/// modifications cause optimistic-validation failures. **Do not perform
+	/// side effects in `f`.** Only the result of the final successful call is
+	/// returned.
 	///
 	/// # Example
 	///
@@ -1808,7 +1849,11 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		// Schedule old root for deferred destruction
 		let old_root = tree_guard.load(Ordering::Acquire, &eg);
 		if !old_root.is_null() {
-			// SAFETY: The epoch guard ensures safe reclamation
+			// SAFETY: We hold exclusive access to the root pointer (via `tree_guard`),
+			// so no thread can begin a new traversal that finds `old_root`. Optimistic
+			// readers still holding it will fail validation on their next `recheck()`.
+			// Crossbeam-epoch defers `Drop` until every guard pinned at this moment
+			// has been released.
 			unsafe { eg.defer_destroy(old_root) };
 		}
 
@@ -1892,6 +1937,9 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 				let mut tree_guard_x = tree_guard.to_exclusive()?;
 
 				// Get exclusive access to the root node
+				// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be
+				// reclaimed for the lifetime of `root_latch`. `tree_guard_x` holds
+				// the root pointer exclusively, preventing concurrent replacement.
 				let root_latch = unsafe { tree_guard_x.load(Ordering::Acquire, eg).deref() };
 				let mut root_guard_x = root_latch.exclusive();
 
@@ -2266,7 +2314,14 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 										// Schedule the old target for deferred destruction
 										let shared = dropped_edge.load(Ordering::Relaxed, eg);
 										if !shared.is_null() {
-											// SAFETY: The epoch guard ensures safe reclamation
+											// SAFETY: `dropped_edge` was unlinked from the
+											// parent under an exclusive latch above, so no new
+											// traversal can reach it. Optimistic readers still
+											// holding the stale pointer will fail validation on
+											// `recheck()` because the parent's version is
+											// bumped on unlock. Crossbeam-epoch defers `Drop`
+											// until every currently pinned epoch guard has
+											// been released.
 											unsafe { eg.defer_destroy(shared) };
 										}
 									} else {
@@ -2280,6 +2335,14 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 										// Schedule deferred destruction
 										let shared = dropped_edge.load(Ordering::Relaxed, eg);
 										if !shared.is_null() {
+											// SAFETY: `dropped_edge` was unlinked from the
+											// parent under an exclusive latch above, so no new
+											// traversal can reach it. Optimistic readers still
+											// holding the stale pointer will fail validation on
+											// `recheck()` because the parent's version is
+											// bumped on unlock. Crossbeam-epoch defers `Drop`
+											// until every currently pinned epoch guard has
+											// been released.
 											unsafe { eg.defer_destroy(shared) };
 										}
 									}
@@ -2310,6 +2373,14 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 										let shared = dropped_edge.load(Ordering::Relaxed, eg);
 										if !shared.is_null() {
+											// SAFETY: `dropped_edge` was unlinked from the
+											// parent under an exclusive latch above, so no new
+											// traversal can reach it. Optimistic readers still
+											// holding the stale pointer will fail validation on
+											// `recheck()` because the parent's version is
+											// bumped on unlock. Crossbeam-epoch defers `Drop`
+											// until every currently pinned epoch guard has
+											// been released.
 											unsafe { eg.defer_destroy(shared) };
 										}
 									} else {
@@ -2321,6 +2392,14 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 										let shared = dropped_edge.load(Ordering::Relaxed, eg);
 										if !shared.is_null() {
+											// SAFETY: `dropped_edge` was unlinked from the
+											// parent under an exclusive latch above, so no new
+											// traversal can reach it. Optimistic readers still
+											// holding the stale pointer will fail validation on
+											// `recheck()` because the parent's version is
+											// bumped on unlock. Crossbeam-epoch defers `Drop`
+											// until every currently pinned epoch guard has
+											// been released.
 											unsafe { eg.defer_destroy(shared) };
 										}
 									}
@@ -2382,6 +2461,14 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 										let shared = dropped_edge.load(Ordering::Relaxed, eg);
 										if !shared.is_null() {
+											// SAFETY: `dropped_edge` was unlinked from the
+											// parent under an exclusive latch above, so no new
+											// traversal can reach it. Optimistic readers still
+											// holding the stale pointer will fail validation on
+											// `recheck()` because the parent's version is
+											// bumped on unlock. Crossbeam-epoch defers `Drop`
+											// until every currently pinned epoch guard has
+											// been released.
 											unsafe { eg.defer_destroy(shared) };
 										}
 									} else {
@@ -2393,6 +2480,14 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 										let shared = dropped_edge.load(Ordering::Relaxed, eg);
 										if !shared.is_null() {
+											// SAFETY: `dropped_edge` was unlinked from the
+											// parent under an exclusive latch above, so no new
+											// traversal can reach it. Optimistic readers still
+											// holding the stale pointer will fail validation on
+											// `recheck()` because the parent's version is
+											// bumped on unlock. Crossbeam-epoch defers `Drop`
+											// until every currently pinned epoch guard has
+											// been released.
 											unsafe { eg.defer_destroy(shared) };
 										}
 									}
@@ -2422,6 +2517,14 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 										let shared = dropped_edge.load(Ordering::Relaxed, eg);
 										if !shared.is_null() {
+											// SAFETY: `dropped_edge` was unlinked from the
+											// parent under an exclusive latch above, so no new
+											// traversal can reach it. Optimistic readers still
+											// holding the stale pointer will fail validation on
+											// `recheck()` because the parent's version is
+											// bumped on unlock. Crossbeam-epoch defers `Drop`
+											// until every currently pinned epoch guard has
+											// been released.
 											unsafe { eg.defer_destroy(shared) };
 										}
 									} else {
@@ -2433,6 +2536,14 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 										let shared = dropped_edge.load(Ordering::Relaxed, eg);
 										if !shared.is_null() {
+											// SAFETY: `dropped_edge` was unlinked from the
+											// parent under an exclusive latch above, so no new
+											// traversal can reach it. Optimistic readers still
+											// holding the stale pointer will fail validation on
+											// `recheck()` because the parent's version is
+											// bumped on unlock. Crossbeam-epoch defers `Drop`
+											// until every currently pinned epoch guard has
+											// been released.
 											unsafe { eg.defer_destroy(shared) };
 										}
 									}
@@ -3127,7 +3238,8 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	/// This is intended for use in iterator hot paths where position has already been validated.
 	#[inline]
 	pub(crate) unsafe fn kv_at_unchecked(&self, pos: u16) -> (&K, &V) {
-		let entry = self.entries.get_unchecked(pos as usize);
+		// SAFETY: The caller guarantees `pos < self.entries.len()`.
+		let entry = unsafe { self.entries.get_unchecked(pos as usize) };
 		(&entry.0, &entry.1)
 	}
 
@@ -3139,7 +3251,8 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	/// This is intended for use in iterator hot paths where position has already been validated.
 	#[inline]
 	pub(crate) unsafe fn kv_at_mut_unchecked(&mut self, pos: u16) -> (&K, &mut V) {
-		let entry = self.entries.get_unchecked_mut(pos as usize);
+		// SAFETY: The caller guarantees `pos < self.entries.len()`.
+		let entry = unsafe { self.entries.get_unchecked_mut(pos as usize) };
 		(&entry.0, &mut entry.1)
 	}
 
@@ -3744,7 +3857,10 @@ impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
 			return;
 		}
 
-		// SAFETY: We're in a test context and hold an epoch guard
+		// SAFETY: `eg` is pinned in the caller and live for the duration of this
+		// validation. No concurrent writer can run because the test calls this
+		// while holding a `&mut` reference to the tree. The loaded `HybridLatch`
+		// is non-null (checked above) and cannot be reclaimed until `eg` retires.
 		let root_latch = unsafe { root_ptr.deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 
@@ -3911,7 +4027,9 @@ impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
 				for (i, edge) in internal.edges.iter().enumerate() {
 					let child_ptr = edge.load(Ordering::Acquire, eg);
 					if !child_ptr.is_null() {
-						// SAFETY: Test context with epoch guard
+						// SAFETY: `eg` is pinned and is held for the duration of this
+						// validation pass; the non-null `child_ptr` is therefore safe
+						// to dereference.
 						let child_latch = unsafe { child_ptr.deref() };
 						let child_guard = child_latch.optimistic_or_spin();
 
@@ -3932,6 +4050,9 @@ impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
 				if let Some(upper_edge) = &internal.upper_edge {
 					let child_ptr = upper_edge.load(Ordering::Acquire, eg);
 					if !child_ptr.is_null() {
+						// SAFETY: `eg` is pinned and is held for the duration of this
+						// validation pass; the non-null `child_ptr` is therefore safe
+						// to dereference.
 						let child_latch = unsafe { child_ptr.deref() };
 						let child_guard = child_latch.optimistic_or_spin();
 

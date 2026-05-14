@@ -346,9 +346,14 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 	fn leaf_lt<'g>(
 		guard: SharedGuard<'g, Node<K, V, IC, LC>>,
 	) -> SharedGuard<'t, Node<K, V, IC, LC>> {
-		// SAFETY: We hold the epoch guard at all times so 'g should equal 't.
-		// The guard's actual lifetime is bounded by the epoch, and we maintain
-		// the epoch pin for our entire lifetime.
+		// SAFETY: `SharedGuard<'g, T>` has identical layout to
+		// `SharedGuard<'t, T>` — only the lifetime parameter differs. The
+		// resulting `'t` is at most the lifetime of `self.eg` (an
+		// `epoch::Guard` that we own and never drop early), and the
+		// `crossbeam-epoch` contract guarantees the underlying node memory
+		// will not be reclaimed while `self.eg` is pinned. The `RwLock` read
+		// state inside the guard is preserved through the transmute, so the
+		// shared lock is correctly released on drop.
 		unsafe { std::mem::transmute(guard) }
 	}
 
@@ -361,9 +366,9 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 	fn parent_lt<'g>(
 		guard: OptimisticGuard<'g, Node<K, V, IC, LC>>,
 	) -> OptimisticGuard<'t, Node<K, V, IC, LC>> {
-		// SAFETY: We hold the epoch guard at all times so 'g should equal 't.
-		// The guard's actual lifetime is bounded by the epoch, and we maintain
-		// the epoch pin for our entire lifetime.
+		// SAFETY: Same layout-and-lifetime argument as `leaf_lt`. The parent
+		// guard is held optimistically (version-checked), and the underlying
+		// `HybridLatch` cannot be reclaimed while `self.eg` is pinned.
 		unsafe { std::mem::transmute(guard) }
 	}
 
@@ -1109,12 +1114,15 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 			Cursor::After(pos) => pos.saturating_add(1),
 		};
 
-		// Process all remaining entries in this leaf
-		// SAFETY: i is bounded by start..leaf_len where:
+		// Process all remaining entries in this leaf.
+		//
+		// i is bounded by start..leaf_len where:
 		// - start comes from cursor state which tracks valid positions
 		// - leaf_len is the actual length of the leaf
 		// - the loop only iterates while i < leaf_len
 		for i in start..leaf_len {
+			// SAFETY: `i < leaf_len == leaf.len <= leaf.entries.len()`, per the
+			// loop bound above.
 			let (k, v) = unsafe { leaf.kv_at_unchecked(i) };
 			f(k, v);
 		}
@@ -1206,7 +1214,12 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 	fn leaf_lt<'g>(
 		guard: ExclusiveGuard<'g, Node<K, V, IC, LC>>,
 	) -> ExclusiveGuard<'t, Node<K, V, IC, LC>> {
-		// SAFETY: Epoch guard protects the memory
+		// SAFETY: `ExclusiveGuard<'g, T>` and `ExclusiveGuard<'t, T>` have
+		// identical layout. The exclusive (write) lock state is preserved
+		// through the transmute, so the lock is correctly released on drop.
+		// `'t` is bounded by the lifetime of `self.eg`, and crossbeam-epoch
+		// guarantees the underlying memory cannot be reclaimed while `self.eg`
+		// is pinned.
 		unsafe { std::mem::transmute(guard) }
 	}
 
@@ -1215,7 +1228,9 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 	fn parent_lt<'g>(
 		guard: OptimisticGuard<'g, Node<K, V, IC, LC>>,
 	) -> OptimisticGuard<'t, Node<K, V, IC, LC>> {
-		// SAFETY: Epoch guard protects the memory
+		// SAFETY: Same layout-and-lifetime argument as `leaf_lt`. The parent
+		// guard is held optimistically and validated via `recheck()` before
+		// any data is trusted.
 		unsafe { std::mem::transmute(guard) }
 	}
 
@@ -2041,12 +2056,15 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			Cursor::After(pos) => pos.saturating_add(1),
 		};
 
-		// Process all remaining entries in this leaf
-		// SAFETY: i is bounded by start..leaf_len where:
+		// Process all remaining entries in this leaf.
+		//
+		// i is bounded by start..leaf_len where:
 		// - start comes from cursor state which tracks valid positions
 		// - leaf_len is the actual length of the leaf
 		// - the loop only iterates while i < leaf_len
 		for i in start..leaf_len {
+			// SAFETY: `i < leaf_len == leaf.len <= leaf.entries.len()`, per
+			// the loop bound above.
 			let (k, v) = unsafe { leaf.kv_at_mut_unchecked(i) };
 			f(k, v);
 		}

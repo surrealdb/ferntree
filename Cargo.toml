@@ -36,3 +36,7 @@ ferntree = { path = ".", features = ["test-utils"] }
 [[bench]]
 name = "comparison"
 harness = false
+
+[[bench]]
+name = "fanout"
+harness = false

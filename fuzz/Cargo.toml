@@ -1,0 +1,38 @@
+[package]
+name = "ferntree-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.ferntree]
+path = ".."
+# `assert_invariants` is gated behind the `test-utils` feature.
+features = ["test-utils"]
+
+[[bin]]
+name = "tree_oracle"
+path = "fuzz_targets/tree_oracle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tree_oracle_iter"
+path = "fuzz_targets/tree_oracle_iter.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+# Keep this crate out of the parent crate's build graph; cargo-fuzz invokes
+# it explicitly with its own toolchain configuration.
+[workspace]
