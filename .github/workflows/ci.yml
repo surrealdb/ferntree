@@ -239,7 +239,16 @@ jobs:
       # bag still holds objects waiting for epoch advancement — these are
       # not leaks but LSan can't tell. `detect_leaks=0` matches the
       # convention used by `crossbeam-*` crates in their own CI.
+      #
+      # `-rss_limit_mb=4096` raises libFuzzer's default 2 GiB RSS cap. Each
+      # `fuzz_target!` invocation creates a fresh `Tree` and drops it; the
+      # nodes go through `crossbeam-epoch`'s deferred destroy queue, which
+      # only frees once the global epoch has advanced past two collection
+      # cycles. Under sustained throughput the queue grows faster than it
+      # drains, and the default cap is reachable within a minute regardless
+      # of any correctness issue. 4 GiB gives the smoke test enough headroom
+      # to actually exercise the target.
       - name: Run oracle fuzz target for 60s
         env:
           ASAN_OPTIONS: "detect_leaks=0"
-        run: cargo +nightly fuzz run tree_oracle -- -max_total_time=60
+        run: cargo +nightly fuzz run tree_oracle -- -max_total_time=60 -rss_limit_mb=4096
