@@ -220,7 +220,7 @@ fn bench_lookup_hit(c: &mut Criterion) {
 
 		group.throughput(Throughput::Elements(lookup_count as u64));
 
-		// FernTree
+		// FernTree (shared-lock path)
 		group.bench_with_input(BenchmarkId::new("ferntree", count), &lookup_keys, |b, keys| {
 			b.iter(|| {
 				for &k in keys {
@@ -228,6 +228,19 @@ fn bench_lookup_hit(c: &mut Criterion) {
 				}
 			})
 		});
+
+		// FernTree (optimistic fast path)
+		group.bench_with_input(
+			BenchmarkId::new("ferntree_optimistic", count),
+			&lookup_keys,
+			|b, keys| {
+				b.iter(|| {
+					for &k in keys {
+						black_box(ferntree.get_optimistic(&k));
+					}
+				})
+			},
+		);
 
 		// SkipMap
 		group.bench_with_input(BenchmarkId::new("skipmap", count), &lookup_keys, |b, keys| {
@@ -281,7 +294,7 @@ fn bench_lookup_miss(c: &mut Criterion) {
 
 		group.throughput(Throughput::Elements(missing.len() as u64));
 
-		// FernTree
+		// FernTree (shared-lock path)
 		group.bench_with_input(BenchmarkId::new("ferntree", count), &missing, |b, keys| {
 			b.iter(|| {
 				for &k in keys {
@@ -289,6 +302,19 @@ fn bench_lookup_miss(c: &mut Criterion) {
 				}
 			})
 		});
+
+		// FernTree (optimistic fast path)
+		group.bench_with_input(
+			BenchmarkId::new("ferntree_optimistic", count),
+			&missing,
+			|b, keys| {
+				b.iter(|| {
+					for &k in keys {
+						black_box(ferntree.get_optimistic(&k));
+					}
+				})
+			},
+		);
 
 		// SkipMap
 		group.bench_with_input(BenchmarkId::new("skipmap", count), &missing, |b, keys| {
@@ -615,7 +641,7 @@ fn bench_concurrent_readers(c: &mut Criterion) {
 			let total_ops = lookup_count * num_threads;
 			group.throughput(Throughput::Elements(total_ops as u64));
 
-			// FernTree
+			// FernTree (shared-lock path)
 			group.bench_with_input(
 				BenchmarkId::new(format!("ferntree/{}t", num_threads), count),
 				&lookup_keys,
@@ -628,6 +654,30 @@ fn bench_concurrent_readers(c: &mut Criterion) {
 								thread::spawn(move || {
 									for &k in &keys {
 										black_box(tree.get(&k));
+									}
+								})
+							})
+							.collect();
+						for h in handles {
+							h.join().unwrap();
+						}
+					})
+				},
+			);
+
+			// FernTree (optimistic fast path)
+			group.bench_with_input(
+				BenchmarkId::new(format!("ferntree_optimistic/{}t", num_threads), count),
+				&lookup_keys,
+				|b, keys| {
+					b.iter(|| {
+						let handles: Vec<_> = (0..num_threads)
+							.map(|_| {
+								let tree = Arc::clone(&ferntree);
+								let keys = keys.clone();
+								thread::spawn(move || {
+									for &k in &keys {
+										black_box(tree.get_optimistic(&k));
 									}
 								})
 							})
@@ -1094,6 +1144,109 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
 }
 
 // ============================================================================
+// Refcounted-value benchmarks (Phase 3: epoch-deferred drop path)
+// ============================================================================
+
+#[derive(Clone)]
+struct ArcBlob(#[allow(dead_code)] Arc<[u8; 32]>);
+
+// SAFETY: `ArcBlob` wraps `Arc<[u8; 32]>`. Bitwise snapshot + recheck yields
+// a valid `Arc`. `EPOCH_DEFERRED_DROP = true` is paired with
+// `insert_defer` / `remove_defer` for all writes, keeping the buffer alive
+// across the reader's snapshot/use window.
+unsafe impl ferntree::OptimisticRead for ArcBlob {
+	const EPOCH_DEFERRED_DROP: bool = true;
+}
+
+fn bench_refcounted_lookup(c: &mut Criterion) {
+	let mut group = c.benchmark_group("refcounted_lookup");
+
+	for count in [10_000usize, 100_000] {
+		let tree: Tree<i64, ArcBlob> = Tree::new();
+		for k in 0..count as i64 {
+			tree.insert_defer(k, ArcBlob(Arc::new([(k & 0xff) as u8; 32])));
+		}
+		let lookup_keys: Vec<i64> = (0..1000i64).collect();
+		group.throughput(Throughput::Elements(lookup_keys.len() as u64));
+
+		// Cloning shared-lock path
+		group.bench_with_input(
+			BenchmarkId::new("shared_get_clone", count),
+			&lookup_keys,
+			|b, keys| {
+				b.iter(|| {
+					for &k in keys {
+						black_box(tree.get(&k));
+					}
+				})
+			},
+		);
+
+		// Cloning optimistic path
+		group.bench_with_input(
+			BenchmarkId::new("optimistic_get_clone", count),
+			&lookup_keys,
+			|b, keys| {
+				b.iter(|| {
+					for &k in keys {
+						black_box(tree.get_optimistic(&k));
+					}
+				})
+			},
+		);
+	}
+	group.finish();
+}
+
+fn bench_refcounted_writes(c: &mut Criterion) {
+	let mut group = c.benchmark_group("refcounted_writes");
+
+	{
+		let count: usize = 10_000;
+		group.throughput(Throughput::Elements(count as u64));
+
+		// insert (synchronous drop of displaced value)
+		group.bench_function(BenchmarkId::new("insert", count), |b| {
+			b.iter_with_setup(
+				|| {
+					let tree: Tree<i64, ArcBlob> = Tree::new();
+					for k in 0..count as i64 {
+						tree.insert(k, ArcBlob(Arc::new([0u8; 32])));
+					}
+					tree
+				},
+				|tree| {
+					for k in 0..count as i64 {
+						tree.insert(k, ArcBlob(Arc::new([1u8; 32])));
+					}
+					black_box(tree);
+				},
+			)
+		});
+
+		// insert_defer (deferred drop of displaced value)
+		group.bench_function(BenchmarkId::new("insert_defer", count), |b| {
+			b.iter_with_setup(
+				|| {
+					let tree: Tree<i64, ArcBlob> = Tree::new();
+					for k in 0..count as i64 {
+						tree.insert_defer(k, ArcBlob(Arc::new([0u8; 32])));
+					}
+					tree
+				},
+				|tree| {
+					for k in 0..count as i64 {
+						tree.insert_defer(k, ArcBlob(Arc::new([1u8; 32])));
+					}
+					black_box(tree);
+				},
+			)
+		});
+	}
+	group.finish();
+}
+
+// ============================================================================
 // Criterion Configuration
 // ============================================================================
 
@@ -1115,4 +1268,6 @@ criterion_group!(
 	bench_concurrent_mixed,
 );
 
-criterion_main!(single_threaded_benches, concurrent_benches);
+criterion_group!(refcounted_benches, bench_refcounted_lookup, bench_refcounted_writes,);
+
+criterion_main!(single_threaded_benches, concurrent_benches, refcounted_benches);

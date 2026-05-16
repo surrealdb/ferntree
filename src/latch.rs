@@ -246,33 +246,49 @@ impl<T> HybridLatch<T> {
 	/// spinning briefly, then yielding to the OS scheduler.
 	///
 	/// The spin is designed to be brief, as writes in the B+ tree are typically fast.
-	#[inline(never)]
+	///
+	/// # Codegen note
+	///
+	/// The function is `#[inline]` so that the hot, uncontended fast path
+	/// (single `Acquire` load, no spin) is inlined into the caller — every
+	/// tree descent crosses this function once per level. The cold spin
+	/// path is split into [`Self::optimistic_spin_until_unlocked`] which is
+	/// `#[cold]` and `#[inline(never)]`, so that branch only costs an
+	/// untaken conditional branch in the common case.
+	#[inline]
 	pub fn optimistic_or_spin(&self) -> OptimisticGuard<'_, T> {
 		// Load current version
-		let mut version = self.version.load(Ordering::Acquire);
+		let version = self.version.load(Ordering::Acquire);
 
-		// Check if write-locked (odd version)
-		if (version & 1) == 1 {
-			// Write in progress - spin until it completes
-			let mut spinwait = parking_lot_core::SpinWait::new();
-			loop {
-				version = self.version.load(Ordering::Acquire);
-				if (version & 1) == 1 {
-					// Still locked - continue spinning with exponential backoff
-					spinwait.spin();
-					continue;
-				} else {
-					// Write completed - version is now even
-					break;
-				}
-			}
-		}
+		// Fast path: not write-locked, return immediately.
+		// The branch predictor will learn this is the common case.
+		let version = if (version & 1) == 0 {
+			version
+		} else {
+			self.optimistic_spin_until_unlocked()
+		};
 
 		// Return optimistic guard with captured version
 		OptimisticGuard {
 			latch: self,
 			data: self.data.get(),
 			version,
+		}
+	}
+
+	/// Cold-path helper for [`Self::optimistic_or_spin`]: spins with
+	/// exponential backoff until the latch is no longer write-locked, then
+	/// returns the even (unlocked) version.
+	#[cold]
+	#[inline(never)]
+	fn optimistic_spin_until_unlocked(&self) -> usize {
+		let mut spinwait = parking_lot_core::SpinWait::new();
+		loop {
+			let version = self.version.load(Ordering::Acquire);
+			if (version & 1) == 0 {
+				return version;
+			}
+			spinwait.spin();
 		}
 	}
 

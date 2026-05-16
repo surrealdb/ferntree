@@ -65,6 +65,16 @@ mod mock_epoch {
 		pub fn flush(&self) {
 			// No-op: we don't defer anything
 		}
+
+		/// Defers execution of the given closure. In our mock, executes
+		/// immediately — loom serializes execution, so the difference is
+		/// invisible to the test.
+		pub fn defer<F, R>(&self, f: F)
+		where
+			F: FnOnce() -> R + Send + 'static,
+		{
+			let _ = f();
+		}
 	}
 
 	/// Pin the current thread to the epoch. Returns a guard that must
