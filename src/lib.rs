@@ -271,7 +271,7 @@ pub(crate) mod sync;
 use sync::epoch::{self as epoch, Atomic, Owned};
 use sync::{AtomicUsize, Ordering};
 
-use atomic_slot::{AtomicLen, SlotArray};
+use atomic_slot::{AtomicLen, OptimisticSlot, SlotArray};
 use inline_vec::InlineVec;
 use latch::{ExclusiveGuard, HybridGuard, HybridLatch, OptimisticGuard, SharedGuard};
 pub use optimistic::OptimisticRead;
@@ -2059,7 +2059,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			self.find_exact_exclusive_leaf_and_optimistic_parent(key, &eg)
 		{
 			// Remove the key-value pair from the leaf
-			let kv = guard.as_leaf_mut().remove_at(pos);
+			let kv = guard.as_leaf_mut().remove_at(pos, &eg);
 
 			// Check if the leaf is now underfull and needs merging
 			if guard.is_underfull() {
@@ -2106,6 +2106,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	pub fn insert(&self, key: K, value: V) -> Option<V>
 	where
 		K: Ord,
+		V: Clone,
 	{
 		// Use the mutable iterator for insertion
 		// This handles splits automatically
@@ -2137,7 +2138,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	pub fn insert_defer(&self, key: K, value: V) -> bool
 	where
 		K: Ord + OptimisticRead,
-		V: OptimisticRead + Send + 'static,
+		V: OptimisticRead + Clone + Send + 'static,
 	{
 		// Note: K is not displaced on overwrite (only V is) and is not
 		// dropped from the leaf on a fresh insert, so we don't need a
@@ -3048,6 +3049,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	pub fn raw_iter_mut(&self) -> iter::RawExclusiveIter<'_, K, V, IC, LC>
 	where
 		K: Ord,
+		V: Clone,
 	{
 		iter::RawExclusiveIter::new(self)
 	}
@@ -3898,9 +3900,45 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	}
 
 	/// Removes and returns the key-value pair at the specified position.
-	pub(crate) fn remove_at(&mut self, pos: u16) -> (K, V) {
+	///
+	/// Maintains the atomic mirror in lock-step so concurrent optimistic
+	/// readers observe a consistent view. The displaced mirror entries
+	/// are routed through the epoch GC so an in-flight reader's
+	/// `Acquire`-loaded pointer stays valid until no reader could still
+	/// be using it.
+	pub(crate) fn remove_at(&mut self, pos: u16, eg: &epoch::Guard) -> (K, V) {
+		let len = self.len.load_relaxed() as usize;
+		// SAFETY: caller holds exclusive lock; pos < len <= LC.
+		let displaced_k = unsafe { self.atomic_keys.shift_remove(len, pos as usize) };
+		let displaced_v = unsafe { self.atomic_values.shift_remove(len, pos as usize) };
+		// Defer-drop the displaced mirror entries so concurrent
+		// optimistic readers' interior pointers stay valid until the
+		// next epoch tick.
+		eg.defer(move || drop(displaced_k));
+		eg.defer(move || drop(displaced_v));
+
 		self.len.fetch_sub(1);
 		self.entries.remove(pos as usize)
+	}
+
+	/// Replace the value at `pos` and return the previous value.
+	/// Maintains the atomic mirror.
+	///
+	/// Used by `iter::insert`'s overwrite path so the mirror stays in
+	/// sync with `entries`.
+	pub(crate) fn swap_value_at(&mut self, pos: u16, value: V, eg: &epoch::Guard) -> V
+	where
+		V: Clone,
+	{
+		let len = self.len.load_relaxed() as usize;
+		debug_assert!((pos as usize) < len);
+		// Update mirror first; the displaced is routed through epoch GC.
+		// SAFETY: under exclusive lock; pos < len, slot is init.
+		let displaced_mirror =
+			unsafe { self.atomic_values.swap_init(pos as usize, value.clone()) };
+		eg.defer(move || drop(displaced_mirror));
+		// Update entries.
+		std::mem::replace(&mut self.entries[pos as usize].1, value)
 	}
 
 	/// Checks if a key falls within this leaf's fence boundaries.
@@ -3929,8 +3967,11 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	}
 }
 
-impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
+impl<K: Clone + OptimisticRead, V: Clone + OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	/// Inserts a key-value pair at the specified position.
+	///
+	/// Maintains the atomic mirror so the optimistic-read fast path
+	/// observes the new entry under `Acquire`-load semantics.
 	///
 	/// # Returns
 	///
@@ -3946,13 +3987,22 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 			self.sample_key = Some(key.clone());
 		}
 
+		let len = self.len.load_relaxed() as usize;
+		// Mirror updates under exclusive lock; pos <= len < LC.
+		// SAFETY: bounds enforced by `has_space()` check above and the
+		// caller's contract that `pos <= len`.
+		unsafe { self.atomic_keys.shift_insert(len, pos as usize, key.clone()) };
+		unsafe { self.atomic_values.shift_insert(len, pos as usize, value.clone()) };
+
 		// Insert the entry at the specified position
 		self.entries.insert(pos as usize, (key, value));
 		self.len.fetch_add(1);
 
 		Some(pos)
 	}
+}
 
+impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	/// Splits this leaf node, moving entries after `split_pos` to `right`.
 	///
 	/// After split:
@@ -3987,7 +4037,25 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 
 		// Move entries after split_pos to the right node
 		assert!(right.entries.is_empty());
-		right.entries.extend(self.entries.drain((split_pos + 1) as usize..));
+		let total = self.len.load_relaxed() as usize;
+		let right_start = (split_pos + 1) as usize;
+		right.entries.extend(self.entries.drain(right_start..));
+
+		// Mirror: move atomic_keys/atomic_values [right_start..total) to
+		// right.atomic_*[0..total-right_start). Atomic-pointer / atomic-
+		// integer shuffles via `move_init_to_empty` — no allocation.
+		// SAFETY: both leaves held under exclusive lock; src slots init,
+		// dst slots empty (right just allocated).
+		for (dst_idx, src_pos) in (right_start..total).enumerate() {
+			unsafe {
+				self.atomic_keys
+					.slot(src_pos)
+					.move_init_to_empty(right.atomic_keys.slot(dst_idx));
+				self.atomic_values
+					.slot(src_pos)
+					.move_init_to_empty(right.atomic_values.slot(dst_idx));
+			}
+		}
 
 		// Set sample keys for node relocation
 		// Use first key of each node (guaranteed to route to that node)
@@ -4008,8 +4076,10 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 	/// - `true` if merge succeeded
 	/// - `false` if combined size would exceed capacity
 	pub(crate) fn merge(&mut self, right: &mut LeafNode<K, V, LC>) -> bool {
+		let self_len = self.len.load_relaxed() as usize;
+		let right_len = right.len.load() as usize;
 		// Check if combined entries fit
-		if (self.len.load_relaxed() + right.len.load()) as usize > LC {
+		if self_len + right_len > LC {
 			return false;
 		}
 
@@ -4021,6 +4091,24 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 
 		// Move all entries from right to self
 		self.entries.extend(right.entries.drain(..));
+
+		// Mirror: move right.atomic_*[0..right_len) to
+		// self.atomic_*[self_len..self_len + right_len).
+		// SAFETY: both leaves under exclusive lock; src slots init in
+		// `right`, dst slots empty in `self` (beyond self_len).
+		for src_idx in 0..right_len {
+			let dst_idx = self_len + src_idx;
+			unsafe {
+				right
+					.atomic_keys
+					.slot(src_idx)
+					.move_init_to_empty(self.atomic_keys.slot(dst_idx));
+				right
+					.atomic_values
+					.slot(src_idx)
+					.move_init_to_empty(self.atomic_values.slot(dst_idx));
+			}
+		}
 
 		// Update sample_key: prefer right's sample_key if available,
 		// otherwise ensure we have one if we have entries (prevents find_parent failures)
@@ -4951,32 +5039,38 @@ mod tests {
 		let tree: Tree<i32, RefcountedBlob> = Tree::new();
 		let blob = RefcountedBlob(std::sync::Arc::new(b"hello world".to_vec()));
 
-		// insert_defer reports key was new
+		// insert_defer reports key was new.
 		assert!(!tree.insert_defer(1, blob.clone()));
-		// Strong count: tree leaf has one, our local `blob` has one
-		assert_eq!(std::sync::Arc::strong_count(&blob.0), 2);
+		// Strong count: the leaf holds two clones (one in `entries`,
+		// one in the atomic mirror used by the optimistic-read fast
+		// path); our local `blob` is the third.
+		assert_eq!(std::sync::Arc::strong_count(&blob.0), 3);
 
-		// Optimistic lookup returns a clone, bumping the refcount
+		// Optimistic lookup clones through the mirror, bumping the
+		// refcount once more.
 		let got =
 			tree.lookup_optimistic(&1, |v| v.clone()).expect("inserted value should be present");
-		assert_eq!(std::sync::Arc::strong_count(&blob.0), 3);
+		assert_eq!(std::sync::Arc::strong_count(&blob.0), 4);
 		assert_eq!(&got.0[..], b"hello world");
 		drop(got);
-		assert_eq!(std::sync::Arc::strong_count(&blob.0), 2);
+		assert_eq!(std::sync::Arc::strong_count(&blob.0), 3);
 
-		// Overwriting: insert_defer returns true (was present), defers old drop
+		// Overwriting: insert_defer returns true (was present), defers
+		// the displaced entries-side and mirror-side drops.
 		let blob2 = RefcountedBlob(std::sync::Arc::new(b"replaced".to_vec()));
 		assert!(tree.insert_defer(1, blob2.clone()));
-		// Tree leaf now holds blob2's Arc, the old blob's leaf-side refcount
-		// is parked inside the epoch deferral (still alive until tick).
-		assert_eq!(std::sync::Arc::strong_count(&blob.0), 2);
-		assert_eq!(std::sync::Arc::strong_count(&blob2.0), 2);
+		// Tree leaf now holds blob2 (twice — entries + mirror); the
+		// old blob's leaf-side refcounts (also two) are parked inside
+		// the epoch deferral until the next epoch tick.
+		assert_eq!(std::sync::Arc::strong_count(&blob.0), 3);
+		assert_eq!(std::sync::Arc::strong_count(&blob2.0), 3);
 
-		// remove_defer reports presence and defers the drop
+		// remove_defer reports presence and defers both displaced drops.
 		assert!(tree.remove_defer(&1));
 		assert!(!tree.remove_defer(&1));
-		// blob2's leaf refcount is now in epoch deferral.
-		assert_eq!(std::sync::Arc::strong_count(&blob2.0), 2);
+		// blob2's leaf refcounts (entries + mirror) are now in epoch
+		// deferral.
+		assert_eq!(std::sync::Arc::strong_count(&blob2.0), 3);
 	}
 
 	// Note: the concurrent stress tests for the optimistic-read fast
@@ -5231,7 +5325,8 @@ mod tests {
 		assert_eq!(*leaf.key_at(1).unwrap(), 20);
 		assert_eq!(*leaf.key_at(2).unwrap(), 30);
 
-		let (k, v) = leaf.remove_at(1);
+		let eg = epoch::pin();
+		let (k, v) = leaf.remove_at(1, &eg);
 		assert_eq!(k, 20);
 		assert_eq!(v, 200);
 		assert_eq!(leaf.len.load(), 2);

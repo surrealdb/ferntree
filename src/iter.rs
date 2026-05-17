@@ -1187,7 +1187,7 @@ pub struct RawExclusiveIter<'t, K: OptimisticRead, V: OptimisticRead, const IC: 
 	leaf: Option<(ExclusiveGuard<'t, Node<K, V, IC, LC>>, Cursor)>,
 }
 
-impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> RawExclusiveIter<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: Clone + OptimisticRead, const IC: usize, const LC: usize> RawExclusiveIter<'t, K, V, IC, LC> {
 	/// Creates a new exclusive iterator, pinning a fresh epoch guard.
 	///
 	/// Call `seek*` methods to position before iterating.
@@ -1667,9 +1667,20 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 	pub fn insert(&mut self, key: K, value: V) -> Option<V> {
 		// Seek to the key's position
 		if self.seek_exact(&key) {
-			// Key exists - update the value
-			let (_k, v) = self.next().unwrap();
-			let old = std::mem::replace(v, value);
+			// Key exists - update both entries and the atomic mirror at
+			// the cursor position. Reading the cursor before advancing
+			// gives us the position; `swap_value_at` handles both stores
+			// under exclusive lock and routes the displaced mirror
+			// entry through the epoch GC.
+			let (guard, cursor) = self.leaf.as_mut().expect("seek_exact set up leaf");
+			let pos = match *cursor {
+				Cursor::Before(p) => p,
+				Cursor::After(p) => p + 1,
+			};
+			let leaf = guard.as_leaf_mut();
+			let old = leaf.swap_value_at(pos, value, &self.eg);
+			// Advance cursor past the just-replaced entry.
+			*cursor = Cursor::After(pos);
 			Some(old)
 		} else {
 			// Key doesn't exist - insert at cursor position
@@ -1813,7 +1824,7 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 					return None;
 				}
 
-				let removed = leaf.remove_at(pos);
+				let removed = leaf.remove_at(pos, &self.eg);
 
 				// Adjust cursor since we removed the entry at pos
 				*cursor = Cursor::Before(pos);
@@ -1855,7 +1866,7 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 					Cursor::Before(pos) => {
 						let curr_pos = *pos;
 						if curr_pos < leaf.len.load() {
-							Some(leaf.remove_at(curr_pos))
+							Some(leaf.remove_at(curr_pos, &self.eg))
 						} else {
 							None
 						}
@@ -1864,7 +1875,7 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 						let pos = *pos;
 						let curr_pos = pos + 1;
 						if curr_pos < leaf.len.load() {
-							Some(leaf.remove_at(curr_pos))
+							Some(leaf.remove_at(curr_pos, &self.eg))
 						} else {
 							None
 						}
