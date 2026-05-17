@@ -346,6 +346,12 @@ fn concurrent_churn_drops_values_exactly() {
 		}
 	}
 
+	// SAFETY: see the matching impl in tests/functional_coverage.rs.
+	unsafe impl ferntree::OptimisticRead for Counted {
+		const EPOCH_DEFERRED_DROP: bool = true;
+		type Slot = ferntree::atomic_slot::BoxedSlot<Self>;
+	}
+
 	let inserts = 200usize;
 	let threads = 4usize;
 

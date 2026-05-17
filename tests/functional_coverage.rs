@@ -137,6 +137,14 @@ impl Drop for DropCounter {
 	}
 }
 
+// SAFETY: BoxedSlot synchronises all access via AtomicPtr; the
+// displaced Box is returned for epoch-defer drop. DropCounter wraps an
+// Arc which is Send + Sync.
+unsafe impl ferntree::OptimisticRead for DropCounter {
+	const EPOCH_DEFERRED_DROP: bool = true;
+	type Slot = ferntree::atomic_slot::BoxedSlot<Self>;
+}
+
 /// Aggressively try to flush crossbeam-epoch's deferred bag.
 ///
 /// The library does not provide a synchronous `flush()` so we approximate it

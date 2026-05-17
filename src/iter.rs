@@ -59,6 +59,7 @@ use crate::sync::epoch::{self as epoch};
 use crate::{Direction, GenericTree, Node};
 use std::borrow::Borrow;
 use std::ops::Bound;
+use crate::optimistic::OptimisticRead;
 
 // ===========================================================================
 // Helper Enums
@@ -292,7 +293,7 @@ enum JumpResult {
 ///
 /// The iterator pins an epoch guard for its entire lifetime, ensuring that
 /// node memory isn't reclaimed while references to entries are outstanding.
-pub struct RawSharedIter<'t, K, V, const IC: usize, const LC: usize> {
+pub struct RawSharedIter<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// Reference to the tree being iterated.
 	tree: &'t GenericTree<K, V, IC, LC>,
 	/// Epoch guard - pinned for the iterator's lifetime.
@@ -306,7 +307,7 @@ pub struct RawSharedIter<'t, K, V, const IC: usize, const LC: usize> {
 	leaf: Option<(SharedGuard<'t, Node<K, V, IC, LC>>, Cursor)>,
 }
 
-impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> RawSharedIter<'t, K, V, IC, LC> {
 	/// Creates a new iterator, pinning a fresh epoch guard.
 	///
 	/// The iterator starts in an unpositioned state;
@@ -1174,7 +1175,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 /// 2. Trigger a split operation
 /// 3. Re-seek to the correct position
 /// 4. Retry the insertion
-pub struct RawExclusiveIter<'t, K, V, const IC: usize, const LC: usize> {
+pub struct RawExclusiveIter<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// Reference to the tree being iterated.
 	tree: &'t GenericTree<K, V, IC, LC>,
 	/// Epoch guard - pinned for the iterator's lifetime.
@@ -1186,7 +1187,7 @@ pub struct RawExclusiveIter<'t, K, V, const IC: usize, const LC: usize> {
 	leaf: Option<(ExclusiveGuard<'t, Node<K, V, IC, LC>>, Cursor)>,
 }
 
-impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> RawExclusiveIter<'t, K, V, IC, LC> {
 	/// Creates a new exclusive iterator, pinning a fresh epoch guard.
 	///
 	/// Call `seek*` methods to position before iterating.
@@ -2102,7 +2103,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 /// assert_eq!(range.next(), Some((&3, &"three")));
 /// assert_eq!(range.next(), None);
 /// ```
-pub struct Range<'t, K, V, const IC: usize, const LC: usize> {
+pub struct Range<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// The underlying iterator.
 	iter: RawSharedIter<'t, K, V, IC, LC>,
 	/// The upper bound for iteration (owned).
@@ -2111,7 +2112,7 @@ pub struct Range<'t, K, V, const IC: usize, const LC: usize> {
 	finished: bool,
 }
 
-impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Range<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Range<'t, K, V, IC, LC> {
 	/// Creates a new range iterator.
 	///
 	/// The iterator is positioned based on the lower bound and will stop
@@ -2294,7 +2295,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Range<'t, K, V, IC
 /// assert_eq!(range.next(), Some((&1, &"one")));
 /// assert_eq!(range.next(), None);
 /// ```
-pub struct RangeRev<'t, K, V, const IC: usize, const LC: usize> {
+pub struct RangeRev<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// The underlying iterator.
 	iter: RawSharedIter<'t, K, V, IC, LC>,
 	/// The lower bound for iteration (owned).
@@ -2303,7 +2304,7 @@ pub struct RangeRev<'t, K, V, const IC: usize, const LC: usize> {
 	finished: bool,
 }
 
-impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RangeRev<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> RangeRev<'t, K, V, IC, LC> {
 	/// Creates a new reverse range iterator.
 	///
 	/// The iterator is positioned based on the upper bound and will stop
@@ -2471,12 +2472,12 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RangeRev<'t, K, V,
 /// assert_eq!(keys.next(), Some(&3));
 /// assert_eq!(keys.next(), None);
 /// ```
-pub struct Keys<'t, K, V, const IC: usize, const LC: usize> {
+pub struct Keys<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// The underlying iterator.
 	iter: RawSharedIter<'t, K, V, IC, LC>,
 }
 
-impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Keys<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Keys<'t, K, V, IC, LC> {
 	/// Creates a new keys iterator positioned at the first key.
 	pub(crate) fn new(tree: &'t GenericTree<K, V, IC, LC>) -> Keys<'t, K, V, IC, LC> {
 		let mut iter = tree.raw_iter();
@@ -2518,12 +2519,12 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Keys<'t, K, V, IC,
 /// assert_eq!(values.next(), Some(&"three"));
 /// assert_eq!(values.next(), None);
 /// ```
-pub struct Values<'t, K, V, const IC: usize, const LC: usize> {
+pub struct Values<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// The underlying iterator.
 	iter: RawSharedIter<'t, K, V, IC, LC>,
 }
 
-impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Values<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Values<'t, K, V, IC, LC> {
 	/// Creates a new values iterator positioned at the first value.
 	pub(crate) fn new(tree: &'t GenericTree<K, V, IC, LC>) -> Values<'t, K, V, IC, LC> {
 		let mut iter = tree.raw_iter();

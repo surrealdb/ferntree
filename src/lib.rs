@@ -271,7 +271,7 @@ pub(crate) mod sync;
 use sync::epoch::{self as epoch, Atomic, Owned};
 use sync::{AtomicUsize, Ordering};
 
-use atomic_slot::AtomicLen;
+use atomic_slot::{AtomicLen, OptimisticOption, OptimisticSlot, SlotArray};
 use inline_vec::InlineVec;
 use latch::{ExclusiveGuard, HybridGuard, HybridLatch, OptimisticGuard, SharedGuard};
 pub use optimistic::OptimisticRead;
@@ -328,7 +328,7 @@ pub type Tree<K, V> = GenericTree<K, V, INNER_CAPACITY, LEAF_CAPACITY>;
 ///
 /// Each node in the tree is wrapped in a `HybridLatch` for concurrency control,
 /// and nodes are connected via `Atomic` pointers for safe concurrent access.
-pub struct GenericTree<K, V, const IC: usize, const LC: usize> {
+pub struct GenericTree<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// The root of the tree, doubly latched for safe root replacement.
 	///
 	/// Structure: `HybridLatch<Atomic<HybridLatch<Node>>>>`
@@ -344,7 +344,7 @@ pub struct GenericTree<K, V, const IC: usize, const LC: usize> {
 	height: AtomicUsize,
 }
 
-impl<K: Clone + Ord, V, const IC: usize, const LC: usize> Default for GenericTree<K, V, IC, LC> {
+impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Default for GenericTree<K, V, IC, LC> {
 	fn default() -> Self {
 		Self::new()
 	}
@@ -364,7 +364,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> Default for GenericTre
 /// # Lifetimes
 /// - `'r`: Lifetime of the tree guard (when node is root)
 /// - `'p`: Lifetime of the parent guard (when node has a parent)
-pub(crate) enum ParentHandler<'r, 'p, K, V, const IC: usize, const LC: usize> {
+pub(crate) enum ParentHandler<'r, 'p, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// The target node is the root of the tree.
 	Root {
 		/// Guard on the tree's root pointer, needed to replace the root during splits.
@@ -395,7 +395,7 @@ pub(crate) enum Direction {
 // GenericTree Implementation
 // ---------------------------------------------------------------------------
 
-impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, LC> {
+impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> GenericTree<K, V, IC, LC> {
 	// -----------------------------------------------------------------------
 	// Construction
 	// -----------------------------------------------------------------------
@@ -421,6 +421,8 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 			root: HybridLatch::new(Atomic::new(HybridLatch::new(Node::Leaf(LeafNode {
 				len: AtomicLen::new(0),
 				entries: InlineVec::new(),
+				atomic_keys: SlotArray::new(),
+				atomic_values: SlotArray::new(),
 				// No fences for the root leaf - it covers the entire key space
 				lower_fence: None,
 				upper_fence: None,
@@ -3267,7 +3269,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 /// race (under Tree Borrows) with a concurrent writer's mutation. See
 /// [`Node::variant_raw`].
 #[repr(C, u8)]
-pub(crate) enum Node<K, V, const IC: usize, const LC: usize> {
+pub(crate) enum Node<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// An internal (index) node containing keys and child pointers.
 	Internal(InternalNode<K, V, IC, LC>) = 0,
 	/// A leaf node containing key-value pairs.
@@ -3278,12 +3280,12 @@ pub(crate) enum Node<K, V, const IC: usize, const LC: usize> {
 /// fast path. Each variant carries a `*const` to the variant's inner type
 /// — never an `&` reborrow — so the caller can project further to leaf /
 /// internal fields without retags.
-pub(crate) enum NodeKindRaw<K, V, const IC: usize, const LC: usize> {
+pub(crate) enum NodeKindRaw<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	Internal(*const InternalNode<K, V, IC, LC>),
 	Leaf(*const LeafNode<K, V, LC>),
 }
 
-impl<K: fmt::Debug, V: fmt::Debug, const IC: usize, const LC: usize> fmt::Debug
+impl<K: fmt::Debug + OptimisticRead, V: fmt::Debug + OptimisticRead, const IC: usize, const LC: usize> fmt::Debug
 	for Node<K, V, IC, LC>
 {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -3294,7 +3296,7 @@ impl<K: fmt::Debug, V: fmt::Debug, const IC: usize, const LC: usize> fmt::Debug
 	}
 }
 
-impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
+impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 	/// Returns `true` if this is a leaf node.
 	#[inline]
 	pub(crate) fn is_leaf(&self) -> bool {
@@ -3562,7 +3564,7 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 /// The `sample_key` is a key known to be in (or route to) this leaf. It's
 /// used by `find_parent()` to relocate this leaf in the tree after structural
 /// changes. Set during splits.
-pub(crate) struct LeafNode<K, V, const LC: usize> {
+pub(crate) struct LeafNode<K: OptimisticRead, V: OptimisticRead, const LC: usize> {
 	/// Number of key-value pairs in this leaf.
 	///
 	/// Atomic so that the optimistic-read fast path can load it
@@ -3577,6 +3579,14 @@ pub(crate) struct LeafNode<K, V, const LC: usize> {
 	/// creating an `&` reborrow (which would race under Tree Borrows with
 	/// concurrent writer mutations under the leaf's exclusive lock).
 	pub(crate) entries: InlineVec<(K, V), LC>,
+	/// Atomic key storage mirror for the optimistic-read fast path.
+	/// Writers under exclusive lock maintain this alongside `entries`;
+	/// optimistic readers read keys from here (atomic loads) instead of
+	/// `ptr::read(K)` (non-atomic).
+	pub(crate) atomic_keys: SlotArray<K::Slot, LC>,
+	/// Atomic value storage mirror for the optimistic-read fast path.
+	/// See [`atomic_keys`] for rationale.
+	pub(crate) atomic_values: SlotArray<V::Slot, LC>,
 	/// Exclusive lower bound - keys in this leaf are > lower_fence.
 	/// None means this is the leftmost leaf (no lower bound).
 	pub(crate) lower_fence: Option<K>,
@@ -3587,7 +3597,7 @@ pub(crate) struct LeafNode<K, V, const LC: usize> {
 	pub(crate) sample_key: Option<K>,
 }
 
-impl<K: fmt::Debug, V: fmt::Debug, const LC: usize> fmt::Debug for LeafNode<K, V, LC> {
+impl<K: fmt::Debug + OptimisticRead, V: fmt::Debug + OptimisticRead, const LC: usize> fmt::Debug for LeafNode<K, V, LC> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("LeafNode")
 			.field("len", &self.len.load_relaxed())
@@ -3599,12 +3609,14 @@ impl<K: fmt::Debug, V: fmt::Debug, const LC: usize> fmt::Debug for LeafNode<K, V
 	}
 }
 
-impl<K, V, const LC: usize> LeafNode<K, V, LC> {
+impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	/// Creates a new, empty leaf node.
 	pub fn new() -> LeafNode<K, V, LC> {
 		LeafNode {
 			len: AtomicLen::new(0),
 			entries: InlineVec::new(),
+			atomic_keys: SlotArray::new(),
+			atomic_values: SlotArray::new(),
 			lower_fence: None,
 			upper_fence: None,
 			sample_key: None,
@@ -3915,7 +3927,7 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	}
 }
 
-impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
+impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	/// Inserts a key-value pair at the specified position.
 	///
 	/// # Returns
@@ -4055,7 +4067,7 @@ impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
 ///
 /// Similar to leaf nodes, internal nodes have fence keys defining their
 /// key range. These are used for optimistic validation and node relocation.
-pub(crate) struct InternalNode<K, V, const IC: usize, const LC: usize> {
+pub(crate) struct InternalNode<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// Number of keys (and regular edges) in this node.
 	///
 	/// Atomic so that readers descending through this node (including
@@ -4085,7 +4097,7 @@ pub(crate) struct InternalNode<K, V, const IC: usize, const LC: usize> {
 	pub(crate) sample_key: Option<K>,
 }
 
-impl<K: fmt::Debug, V, const IC: usize, const LC: usize> fmt::Debug for InternalNode<K, V, IC, LC> {
+impl<K: fmt::Debug + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> fmt::Debug for InternalNode<K, V, IC, LC> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("InternalNode")
 			.field("len", &self.len.load_relaxed())
@@ -4099,7 +4111,7 @@ impl<K: fmt::Debug, V, const IC: usize, const LC: usize> fmt::Debug for Internal
 	}
 }
 
-impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
+impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	/// Creates a new, empty internal node.
 	pub(crate) fn new() -> InternalNode<K, V, IC, LC> {
 		InternalNode {
@@ -4460,7 +4472,7 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	}
 }
 
-impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
+impl<K: Clone + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	/// Splits this internal node, moving entries after `split_pos` to `right`.
 	///
 	/// Internal node splitting is more complex than leaf splitting because
@@ -4608,7 +4620,7 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 /// Invariant validation for testing. Validates tree structure to ensure
 /// unreachable code paths are never reached.
 #[cfg(any(test, feature = "test-utils"))]
-impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
+impl<K: Clone + Ord + std::fmt::Debug + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
 	GenericTree<K, V, IC, LC>
 {
 	/// Validates all tree invariants. Panics with diagnostic info if any invariant is violated.
