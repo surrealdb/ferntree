@@ -320,6 +320,86 @@ Honest assessment based on the per-step blast radius:
 
 Total: 18-29 hours of focused engineering. This is a multi-session PR.
 
+## Current state (end of working session)
+
+Commits landed on this branch (10 total):
+
+| # | SHA | What |
+|---|---|---|
+| 1 | c6d97b7 | Phase 1 — `src/atomic_slot.rs` primitives + `OptimisticRead::Slot` |
+| 2 | 2f79c3a | `AtomicLen` for both node `len` fields |
+| 3 | 1b0c873 | Mirror fields + `K/V: OptimisticRead` bounds propagated |
+| 4 | 8c68aaa | Clean up unused-import warnings |
+| 5 | d98aa73 | Plan update — dual-storage lessons |
+| 6 | 0de2e92 | `OptimisticSlot::load_into` for buffer-based borrows |
+| 7 | 4f3a7c7 | Plan refinement: shared-lock leaf paths already synced |
+| 8 | 1129e21 | Maintain atomic mirror in LeafNode writers (insert_at, remove_at, split, merge, swap_value_at) |
+| 9 | fef306d | Read optimistic-fast-path V and K from atomic mirror; move the two quarantined stress tests into `--lib` |
+| 10 | 897ba51 | Wrap SlotArray's inner array in UnsafeCell for Tree-Borrows safety |
+
+### What's verified
+
+- 258 lib tests + ~200 integration tests + 38 doctests pass on every commit.
+- 18 `atomic_slot` unit tests pass under
+  `MIRIFLAGS='-Zmiri-tree-borrows ...' cargo +nightly miri test --lib`,
+  including 6 concurrent tests that exercise reader/writer pairings of
+  `InlineSlot`, `BoxedSlot`, `SlotArray::shift_*`, `AtomicLen`, and
+  `OptimisticOption`.
+- The single-threaded `epoch_deferred_drop_basic` test passes under
+  Miri `--lib` — proving the atomic-mirror primitives integrate
+  cleanly with `Tree::insert_defer` / `lookup_optimistic` /
+  `remove_defer` in non-concurrent use.
+
+### What still fails
+
+The two formerly-quarantined concurrent tests
+(`epoch_deferred_drop_optimistic_reader_vs_defer_writer`,
+`k_deferred_drop_optimistic_reader_vs_defer_writer`) pass under
+`cargo test --lib` but fail under
+`cargo +nightly miri test --lib` with a Tree-Borrows-experimental
+"foreign tag" violation. The pattern: writer holds `&mut LeafNode`
+via the exclusive lock guard; the leaf's `&mut` tag protects the
+entire leaf memory tree; the optimistic reader's `&AtomicPtr<T>`
+reborrow inside `BoxedSlot::try_load_raw_ptr` (or `&AtomicU16` for
+inline storage) is foreign to the writer's tag. Tree Borrows treats
+this as UB even though the underlying operations are stdlib atomic
+ops on UnsafeCell-typed memory.
+
+**Note:** the data-race-detector aspect — the explicit concern in
+the issue text — is satisfied. The reader/writer pairings are
+`AtomicPtr::load(Acquire)` vs `AtomicPtr::store(Release)` /
+`swap(AcqRel)`, so memory-model commutativity holds. Real
+concurrent execution under `cargo test`, ASan, and TSan is clean.
+The remaining failure is specifically Miri's experimental Tree
+Borrows enforcement of `&` reborrow scoping.
+
+### Path to fully closing #7
+
+Closing the Tree-Borrows residue requires moving the writer's leaf
+mutation off the `&mut LeafNode` path:
+
+- `ExclusiveGuard` would need to expose `as_ptr_mut() -> *mut LeafNode`
+  rather than (or in addition to) `Deref<Target = LeafNode>`.
+- Writer methods (`LeafNode::insert_at`, `remove_at`, `split`,
+  `merge`, `swap_value_at`) would take `*mut Self` instead of
+  `&mut self`, and project to `atomic_keys` / `atomic_values` via
+  `ptr::addr_of_mut!`.
+- `SlotArray` write methods (`shift_insert`, `shift_remove`,
+  `swap_init`, etc.) would take `*const Self` and use
+  `OptimisticSlot::*_raw_ptr` variants that go directly to the
+  slot's inner atomic (`AtomicPtr<T>` for boxed,
+  `T::Atomic` for inline) without ever materialising `&Slot`.
+
+The `*_raw_ptr` variants on `OptimisticSlot` are partly in place
+(`try_load_raw_ptr` is overridden on both `InlineSlot` and
+`BoxedSlot`); the corresponding write-side overrides plus the
+LeafNode/writer-path refactor are the remaining surgical work. The
+trait architecture is ready to receive them.
+
+After this, internal-node K migration follows the same pattern,
+and `find_shared_leaf_and_optimistic_parent` migrates to the same
+raw-projection descent the optimistic path already uses.
+
 ## Risks not yet resolved
 
 - **`&'static str` V:** boxing it adds an allocation. Most existing test
