@@ -393,13 +393,13 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 			let anchor = match *cursor {
 				Cursor::Before(pos) => {
 					// We're before position `pos`
-					if pos >= leaf.len {
+					if pos >= leaf.len.load() {
 						// Past the end of this leaf
-						if leaf.len > 0 {
+						if leaf.len.load() > 0 {
 							// Anchor after the last key in this leaf
 							Anchor::After(
-								leaf.key_at(leaf.len - 1)
-									.expect("leaf.len > 0 implies key exists at len-1")
+								leaf.key_at(leaf.len.load() - 1)
+									.expect("leaf.len.load() > 0 implies key exists at len-1")
 									.clone(),
 							)
 						} else if let Some(k) = &leaf.lower_fence {
@@ -413,19 +413,19 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 						// Normal case - anchor before the key at this position
 						Anchor::Before(
 							leaf.key_at(pos)
-								.expect("pos < leaf.len implies key exists at pos")
+								.expect("pos < leaf.len.load() implies key exists at pos")
 								.clone(),
 						)
 					}
 				}
 				Cursor::After(pos) => {
 					// We're after position `pos`
-					if pos >= leaf.len {
+					if pos >= leaf.len.load() {
 						// Position is past leaf bounds
-						if leaf.len > 0 {
+						if leaf.len.load() > 0 {
 							Anchor::After(
-								leaf.key_at(leaf.len - 1)
-									.expect("leaf.len > 0 implies key exists at len-1")
+								leaf.key_at(leaf.len.load() - 1)
+									.expect("leaf.len.load() > 0 implies key exists at len-1")
 									.clone(),
 							)
 						} else if let Some(k) = &leaf.upper_fence {
@@ -437,7 +437,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 						// Normal case - anchor after the key at this position
 						Anchor::After(
 							leaf.key_at(pos)
-								.expect("pos < leaf.len implies key exists at pos")
+								.expect("pos < leaf.len.load() implies key exists at pos")
 								.clone(),
 						)
 					}
@@ -501,11 +501,11 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 
 				match *cursor {
 					// If before a valid position, we have more entries in this leaf
-					Cursor::Before(pos) if pos < leaf.len => {
+					Cursor::Before(pos) if pos < leaf.len.load() => {
 						return LeafResult::Retry;
 					}
 					// If after a position and there are more entries after
-					Cursor::After(pos) if (pos + 1) < leaf.len => {
+					Cursor::After(pos) if (pos + 1) < leaf.len.load() => {
 						return LeafResult::Retry;
 					}
 					_ => {}
@@ -625,7 +625,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 			if let Some((parent_guard, p_cursor)) = self.parent.as_ref() {
 				// Check if sibling is within the same parent
 				let bounded_pos = match direction {
-					Direction::Forward if *p_cursor < parent_guard.as_internal().len => {
+					Direction::Forward if *p_cursor < parent_guard.as_internal().len.load() => {
 						Some(*p_cursor + 1)
 					}
 					Direction::Reverse if *p_cursor > 0 => Some(*p_cursor - 1),
@@ -668,7 +668,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				// Set cursor to start (Forward) or end (Reverse) of new leaf
 				let l_cursor = match direction {
 					Direction::Forward => Cursor::Before(0),
-					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len - 1),
+					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len.load() - 1),
 				};
 
 				self.leaf = Some((leaf_guard, l_cursor));
@@ -682,7 +682,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 			Ok(Outcome::LeafAndParent(leaf_guard, parent_guard, p_cursor)) => {
 				let l_cursor = match direction {
 					Direction::Forward => Cursor::Before(0),
-					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len - 1),
+					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len.load() - 1),
 				};
 
 				self.leaf = Some((leaf_guard, l_cursor));
@@ -730,7 +730,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 
 		// Find position within the leaf
 		let leaf = guard.as_leaf();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 		let (pos, _) = leaf.lower_bound(key);
 
 		// Set cursor before the found position (or end if past bounds)
@@ -769,7 +769,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		};
 
 		let leaf = guard.as_leaf();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 		let (pos, exact) = leaf.lower_bound(key);
 
 		// Position cursor based on whether we found an exact match
@@ -820,7 +820,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		};
 
 		let leaf = guard.as_leaf();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 		let (pos, exact) = leaf.lower_bound(key);
 
 		// Always position before the found position
@@ -883,7 +883,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		};
 
 		// Position after the last entry (before position = len)
-		let leaf_len = guard.as_leaf().len;
+		let leaf_len = guard.as_leaf().len.load();
 		self.leaf = Some((guard, Cursor::Before(leaf_len)));
 		self.parent = parent_opt;
 	}
@@ -912,7 +912,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		loop {
 			// Determine what to return based on current cursor position
 			let opt = match self.leaf.as_ref() {
-				Some((guard, cursor)) => cursor.next_entry(guard.as_leaf().len),
+				Some((guard, cursor)) => cursor.next_entry(guard.as_leaf().len.load()),
 				None => return None,
 			};
 
@@ -921,7 +921,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				let (guard, cursor) = self.leaf.as_mut().unwrap();
 				let leaf = guard.as_leaf();
 				*cursor = new_cursor;
-				// SAFETY: cursor.next_entry() already validated that curr_pos < leaf.len
+				// SAFETY: cursor.next_entry() already validated that curr_pos < leaf.len.load()
 				return Some(unsafe { leaf.kv_at_unchecked(curr_pos) });
 			} else {
 				// Current leaf exhausted - try to move to next leaf
@@ -1009,14 +1009,14 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 			// Get position to return (or None if at end of leaf)
 			// This captures the position as a value, ending the borrow
 			let pos_opt = match self.leaf.as_ref() {
-				Some((guard, cursor)) => cursor.peek_next_pos(guard.as_leaf().len),
+				Some((guard, cursor)) => cursor.peek_next_pos(guard.as_leaf().len.load()),
 				None => return None,
 			};
 
 			if let Some(pos) = pos_opt {
 				// Return entry at position (new borrow)
 				let (guard, _) = self.leaf.as_ref().unwrap();
-				// SAFETY: peek_next_pos() already validated that pos < leaf.len
+				// SAFETY: peek_next_pos() already validated that pos < leaf.len.load()
 				return Some(unsafe { guard.as_leaf().kv_at_unchecked(pos) });
 			} else {
 				// At end of current leaf - try to move to next leaf
@@ -1106,7 +1106,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		};
 
 		let leaf = guard.as_leaf();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 
 		// Determine starting position based on cursor state
 		let start = match *cursor {
@@ -1121,7 +1121,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		// - leaf_len is the actual length of the leaf
 		// - the loop only iterates while i < leaf_len
 		for i in start..leaf_len {
-			// SAFETY: `i < leaf_len == leaf.len <= leaf.entries.len()`, per the
+			// SAFETY: `i < leaf_len == leaf.len.load() <= leaf.entries.len()`, per the
 			// loop bound above.
 			let (k, v) = unsafe { leaf.kv_at_unchecked(i) };
 			f(k, v);
@@ -1245,11 +1245,11 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			let leaf = guard.as_leaf();
 			let anchor = match *cursor {
 				Cursor::Before(pos) => {
-					if pos >= leaf.len {
-						if leaf.len > 0 {
+					if pos >= leaf.len.load() {
+						if leaf.len.load() > 0 {
 							Anchor::After(
-								leaf.key_at(leaf.len - 1)
-									.expect("leaf.len > 0 implies key exists at len-1")
+								leaf.key_at(leaf.len.load() - 1)
+									.expect("leaf.len.load() > 0 implies key exists at len-1")
 									.clone(),
 							)
 						} else if let Some(k) = &leaf.lower_fence {
@@ -1260,17 +1260,17 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 					} else {
 						Anchor::Before(
 							leaf.key_at(pos)
-								.expect("pos < leaf.len implies key exists at pos")
+								.expect("pos < leaf.len.load() implies key exists at pos")
 								.clone(),
 						)
 					}
 				}
 				Cursor::After(pos) => {
-					if pos >= leaf.len {
-						if leaf.len > 0 {
+					if pos >= leaf.len.load() {
+						if leaf.len.load() > 0 {
 							Anchor::After(
-								leaf.key_at(leaf.len - 1)
-									.expect("leaf.len > 0 implies key exists at len-1")
+								leaf.key_at(leaf.len.load() - 1)
+									.expect("leaf.len.load() > 0 implies key exists at len-1")
 									.clone(),
 							)
 						} else if let Some(k) = &leaf.upper_fence {
@@ -1281,7 +1281,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 					} else {
 						Anchor::After(
 							leaf.key_at(pos)
-								.expect("pos < leaf.len implies key exists at pos")
+								.expect("pos < leaf.len.load() implies key exists at pos")
 								.clone(),
 						)
 					}
@@ -1325,10 +1325,10 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				let (guard, cursor) = self.leaf.as_ref().unwrap();
 				let leaf = guard.as_leaf();
 				match *cursor {
-					Cursor::Before(pos) if pos < leaf.len => {
+					Cursor::Before(pos) if pos < leaf.len.load() => {
 						return LeafResult::Retry;
 					}
-					Cursor::After(pos) if (pos + 1) < leaf.len => {
+					Cursor::After(pos) if (pos + 1) < leaf.len.load() => {
 						return LeafResult::Retry;
 					}
 					_ => {}
@@ -1414,7 +1414,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		let optimistic_perform = || {
 			if let Some((parent_guard, p_cursor)) = self.parent.as_ref() {
 				let bounded_pos = match direction {
-					Direction::Forward if *p_cursor < parent_guard.as_internal().len => {
+					Direction::Forward if *p_cursor < parent_guard.as_internal().len.load() => {
 						Some(*p_cursor + 1)
 					}
 					Direction::Reverse if *p_cursor > 0 => Some(*p_cursor - 1),
@@ -1453,7 +1453,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			Ok(Outcome::Leaf(leaf_guard, p_cursor)) => {
 				let l_cursor = match direction {
 					Direction::Forward => Cursor::Before(0),
-					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len - 1),
+					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len.load() - 1),
 				};
 
 				self.leaf = Some((leaf_guard, l_cursor));
@@ -1466,7 +1466,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			Ok(Outcome::LeafAndParent(leaf_guard, parent_guard, p_cursor)) => {
 				let l_cursor = match direction {
 					Direction::Forward => Cursor::Before(0),
-					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len - 1),
+					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len.load() - 1),
 				};
 
 				self.leaf = Some((leaf_guard, l_cursor));
@@ -1507,7 +1507,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		};
 
 		let leaf = guard.as_leaf();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 		let (pos, _) = leaf.lower_bound(key);
 		if pos >= leaf_len {
 			self.leaf = Some((guard, Cursor::Before(leaf_len)));
@@ -1540,7 +1540,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		};
 
 		let leaf = guard.as_leaf();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 		let (pos, exact) = leaf.lower_bound(key);
 		if exact {
 			self.leaf = Some((guard, Cursor::After(pos)));
@@ -1582,7 +1582,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		};
 
 		let leaf = guard.as_leaf();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 		let (pos, exact) = leaf.lower_bound(key);
 		if pos >= leaf_len {
 			self.leaf = Some((guard, Cursor::Before(leaf_len)));
@@ -1633,7 +1633,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			}
 		};
 
-		let leaf_len = guard.as_leaf().len;
+		let leaf_len = guard.as_leaf().len.load();
 		self.leaf = Some((guard, Cursor::Before(leaf_len)));
 		self.parent = parent_opt;
 	}
@@ -1808,7 +1808,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				};
 
 				let leaf = guard.as_leaf_mut();
-				if pos >= leaf.len {
+				if pos >= leaf.len.load() {
 					return None;
 				}
 
@@ -1853,7 +1853,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				let removed = match cursor {
 					Cursor::Before(pos) => {
 						let curr_pos = *pos;
-						if curr_pos < leaf.len {
+						if curr_pos < leaf.len.load() {
 							Some(leaf.remove_at(curr_pos))
 						} else {
 							None
@@ -1862,7 +1862,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 					Cursor::After(pos) => {
 						let pos = *pos;
 						let curr_pos = pos + 1;
-						if curr_pos < leaf.len {
+						if curr_pos < leaf.len.load() {
 							Some(leaf.remove_at(curr_pos))
 						} else {
 							None
@@ -1914,7 +1914,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 	pub fn next(&mut self) -> Option<(&K, &mut V)> {
 		loop {
 			let opt = match self.leaf.as_ref() {
-				Some((guard, cursor)) => cursor.next_entry(guard.as_leaf().len),
+				Some((guard, cursor)) => cursor.next_entry(guard.as_leaf().len.load()),
 				None => return None,
 			};
 
@@ -1923,7 +1923,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				// Get mutable access to the leaf
 				let leaf = guard.as_leaf_mut();
 				*cursor = new_cursor;
-				// SAFETY: cursor.next_entry() already validated that curr_pos < leaf.len
+				// SAFETY: cursor.next_entry() already validated that curr_pos < leaf.len.load()
 				return Some(unsafe { leaf.kv_at_mut_unchecked(curr_pos) });
 			} else {
 				match self.next_leaf() {
@@ -1976,14 +1976,14 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		loop {
 			// Get position to return (or None if at end of leaf)
 			let pos_opt = match self.leaf.as_ref() {
-				Some((guard, cursor)) => cursor.peek_next_pos(guard.as_leaf().len),
+				Some((guard, cursor)) => cursor.peek_next_pos(guard.as_leaf().len.load()),
 				None => return None,
 			};
 
 			if let Some(pos) = pos_opt {
 				// Return entry at position (new mutable borrow)
 				let (guard, _) = self.leaf.as_mut().unwrap();
-				// SAFETY: peek_next_pos() already validated that pos < leaf.len
+				// SAFETY: peek_next_pos() already validated that pos < leaf.len.load()
 				return Some(unsafe { guard.as_leaf_mut().kv_at_mut_unchecked(pos) });
 			} else {
 				// At end of current leaf - try to move to next leaf
@@ -2048,7 +2048,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		};
 
 		let leaf = guard.as_leaf_mut();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 
 		// Determine starting position based on cursor state
 		let start = match *cursor {
@@ -2063,7 +2063,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		// - leaf_len is the actual length of the leaf
 		// - the loop only iterates while i < leaf_len
 		for i in start..leaf_len {
-			// SAFETY: `i < leaf_len == leaf.len <= leaf.entries.len()`, per
+			// SAFETY: `i < leaf_len == leaf.len.load() <= leaf.entries.len()`, per
 			// the loop bound above.
 			let (k, v) = unsafe { leaf.kv_at_mut_unchecked(i) };
 			f(k, v);

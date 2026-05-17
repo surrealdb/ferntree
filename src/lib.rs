@@ -271,6 +271,7 @@ pub(crate) mod sync;
 use sync::epoch::{self as epoch, Atomic, Owned};
 use sync::{AtomicUsize, Ordering};
 
+use atomic_slot::AtomicLen;
 use inline_vec::InlineVec;
 use latch::{ExclusiveGuard, HybridGuard, HybridLatch, OptimisticGuard, SharedGuard};
 pub use optimistic::OptimisticRead;
@@ -418,7 +419,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		// Structure: root_latch -> Atomic -> node_latch -> Node::Leaf
 		GenericTree {
 			root: HybridLatch::new(Atomic::new(HybridLatch::new(Node::Leaf(LeafNode {
-				len: 0,
+				len: AtomicLen::new(0),
 				entries: InlineVec::new(),
 				// No fences for the root leaf - it covers the entire key space
 				lower_fence: None,
@@ -661,7 +662,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		// For Forward: can we go to pos+1?
 		// For Reverse: can we go to pos-1?
 		let within_bounds = match direction {
-			Direction::Forward => pos < parent_guard.as_internal().len,
+			Direction::Forward => pos < parent_guard.as_internal().len.load(),
 			Direction::Reverse => pos > 0,
 		};
 
@@ -711,7 +712,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 				// Check if there's a sibling at this level
 				let within_bounds = match direction {
-					Direction::Forward => pos < parent_guard.as_internal().len,
+					Direction::Forward => pos < parent_guard.as_internal().len.load(),
 					Direction::Reverse => pos > 0,
 				};
 
@@ -872,7 +873,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 					// - Reverse (seeking last): take rightmost child (position len = upper_edge)
 					let pos = match direction {
 						Direction::Forward => 0,
-						Direction::Reverse => internal.len,
+						Direction::Reverse => internal.len.load(),
 					};
 					let swip = internal.edge_at(pos)?;
 					(swip, pos)
@@ -2364,12 +2365,12 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 						// Root is an internal node that needs splitting
 
 						// Don't split if too small (need at least 3 keys to split)
-						if root_internal_node.len <= 2 {
+						if root_internal_node.len.load() <= 2 {
 							return Ok(());
 						}
 
 						// Choose the middle position for the split
-						let split_pos = root_internal_node.len / 2;
+						let split_pos = root_internal_node.len.load() / 2;
 						let split_key = root_internal_node
 							.key_at(split_pos)
 							.expect("split position must be within node bounds")
@@ -2403,12 +2404,12 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 						// Root is a leaf that needs splitting (tree is growing from height 1 to 2)
 
 						// Don't split if too small
-						if root_leaf_node.len <= 2 {
+						if root_leaf_node.len.load() <= 2 {
 							return Ok(());
 						}
 
 						// Choose the middle position for the split
-						let split_pos = root_leaf_node.len / 2;
+						let split_pos = root_leaf_node.len.load() / 2;
 						let split_key = root_leaf_node
 							.key_at(split_pos)
 							.expect("split position must be within node bounds")
@@ -2481,12 +2482,12 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 							// Splitting an internal node
 
 							// Don't split if too small
-							if left_internal.len <= 2 {
+							if left_internal.len.load() <= 2 {
 								return Ok(());
 							}
 
 							// Choose split position
-							let split_pos = left_internal.len / 2;
+							let split_pos = left_internal.len.load() / 2;
 							let split_key = left_internal
 								.key_at(split_pos)
 								.expect("split position must be within node bounds")
@@ -2514,7 +2515,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 							// Insert the new separator key and right child into parent
 							// After split: left node has lower keys, right node has higher keys.
 							// Left node stays at current position, right node is inserted after.
-							if pos == parent_internal.len {
+							if pos == parent_internal.len.load() {
 								// Node was at upper_edge - it becomes the left.
 								// Insert split key and make right the new upper_edge.
 								let left_edge = std::mem::replace(
@@ -2532,12 +2533,12 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 							// Splitting a leaf node
 
 							// Don't split if too small
-							if left_leaf.len <= 2 {
+							if left_leaf.len.load() <= 2 {
 								return Ok(());
 							}
 
 							// Choose split position
-							let split_pos = left_leaf.len / 2;
+							let split_pos = left_leaf.len.load() / 2;
 							let split_key = left_leaf
 								.key_at(split_pos)
 								.expect("split position must be within node bounds")
@@ -2565,7 +2566,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 							// Insert the new separator and right child into parent
 							// After split: left node has lower keys, right node has higher keys.
 							// Left node stays at current position, right node is inserted after.
-							if pos == parent_internal.len {
+							if pos == parent_internal.len.load() {
 								// Node was at upper_edge - it becomes the left.
 								// Insert split key and make right the new upper_edge.
 								let left_edge = std::mem::replace(
@@ -2664,7 +2665,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 				mut parent_guard,
 				pos,
 			} => {
-				let parent_len = parent_guard.as_internal().len;
+				let parent_len = parent_guard.as_internal().len.load();
 
 				// Re-acquire the target through lock coupling
 				let swip = parent_guard.as_internal().edge_at(pos)?;
@@ -3228,7 +3229,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 				let (leaf_guard, _parent_opt) = self.find_first_leaf_and_parent(&eg)?;
 
 				// Check if the first leaf has any entries
-				let is_empty = leaf_guard.as_leaf().len == 0;
+				let is_empty = leaf_guard.as_leaf().len.load() == 0;
 
 				// Validate our optimistic read
 				leaf_guard.recheck()?;
@@ -3519,14 +3520,14 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 			Node::Internal(ref internal) => match other {
 				Node::Internal(ref other) => {
 					// +1 for the separator key that gets added during merge
-					((internal.len + 1 + other.len) as usize) < IC
+					((internal.len.load() + 1 + other.len.load()) as usize) < IC
 				}
 				_ => false, // Can't merge internal with leaf
 			},
 			Node::Leaf(ref leaf) => match other {
 				Node::Leaf(ref other) => {
 					// Leaf merge doesn't add a separator key
-					((leaf.len + other.len) as usize) < LC
+					((leaf.len.load() + other.len.load()) as usize) < LC
 				}
 				_ => false, // Can't merge leaf with internal
 			},
@@ -3563,7 +3564,12 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 /// changes. Set during splits.
 pub(crate) struct LeafNode<K, V, const LC: usize> {
 	/// Number of key-value pairs in this leaf.
-	pub(crate) len: u16,
+	///
+	/// Atomic so that the optimistic-read fast path can load it
+	/// concurrently with writer updates without violating the C/Rust
+	/// memory model's data-race rules. Writers (under exclusive lock)
+	/// use `Release` stores; readers use `Acquire` loads.
+	pub(crate) len: AtomicLen,
 	/// Sorted array of key-value pairs (interleaved for cache locality).
 	///
 	/// Backed by [`InlineVec`] rather than `SmallVec` so the optimistic
@@ -3584,7 +3590,7 @@ pub(crate) struct LeafNode<K, V, const LC: usize> {
 impl<K: fmt::Debug, V: fmt::Debug, const LC: usize> fmt::Debug for LeafNode<K, V, LC> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("LeafNode")
-			.field("len", &self.len)
+			.field("len", &self.len.load_relaxed())
 			.field("entries", &self.entries)
 			.field("lower_fence", &self.lower_fence)
 			.field("upper_fence", &self.upper_fence)
@@ -3597,7 +3603,7 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	/// Creates a new, empty leaf node.
 	pub fn new() -> LeafNode<K, V, LC> {
 		LeafNode {
-			len: 0,
+			len: AtomicLen::new(0),
 			entries: InlineVec::new(),
 			lower_fence: None,
 			upper_fence: None,
@@ -3619,7 +3625,7 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	/// # Concurrency Safety
 	///
 	/// Uses safe bounds checking to handle concurrent access. Under optimistic
-	/// locking, `self.len` may be inconsistent with `self.entries.len()` during
+	/// locking, `self.len.load_relaxed()` may be inconsistent with `self.entries.len()` during
 	/// concurrent modifications. The caller's recheck will detect this, but
 	/// we must not cause undefined behavior in the meantime.
 	#[inline]
@@ -3637,14 +3643,14 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 		if let Some(fk) = self.upper_fence() {
 			if key > fk.borrow() {
 				// Key is above our range - would be at position len
-				return (self.len, false);
+				return (self.len.load_relaxed(), false);
 			}
 		}
 
 		// Use actual entries length for safe bounds - handles concurrent modifications
 		let entries_len = self.entries.len() as u16;
 		let mut lower = 0;
-		let mut upper = self.len.min(entries_len);
+		let mut upper = self.len.load_relaxed().min(entries_len);
 
 		while lower < upper {
 			let mid = ((upper - lower) / 2) + lower;
@@ -3699,7 +3705,7 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	pub(crate) unsafe fn len_raw(this: *const Self) -> u16 {
 		// SAFETY: `len` is a u16 at a known field offset; the read is an
 		// unsynchronised aligned load with no retag.
-		unsafe { ptr::read(ptr::addr_of!((*this).len)) }
+		unsafe { AtomicLen::load_raw(ptr::addr_of!((*this).len)) }
 	}
 
 	/// Returns a raw pointer to the entries array via projection.
@@ -3843,7 +3849,7 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	///
 	/// # Safety
 	///
-	/// Caller must ensure `pos < self.len` and `pos < self.entries.len()`.
+	/// Caller must ensure `pos < self.len.load_relaxed()` and `pos < self.entries.len()`.
 	/// This is intended for use in iterator hot paths where position has already been validated.
 	#[inline]
 	pub(crate) unsafe fn kv_at_unchecked(&self, pos: u16) -> (&K, &V) {
@@ -3856,7 +3862,7 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	///
 	/// # Safety
 	///
-	/// Caller must ensure `pos < self.len` and `pos < self.entries.len()`.
+	/// Caller must ensure `pos < self.len.load_relaxed()` and `pos < self.entries.len()`.
 	/// This is intended for use in iterator hot paths where position has already been validated.
 	#[inline]
 	pub(crate) unsafe fn kv_at_mut_unchecked(&mut self, pos: u16) -> (&K, &mut V) {
@@ -3868,18 +3874,18 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	/// Returns `true` if there's room for another entry.
 	#[inline]
 	pub(crate) fn has_space(&self) -> bool {
-		(self.len as usize) < LC
+		(self.len.load_relaxed() as usize) < LC
 	}
 
 	/// Returns `true` if the node is below minimum occupancy (40% of capacity).
 	#[inline]
 	pub(crate) fn is_underfull(&self) -> bool {
-		(self.len as usize) * 10 < LC * 4
+		(self.len.load_relaxed() as usize) * 10 < LC * 4
 	}
 
 	/// Removes and returns the key-value pair at the specified position.
 	pub(crate) fn remove_at(&mut self, pos: u16) -> (K, V) {
-		self.len -= 1;
+		self.len.fetch_sub(1);
 		self.entries.remove(pos as usize)
 	}
 
@@ -3928,7 +3934,7 @@ impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
 
 		// Insert the entry at the specified position
 		self.entries.insert(pos as usize, (key, value));
-		self.len += 1;
+		self.len.fetch_add(1);
 
 		Some(pos)
 	}
@@ -3975,8 +3981,8 @@ impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
 		right.sample_key = Some(right.entries[0].0.clone());
 
 		// Update lengths
-		right.len = right.entries.len() as u16;
-		self.len = self.entries.len() as u16;
+		right.len.store(right.entries.len() as u16);
+		self.len.store(self.entries.len() as u16);
 	}
 
 	/// Merges the `right` leaf into `self`.
@@ -3989,12 +3995,12 @@ impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
 	/// - `false` if combined size would exceed capacity
 	pub(crate) fn merge(&mut self, right: &mut LeafNode<K, V, LC>) -> bool {
 		// Check if combined entries fit
-		if (self.len + right.len) as usize > LC {
+		if (self.len.load_relaxed() + right.len.load()) as usize > LC {
 			return false;
 		}
 
 		// Mark right as empty
-		right.len = 0;
+		right.len.store(0);
 
 		// Inherit right's upper fence (we now cover its range too)
 		self.upper_fence = right.upper_fence.take();
@@ -4011,7 +4017,7 @@ impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
 		}
 
 		// Update length
-		self.len = self.entries.len() as u16;
+		self.len.store(self.entries.len() as u16);
 		true
 	}
 }
@@ -4051,7 +4057,11 @@ impl<K: Clone, V, const LC: usize> LeafNode<K, V, LC> {
 /// key range. These are used for optimistic validation and node relocation.
 pub(crate) struct InternalNode<K, V, const IC: usize, const LC: usize> {
 	/// Number of keys (and regular edges) in this node.
-	pub(crate) len: u16,
+	///
+	/// Atomic so that readers descending through this node (including
+	/// shared-lock readers which hold only an optimistic guard on the
+	/// internal node) can load it without violating the data-race rules.
+	pub(crate) len: AtomicLen,
 	/// Separator keys, sorted in ascending order.
 	///
 	/// Backed by [`InlineVec`] — see the comment on `LeafNode::entries`.
@@ -4078,7 +4088,7 @@ pub(crate) struct InternalNode<K, V, const IC: usize, const LC: usize> {
 impl<K: fmt::Debug, V, const IC: usize, const LC: usize> fmt::Debug for InternalNode<K, V, IC, LC> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("InternalNode")
-			.field("len", &self.len)
+			.field("len", &self.len.load_relaxed())
 			.field("keys", &self.keys)
 			.field("edges", &self.edges)
 			.field("upper_edge", &self.upper_edge)
@@ -4093,7 +4103,7 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	/// Creates a new, empty internal node.
 	pub(crate) fn new() -> InternalNode<K, V, IC, LC> {
 		InternalNode {
-			len: 0,
+			len: AtomicLen::new(0),
 			keys: InlineVec::new(),
 			edges: InlineVec::new(),
 			upper_edge: Atomic::null(),
@@ -4131,14 +4141,14 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 
 		if let Some(fk) = self.upper_fence() {
 			if key > fk.borrow() {
-				return (self.len, false);
+				return (self.len.load_relaxed(), false);
 			}
 		}
 
 		// Use actual keys length for safe bounds - handles concurrent modifications
 		let keys_len = self.keys.len() as u16;
 		let mut lower = 0;
-		let mut upper = self.len.min(keys_len);
+		let mut upper = self.len.load_relaxed().min(keys_len);
 
 		while lower < upper {
 			let mid = ((upper - lower) / 2) + lower;
@@ -4190,7 +4200,7 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	#[inline]
 	pub(crate) unsafe fn len_raw(this: *const Self) -> u16 {
 		// SAFETY: `len` is a u16 at a known field offset.
-		unsafe { ptr::read(ptr::addr_of!((*this).len)) }
+		unsafe { AtomicLen::load_raw(ptr::addr_of!((*this).len)) }
 	}
 
 	/// Returns a raw pointer to the keys array via projection.
@@ -4328,7 +4338,7 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 		&self,
 		pos: u16,
 	) -> error::Result<&Atomic<HybridLatch<Node<K, V, IC, LC>>>> {
-		if pos == self.len {
+		if pos == self.len.load_relaxed() {
 			// Rightmost child - use upper_edge. We detect "no upper
 			// edge" via a null-pointer sentinel (rather than Option's
 			// None) because the optimistic fast path projects through
@@ -4364,13 +4374,13 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	/// Returns `true` if there's room for another key/edge pair.
 	#[inline]
 	pub(crate) fn has_space(&self) -> bool {
-		(self.len as usize) < IC
+		(self.len.load_relaxed() as usize) < IC
 	}
 
 	/// Returns `true` if the node is below minimum occupancy (40%).
 	#[inline]
 	pub(crate) fn is_underfull(&self) -> bool {
-		(self.len as usize) * 10 < IC * 4
+		(self.len.load_relaxed() as usize) * 10 < IC * 4
 	}
 
 	/// Inserts a key and its left child pointer.
@@ -4403,7 +4413,7 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 			// Insert key and edge at the found position
 			self.keys.insert(pos as usize, key);
 			self.edges.insert(pos as usize, value);
-			self.len += 1;
+			self.len.fetch_add(1);
 		}
 		Some(pos)
 	}
@@ -4412,7 +4422,7 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	pub(crate) fn remove_at(&mut self, pos: u16) -> (K, Atomic<HybridLatch<Node<K, V, IC, LC>>>) {
 		let key = self.keys.remove(pos as usize);
 		let edge = self.edges.remove(pos as usize);
-		self.len -= 1;
+		self.len.fetch_sub(1);
 
 		(key, edge)
 	}
@@ -4446,7 +4456,7 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 		self.keys.insert(pos as usize, key);
 		// Insert edge at position pos+1 (right child, after the left child at pos)
 		self.edges.insert((pos + 1) as usize, edge);
-		self.len += 1;
+		self.len.fetch_add(1);
 	}
 }
 
@@ -4512,8 +4522,8 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 		right.sample_key = Some(right.keys[0].clone());
 
 		// Update lengths
-		right.len = right.keys.len() as u16;
-		self.len = self.keys.len() as u16;
+		right.len.store(right.keys.len() as u16);
+		self.len.store(self.keys.len() as u16);
 	}
 
 	/// Merges the `right` internal node into `self`.
@@ -4542,7 +4552,7 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	pub(crate) fn merge(&mut self, right: &mut InternalNode<K, V, IC, LC>) -> bool {
 		// Check if combined entries fit
 		// +1 for the separator key that gets added back
-		if (self.len + right.len + 1) as usize > IC {
+		if (self.len.load_relaxed() + right.len.load() + 1) as usize > IC {
 			return false;
 		}
 
@@ -4584,8 +4594,8 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 		}
 
 		// Update lengths
-		self.len = self.keys.len() as u16;
-		right.len = 0;
+		self.len.store(self.keys.len() as u16);
+		right.len.store(0);
 
 		true
 	}
@@ -4669,10 +4679,10 @@ impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
 
 				// Invariant 6: Length consistency
 				assert_eq!(
-					leaf.len as usize,
+					leaf.len.load() as usize,
 					leaf.entries.len(),
 					"Leaf len {} != entries.len() {}",
-					leaf.len,
+					leaf.len.load(),
 					leaf.entries.len()
 				);
 
@@ -4745,10 +4755,10 @@ impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
 
 				// Invariant 6: Length consistency
 				assert_eq!(
-					internal.len as usize,
+					internal.len.load() as usize,
 					internal.keys.len(),
 					"Internal len {} != keys.len() {}",
-					internal.len,
+					internal.len.load(),
 					internal.keys.len()
 				);
 				assert_eq!(
@@ -5202,7 +5212,7 @@ mod tests {
 		assert!(leaf.insert_at(1, 30, 300).is_some());
 		assert!(leaf.insert_at(1, 20, 200).is_some()); // Insert in middle
 
-		assert_eq!(leaf.len, 3);
+		assert_eq!(leaf.len.load(), 3);
 		assert_eq!(*leaf.key_at(0).unwrap(), 10);
 		assert_eq!(*leaf.key_at(1).unwrap(), 20);
 		assert_eq!(*leaf.key_at(2).unwrap(), 30);
@@ -5210,7 +5220,7 @@ mod tests {
 		let (k, v) = leaf.remove_at(1);
 		assert_eq!(k, 20);
 		assert_eq!(v, 200);
-		assert_eq!(leaf.len, 2);
+		assert_eq!(leaf.len.load(), 2);
 	}
 
 	#[test]
@@ -5224,8 +5234,8 @@ mod tests {
 		left.split(&mut right, 5);
 
 		// Left should have keys 0-50, right should have keys 60-90
-		assert_eq!(left.len, 6); // 0, 10, 20, 30, 40, 50
-		assert_eq!(right.len, 4); // 60, 70, 80, 90
+		assert_eq!(left.len.load(), 6); // 0, 10, 20, 30, 40, 50
+		assert_eq!(right.len.load(), 4); // 60, 70, 80, 90
 
 		// Check fence keys
 		assert!(left.lower_fence.is_none()); // Left keeps original lower fence
@@ -5256,7 +5266,7 @@ mod tests {
 		let result = left.merge(&mut right);
 		assert!(result);
 
-		assert_eq!(left.len, 4);
+		assert_eq!(left.len.load(), 4);
 		assert_eq!(*left.key_at(0).unwrap(), 10);
 		assert_eq!(*left.key_at(1).unwrap(), 20);
 		assert_eq!(*left.key_at(2).unwrap(), 30);
@@ -5268,7 +5278,7 @@ mod tests {
 		assert_eq!(left.sample_key, Some(30));
 
 		// Right should be empty
-		assert_eq!(right.len, 0);
+		assert_eq!(right.len.load(), 0);
 	}
 
 	#[test]
@@ -5286,8 +5296,8 @@ mod tests {
 		let result = left.merge(&mut right);
 		assert!(!result);
 		// Both should be unchanged
-		assert_eq!(left.len, 3);
-		assert_eq!(right.len, 2);
+		assert_eq!(left.len.load(), 3);
+		assert_eq!(right.len.load(), 2);
 	}
 
 	#[test]
@@ -5344,7 +5354,7 @@ mod tests {
 		internal.keys.push(10);
 		internal.keys.push(20);
 		internal.keys.push(30);
-		internal.len = 3;
+		internal.len.store(3);
 
 		let (pos, exact) = internal.lower_bound(&5);
 		assert_eq!(pos, 0); // < 10, go to child 0
@@ -5372,10 +5382,10 @@ mod tests {
 		let mut internal: InternalNode<i32, i32, 3, 64> = InternalNode::new();
 		assert!(internal.has_space());
 
-		internal.len = 2;
+		internal.len.store(2);
 		assert!(internal.has_space());
 
-		internal.len = 3;
+		internal.len.store(3);
 		assert!(!internal.has_space());
 	}
 
@@ -5384,10 +5394,10 @@ mod tests {
 		// With capacity 10, underfull threshold is 4 (40%)
 		let mut internal: InternalNode<i32, i32, 10, 64> = InternalNode::new();
 
-		internal.len = 3;
+		internal.len.store(3);
 		assert!(internal.is_underfull());
 
-		internal.len = 4;
+		internal.len.store(4);
 		assert!(!internal.is_underfull());
 	}
 
