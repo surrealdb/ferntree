@@ -54,6 +54,7 @@
 //! the target slot is currently init.
 
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ptr;
 use core::sync::atomic::{
 	AtomicI16, AtomicI32, AtomicI64, AtomicI8, AtomicPtr, AtomicU16, AtomicU32, AtomicU64,
@@ -336,6 +337,34 @@ pub unsafe trait OptimisticSlot: Default + Send + Sync + Sized {
 	/// - The caller must have exclusive ownership of the slot (e.g., this
 	///   is the parent's `Drop` impl).
 	unsafe fn drop_in_place(&mut self, was_init: bool);
+
+	/// Load the slot's value into a caller-provided buffer for
+	/// materialisation, returning a borrow valid for the lifetime of
+	/// the buffer / surrounding lock.
+	///
+	/// - For [`InlineSlot`], the buffer is written with the loaded
+	///   value's bits and the returned borrow points into the buffer.
+	/// - For [`BoxedSlot`], the buffer is left untouched and the
+	///   returned borrow points into the `Box<T>` directly. Valid for
+	///   the duration of the surrounding shared / exclusive lock,
+	///   which prevents concurrent `swap_init` / `take_init`.
+	/// - For [`UnitSlot`], the buffer is written with `()` and the
+	///   returned borrow is `&()`.
+	///
+	/// This unifies the "read a borrow without taking ownership" API
+	/// across both inline and boxed storage, allowing iterators and
+	/// closure-based read methods to expose `&K` / `&V` semantics over
+	/// atomic storage.
+	///
+	/// # Safety
+	///
+	/// - The slot must be currently **init**.
+	/// - The caller must hold a shared or exclusive lock on the
+	///   surrounding node so the underlying data is not freed.
+	unsafe fn load_into<'a>(
+		&'a self,
+		buf: &'a mut MaybeUninit<Self::Value>,
+	) -> &'a Self::Value;
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +439,13 @@ unsafe impl<T: AtomicLoadable + Default> OptimisticSlot for InlineSlot<T> {
 	#[inline]
 	unsafe fn drop_in_place(&mut self, _was_init: bool) {
 		// AtomicLoadable types are `Copy`; their `Drop` is a no-op.
+	}
+
+	#[inline]
+	unsafe fn load_into<'a>(&'a self, buf: &'a mut MaybeUninit<T>) -> &'a T {
+		// Materialise the loaded value into the caller's buffer.
+		let v = T::load_acquire(&self.inner);
+		buf.write(v)
 	}
 }
 
@@ -525,6 +561,17 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 			debug_assert!(self.inner.load(Ordering::Relaxed).is_null());
 		}
 	}
+
+	#[inline]
+	unsafe fn load_into<'a>(&'a self, _buf: &'a mut MaybeUninit<T>) -> &'a T {
+		// For boxed storage, the borrow points into the `Box<T>` rather
+		// than the caller's buffer. The lock the caller holds keeps the
+		// Box alive (`swap_init` / `take_init` require exclusive lock).
+		let raw = self.inner.load(Ordering::Acquire);
+		// SAFETY: slot is init (caller's invariant), so `raw` is a
+		// valid `*const T` whose pointee outlives the surrounding lock.
+		unsafe { &*raw }
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +598,10 @@ unsafe impl OptimisticSlot for UnitSlot {
 	unsafe fn move_init_to_empty(&self, _dst: &Self) {}
 	#[inline]
 	unsafe fn drop_in_place(&mut self, _was_init: bool) {}
+	#[inline]
+	unsafe fn load_into<'a>(&'a self, buf: &'a mut MaybeUninit<()>) -> &'a () {
+		buf.write(())
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -641,6 +692,26 @@ where
 		// `S: OptimisticSlot` has interior mutability (atomic types).
 		let slot = unsafe { &*Self::slots_ptr(this).add(pos) };
 		unsafe { slot.load() }
+	}
+
+	/// Load the value at `pos` into a caller-provided buffer for
+	/// materialisation. See [`OptimisticSlot::load_into`].
+	///
+	/// # Safety
+	///
+	/// - `pos < N`.
+	/// - Slot at `pos` must be currently init.
+	/// - Caller must hold a shared or exclusive lock on the surrounding
+	///   node.
+	#[inline]
+	pub unsafe fn load_into<'a>(
+		&'a self,
+		pos: usize,
+		buf: &'a mut MaybeUninit<S::Value>,
+	) -> &'a S::Value {
+		debug_assert!(pos < N);
+		// SAFETY: bounds asserted by caller.
+		unsafe { self.slots.get_unchecked(pos).load_into(buf) }
 	}
 
 	/// Store `value` into the slot at `pos`, which must currently be empty.
@@ -1100,6 +1171,41 @@ mod tests {
 			assert_eq!(arr.load(1), 15);
 			assert_eq!(arr.load(2), 30);
 		}
+	}
+
+	#[test]
+	fn inline_slot_load_into_returns_buffer_borrow() {
+		use core::mem::MaybeUninit;
+		let s: InlineSlot<u64> = InlineSlot::default();
+		unsafe { s.store_into_empty(0x123456789abcdef0) };
+		let mut buf = MaybeUninit::uninit();
+		// SAFETY: slot is init.
+		let v: &u64 = unsafe { s.load_into(&mut buf) };
+		assert_eq!(*v, 0x123456789abcdef0);
+	}
+
+	#[test]
+	fn boxed_slot_load_into_returns_box_borrow() {
+		use core::mem::MaybeUninit;
+		let s: BoxedSlot<String> = BoxedSlot::default();
+		unsafe { s.store_into_empty(String::from("hello")) };
+		let mut buf = MaybeUninit::uninit();
+		// SAFETY: slot is init; we hold exclusive ownership in this test.
+		let v: &String = unsafe { s.load_into(&mut buf) };
+		assert_eq!(v.as_str(), "hello");
+		// Tear down before drop.
+		// SAFETY: slot is init.
+		let _ = unsafe { s.take_init() };
+	}
+
+	#[test]
+	fn unit_slot_load_into_returns_unit() {
+		use core::mem::MaybeUninit;
+		let s = UnitSlot;
+		let mut buf = MaybeUninit::uninit();
+		// SAFETY: UnitSlot is always "init" (no state).
+		let v: &() = unsafe { s.load_into(&mut buf) };
+		assert_eq!(*v, ());
 	}
 
 	#[test]
