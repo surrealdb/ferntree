@@ -271,7 +271,7 @@ pub(crate) mod sync;
 use sync::epoch::{self as epoch, Atomic, Owned};
 use sync::{AtomicUsize, Ordering};
 
-use atomic_slot::{AtomicLen, OptimisticOption, OptimisticSlot, SlotArray};
+use atomic_slot::{AtomicLen, SlotArray};
 use inline_vec::InlineVec;
 use latch::{ExclusiveGuard, HybridGuard, HybridLatch, OptimisticGuard, SharedGuard};
 pub use optimistic::OptimisticRead;
@@ -3583,9 +3583,11 @@ pub(crate) struct LeafNode<K: OptimisticRead, V: OptimisticRead, const LC: usize
 	/// Writers under exclusive lock maintain this alongside `entries`;
 	/// optimistic readers read keys from here (atomic loads) instead of
 	/// `ptr::read(K)` (non-atomic).
+	#[allow(dead_code)] // populated and read by subsequent steps
 	pub(crate) atomic_keys: SlotArray<K::Slot, LC>,
 	/// Atomic value storage mirror for the optimistic-read fast path.
 	/// See [`atomic_keys`] for rationale.
+	#[allow(dead_code)] // populated and read by subsequent steps
 	pub(crate) atomic_values: SlotArray<V::Slot, LC>,
 	/// Exclusive lower bound - keys in this leaf are > lower_fence.
 	/// None means this is the leftmost leaf (no lower bound).
