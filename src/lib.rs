@@ -420,9 +420,8 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		GenericTree {
 			root: HybridLatch::new(Atomic::new(HybridLatch::new(Node::Leaf(LeafNode {
 				len: AtomicLen::new(0),
-				entries: InlineVec::new(),
-				atomic_keys: SlotArray::new(),
-				atomic_values: SlotArray::new(),
+				keys: SlotArray::new(),
+				values: SlotArray::new(),
 				// No fences for the root leaf - it covers the entire key space
 				lower_fence: None,
 				upper_fence: None,
@@ -1562,8 +1561,10 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 
 			if exact {
 				// Safe to call user code: the shared guard blocks writers,
-				// so `V` cannot be mutated for the duration of `f`.
-				leaf.value_at(pos).ok().map(&f)
+				// so `V` cannot be mutated for the duration of `f`. The
+				// value is atomically loaded into a stack-local and
+				// passed by reference to the closure.
+				leaf.value_at(pos).ok().map(|v| f(&v))
 			} else {
 				None
 			}
@@ -1762,10 +1763,10 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				// recheck-must-retry condition.
 				//
 				// SAFETY: `leaf_ptr` is valid for the lifetime of the
-				// optimistic guard; `atomic_values` is a `SlotArray<…,
+				// optimistic guard; `values` is a `SlotArray<…,
 				// LC>` at a known field offset; `pos < LC` checked.
 				let values_ptr: *const SlotArray<V::Slot, LC> =
-					unsafe { ptr::addr_of!((*leaf_ptr).atomic_values) };
+					unsafe { ptr::addr_of!((*leaf_ptr).values) };
 				let snapshot: V = match unsafe {
 					SlotArray::try_load_raw(values_ptr, pos as usize)
 				} {
@@ -3533,10 +3534,20 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Nod
 	/// Returns the keys stored in this node (for testing).
 	#[cfg(test)]
 	#[inline]
-	pub(crate) fn keys(&self) -> Vec<&K> {
+	pub(crate) fn keys(&self) -> Vec<K>
+	where
+		K: Clone,
+	{
 		match self {
-			Node::Internal(ref internal) => internal.keys.iter().collect(),
-			Node::Leaf(ref leaf) => leaf.entries.iter().map(|(k, _)| k).collect(),
+			Node::Internal(ref internal) => internal.keys.iter().cloned().collect(),
+			Node::Leaf(ref leaf) => {
+				let len = leaf.len.load() as usize;
+				(0..len)
+					.map(|i| unsafe {
+						SlotArray::load_raw(ptr::addr_of!(leaf.keys), i)
+					})
+					.collect()
+			}
 		}
 	}
 
@@ -3630,23 +3641,17 @@ pub(crate) struct LeafNode<K: OptimisticRead, V: OptimisticRead, const LC: usize
 	/// memory model's data-race rules. Writers (under exclusive lock)
 	/// use `Release` stores; readers use `Acquire` loads.
 	pub(crate) len: AtomicLen,
-	/// Sorted array of key-value pairs (interleaved for cache locality).
-	///
-	/// Backed by [`InlineVec`] rather than `SmallVec` so the optimistic
-	/// read fast path can project to `len` / data via raw pointers without
-	/// creating an `&` reborrow (which would race under Tree Borrows with
-	/// concurrent writer mutations under the leaf's exclusive lock).
-	pub(crate) entries: InlineVec<(K, V), LC>,
-	/// Atomic key storage mirror for the optimistic-read fast path.
-	/// Writers under exclusive lock maintain this alongside `entries`;
-	/// optimistic readers read keys from here (atomic loads) instead of
-	/// `ptr::read(K)` (non-atomic).
-	#[allow(dead_code)] // populated and read by subsequent steps
-	pub(crate) atomic_keys: SlotArray<K::Slot, LC>,
-	/// Atomic value storage mirror for the optimistic-read fast path.
-	/// See [`atomic_keys`] for rationale.
-	#[allow(dead_code)] // populated and read by subsequent steps
-	pub(crate) atomic_values: SlotArray<V::Slot, LC>,
+	/// Atomic key storage. Writers under exclusive lock use
+	/// `SlotArray::shift_insert_raw` / `shift_remove_raw` to mutate;
+	/// readers (optimistic or shared-lock) use atomic `Acquire` loads
+	/// via `SlotArray::try_load_raw` / `load_raw`. The atomic load /
+	/// store discipline satisfies both Tree Borrows and the C/Rust
+	/// memory model's data-race detector, so the optimistic fast path
+	/// can read concurrently with a writer's mutation under exclusive
+	/// lock without UB.
+	pub(crate) keys: SlotArray<K::Slot, LC>,
+	/// Atomic value storage. Same discipline as `keys`.
+	pub(crate) values: SlotArray<V::Slot, LC>,
 	/// Exclusive lower bound - keys in this leaf are > lower_fence.
 	/// None means this is the leftmost leaf (no lower bound).
 	pub(crate) lower_fence: Option<K>,
@@ -3661,7 +3666,6 @@ impl<K: fmt::Debug + OptimisticRead, V: fmt::Debug + OptimisticRead, const LC: u
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("LeafNode")
 			.field("len", &self.len.load_relaxed())
-			.field("entries", &self.entries)
 			.field("lower_fence", &self.lower_fence)
 			.field("upper_fence", &self.upper_fence)
 			.field("sample_key", &self.sample_key)
@@ -3674,9 +3678,8 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	pub fn new() -> LeafNode<K, V, LC> {
 		LeafNode {
 			len: AtomicLen::new(0),
-			entries: InlineVec::new(),
-			atomic_keys: SlotArray::new(),
-			atomic_values: SlotArray::new(),
+			keys: SlotArray::new(),
+			values: SlotArray::new(),
 			lower_fence: None,
 			upper_fence: None,
 			sample_key: None,
@@ -3719,21 +3722,30 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 			}
 		}
 
-		// Use actual entries length for safe bounds - handles concurrent modifications
-		let entries_len = self.entries.len() as u16;
 		let mut lower = 0;
-		let mut upper = self.len.load_relaxed().min(entries_len);
+		let mut upper = self.len.load_relaxed().min(LC as u16);
 
 		while lower < upper {
 			let mid = ((upper - lower) / 2) + lower;
 
-			// Safe bounds check - concurrent modifications may cause len > entries.len()
-			let Some((mid_key, _)) = self.entries.get(mid as usize) else {
-				// Index out of bounds due to concurrent modification - return conservative result.
-				// This is the cold path; the optimiser uses the hint to keep the hot
-				// binary-search body straight-line.
-				std::hint::cold_path();
-				return (lower, false);
+			// Atomic load of the key at position `mid`. For inline storage
+			// this is an atomic-sized integer load; for boxed storage it
+			// clones through an Acquire-loaded pointer. Both synchronise
+			// with the writer's Release store under exclusive lock.
+			// SAFETY: `mid < upper <= LC`; slot is init while we hold a
+			// shared / exclusive guard on the leaf.
+			let mid_key_opt: Option<K> = unsafe {
+				SlotArray::try_load_raw(ptr::addr_of!(self.keys), mid as usize)
+			};
+			let mid_key = match mid_key_opt {
+				Some(k) => k,
+				None => {
+					// Slot was concurrently emptied (only possible under
+					// the optimistic path with raced writer); caller's
+					// recheck will catch.
+					std::hint::cold_path();
+					return (lower, false);
+				}
 			};
 
 			if key < mid_key.borrow() {
@@ -3778,19 +3790,6 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		// SAFETY: `len` is a u16 at a known field offset; the read is an
 		// unsynchronised aligned load with no retag.
 		unsafe { AtomicLen::load_raw(ptr::addr_of!((*this).len)) }
-	}
-
-	/// Returns a raw pointer to the entries array via projection.
-	///
-	/// # Safety
-	///
-	/// See [`Self::len_raw`].
-	#[inline]
-	pub(crate) unsafe fn entries_ptr_raw(this: *const Self) -> *const (K, V) {
-		// SAFETY: `entries` is an `InlineVec` at a known field offset.
-		// `InlineVec::raw_data_ptr` returns a `*const (K, V)` without
-		// reborrowing.
-		unsafe { InlineVec::raw_data_ptr(ptr::addr_of!((*this).entries)) }
 	}
 
 	/// Binary search for `key` via raw pointer projection, without
@@ -3851,10 +3850,10 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		// Bound `upper` by the InlineVec's compile-time capacity LC since
 		// `len` may be inconsistent under concurrent mutation (recheck
 		// will catch).
-		// SAFETY: `atomic_keys` is a `SlotArray<K::Slot, LC>` at a known
+		// SAFETY: `keys` is a `SlotArray<K::Slot, LC>` at a known
 		// field offset; raw projection without `&LeafNode` reborrow.
 		let keys_ptr: *const SlotArray<K::Slot, LC> =
-			unsafe { ptr::addr_of!((*this).atomic_keys) };
+			unsafe { ptr::addr_of!((*this).keys) };
 		let mut lower: u16 = 0;
 		let mut upper: u16 = len.min(LC as u16);
 
@@ -3896,62 +3895,60 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		(lower, false)
 	}
 
-	/// Returns a reference to the value at the given position.
+	/// Atomic-loads the value at the given position.
+	///
+	/// Returns an owned `V` (cloned via the slot's atomic load semantics —
+	/// for inline storage this is a Copy of the bits; for boxed storage
+	/// it clones through the Acquire-loaded `Box<V>` pointer).
 	///
 	/// # Concurrency Safety
 	///
-	/// Uses safe bounds checking - returns `Err(Unwind)` if position is invalid
-	/// due to concurrent modification, triggering a retry.
+	/// Returns `Err(Unwind)` if position is out of bounds or if a
+	/// concurrent writer has temporarily emptied the slot (boxed-storage
+	/// path). The caller's recheck triggers a retry.
 	#[inline]
-	pub(crate) fn value_at(&self, pos: u16) -> error::Result<&V> {
-		self.entries.get(pos as usize).map(|(_, v)| v).ok_or(error::Error::Unwind)
+	pub(crate) fn value_at(&self, pos: u16) -> error::Result<V> {
+		if pos as usize >= self.len.load_relaxed() as usize {
+			return Err(error::Error::Unwind);
+		}
+		// SAFETY: pos < len; slot is init under our shared / exclusive lock.
+		unsafe { SlotArray::try_load_raw(ptr::addr_of!(self.values), pos as usize) }
+			.ok_or(error::Error::Unwind)
 	}
 
-	/// Returns a reference to the key at the given position.
-	///
-	/// # Concurrency Safety
-	///
-	/// Uses safe bounds checking - returns `Err(Unwind)` if position is invalid.
+	/// Atomic-loads the key at the given position. Same semantics as
+	/// [`value_at`](Self::value_at) but for keys.
 	#[inline]
-	pub(crate) fn key_at(&self, pos: u16) -> error::Result<&K> {
-		self.entries.get(pos as usize).map(|(k, _)| k).ok_or(error::Error::Unwind)
+	pub(crate) fn key_at(&self, pos: u16) -> error::Result<K> {
+		if pos as usize >= self.len.load_relaxed() as usize {
+			return Err(error::Error::Unwind);
+		}
+		unsafe { SlotArray::try_load_raw(ptr::addr_of!(self.keys), pos as usize) }
+			.ok_or(error::Error::Unwind)
 	}
 
-	/// Returns references to the key and value at the given position.
-	///
-	/// # Concurrency Safety
-	///
-	/// Uses safe bounds checking - returns `Err(Unwind)` if position is invalid.
+	/// Atomic-loads the key and value at the given position.
 	#[inline]
 	#[allow(dead_code)]
-	pub(crate) fn kv_at(&self, pos: u16) -> error::Result<(&K, &V)> {
-		self.entries.get(pos as usize).map(|(k, v)| (k, v)).ok_or(error::Error::Unwind)
+	pub(crate) fn kv_at(&self, pos: u16) -> error::Result<(K, V)> {
+		let k = self.key_at(pos)?;
+		let v = self.value_at(pos)?;
+		Ok((k, v))
 	}
 
-	/// Returns references to the key and value at the given position without bounds checking.
+	/// Atomic-loads (K, V) at the given position without bounds checking.
 	///
 	/// # Safety
 	///
-	/// Caller must ensure `pos < self.len.load_relaxed()` and `pos < self.entries.len()`.
-	/// This is intended for use in iterator hot paths where position has already been validated.
+	/// Caller must ensure `pos < self.len.load_relaxed()` and that the
+	/// slot at `pos` is currently init (i.e. the leaf is held under a
+	/// shared or exclusive lock).
 	#[inline]
-	pub(crate) unsafe fn kv_at_unchecked(&self, pos: u16) -> (&K, &V) {
-		// SAFETY: The caller guarantees `pos < self.entries.len()`.
-		let entry = unsafe { self.entries.get_unchecked(pos as usize) };
-		(&entry.0, &entry.1)
-	}
-
-	/// Returns references to the key (immutable) and value (mutable) at position without bounds checking.
-	///
-	/// # Safety
-	///
-	/// Caller must ensure `pos < self.len.load_relaxed()` and `pos < self.entries.len()`.
-	/// This is intended for use in iterator hot paths where position has already been validated.
-	#[inline]
-	pub(crate) unsafe fn kv_at_mut_unchecked(&mut self, pos: u16) -> (&K, &mut V) {
-		// SAFETY: The caller guarantees `pos < self.entries.len()`.
-		let entry = unsafe { self.entries.get_unchecked_mut(pos as usize) };
-		(&entry.0, &mut entry.1)
+	pub(crate) unsafe fn kv_at_unchecked(&self, pos: u16) -> (K, V) {
+		// SAFETY: caller guarantees pos < len and init.
+		let k = unsafe { SlotArray::load_raw(ptr::addr_of!(self.keys), pos as usize) };
+		let v = unsafe { SlotArray::load_raw(ptr::addr_of!(self.values), pos as usize) };
+		(k, v)
 	}
 
 	/// Returns `true` if there's room for another entry.
@@ -3987,23 +3984,32 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	/// - `pos < len`.
 	pub(crate) unsafe fn remove_at_raw(this: *mut Self, pos: u16, eg: &epoch::Guard) -> (K, V) {
 		let len = unsafe { AtomicLen::load_raw(ptr::addr_of!((*this).len)) } as usize;
-		// Atomic-mirror updates via raw-pointer projection.
 		// SAFETY: caller holds exclusive lock; pos < len <= LC.
-		let keys_ptr = unsafe { ptr::addr_of!((*this).atomic_keys) };
-		let values_ptr = unsafe { ptr::addr_of!((*this).atomic_values) };
+		let keys_ptr = unsafe { ptr::addr_of!((*this).keys) };
+		let values_ptr = unsafe { ptr::addr_of!((*this).values) };
+
+		// Atomic-load a copy of (K, V) for the caller. For inline
+		// storage this is a Copy; for boxed storage this clones through
+		// the Acquire-loaded pointer (refcount bump for refcounted V).
+		let removed_k: K =
+			unsafe { SlotArray::load_raw(keys_ptr, pos as usize) };
+		let removed_v: V =
+			unsafe { SlotArray::load_raw(values_ptr, pos as usize) };
+
+		// Shift the storage to fill the gap. The displaced owners
+		// (Box<K> / Box<V> for boxed storage, K / V for inline) are
+		// routed through the epoch GC so concurrent optimistic readers'
+		// pointers stay valid.
 		let displaced_k = unsafe { SlotArray::shift_remove_raw(keys_ptr, len, pos as usize) };
 		let displaced_v = unsafe { SlotArray::shift_remove_raw(values_ptr, len, pos as usize) };
 		eg.defer(move || drop(displaced_k));
 		eg.defer(move || drop(displaced_v));
 
-		// Update len atomically via the raw `AtomicLen` field.
+		// Update len atomically.
 		let len_ptr: *const AtomicLen = unsafe { ptr::addr_of!((*this).len) };
 		unsafe { (*len_ptr).fetch_sub(1) };
 
-		// Remove from entries via raw-pointer projection on InlineVec.
-		// We use a brief `&mut InlineVec` scoped to the call only.
-		let entries_ptr = unsafe { ptr::addr_of_mut!((*this).entries) };
-		unsafe { (*entries_ptr).remove(pos as usize) }
+		(removed_k, removed_v)
 	}
 
 	/// Replace the value at `pos` and return the previous value.
@@ -4025,27 +4031,22 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		pos: u16,
 		value: V,
 		eg: &epoch::Guard,
-	) -> V
-	where
-		V: Clone,
-	{
+	) -> V {
 		let len = unsafe { AtomicLen::load_raw(ptr::addr_of!((*this).len)) } as usize;
 		debug_assert!((pos as usize) < len);
-		// Mirror update via raw-pointer projection (no `&Self` /
-		// `&mut Self` reborrow).
-		let values_ptr = unsafe { ptr::addr_of!((*this).atomic_values) };
-		let displaced_mirror =
-			unsafe { SlotArray::swap_init_raw(values_ptr, pos as usize, value.clone()) };
-		eg.defer(move || drop(displaced_mirror));
-		// Update entries via raw-pointer projection. We avoid an
-		// `&mut InlineVec` reborrow so no Tree-Borrows tag is
-		// established at the field level.
-		let entries_ptr = unsafe { ptr::addr_of_mut!((*this).entries) };
-		let entry_ptr = unsafe {
-			InlineVec::<(K, V), LC>::raw_data_ptr(entries_ptr).add(pos as usize) as *mut (K, V)
-		};
-		let entry_v_ptr = unsafe { ptr::addr_of_mut!((*entry_ptr).1) };
-		unsafe { ptr::replace(entry_v_ptr, value) }
+		// Atomic load + swap on the values slot. For inline storage the
+		// swap is one AcqRel atomic op; for boxed storage it allocates
+		// a fresh `Box<V>` from `value` and AcqRel-swaps the AtomicPtr.
+		let values_ptr = unsafe { ptr::addr_of!((*this).values) };
+		// Capture a copy of the old V to return to the caller.
+		let old_v: V = unsafe { SlotArray::load_raw(values_ptr, pos as usize) };
+		// Now swap in the new V. The displaced owner is routed through
+		// the epoch GC so concurrent optimistic readers still hold
+		// valid pointers until the next epoch tick.
+		let displaced =
+			unsafe { SlotArray::swap_init_raw(values_ptr, pos as usize, value) };
+		eg.defer(move || drop(displaced));
+		old_v
 	}
 
 	/// Checks if a key falls within this leaf's fence boundaries.
@@ -4114,15 +4115,11 @@ impl<K: Clone + OptimisticRead, V: Clone + OptimisticRead, const LC: usize> Leaf
 			unsafe { ptr::write(sample_key_ptr, Some(key.clone())) };
 		}
 
-		// Mirror updates via raw-pointer projection; pos <= len < LC.
-		let keys_ptr = unsafe { ptr::addr_of!((*this).atomic_keys) };
-		let values_ptr = unsafe { ptr::addr_of!((*this).atomic_values) };
-		unsafe { SlotArray::shift_insert_raw(keys_ptr, len, pos as usize, key.clone()) };
-		unsafe { SlotArray::shift_insert_raw(values_ptr, len, pos as usize, value.clone()) };
-
-		// Insert entries via raw projection on InlineVec.
-		let entries_ptr = unsafe { ptr::addr_of_mut!((*this).entries) };
-		unsafe { (*entries_ptr).insert(pos as usize, (key, value)) };
+		// Storage updates via raw-pointer projection; pos <= len < LC.
+		let keys_ptr = unsafe { ptr::addr_of!((*this).keys) };
+		let values_ptr = unsafe { ptr::addr_of!((*this).values) };
+		unsafe { SlotArray::shift_insert_raw(keys_ptr, len, pos as usize, key) };
+		unsafe { SlotArray::shift_insert_raw(values_ptr, len, pos as usize, value) };
 
 		// Update len atomically.
 		unsafe { (*len_ptr).fetch_add(1) };
@@ -4153,36 +4150,30 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 	/// - `right`: An empty leaf node to receive the upper half
 	/// - `split_pos`: Position of the entry whose key becomes the separator
 	pub(crate) fn split(&mut self, right: &mut LeafNode<K, V, LC>, split_pos: u16) {
-		// The key at split_pos becomes the boundary between left and right
-		let split_key = self.entries[split_pos as usize].0.clone();
+		// Total entries in self before the split.
+		let total = self.len.load_relaxed() as usize;
+		let right_start = (split_pos + 1) as usize;
+		let right_count = total - right_start;
 
-		// Update fence keys:
-		// - Right's lower fence is the split key (exclusive)
-		// - Right inherits our upper fence
-		// - Our new upper fence is the split key (inclusive)
+		// Atomic-load the split key. For boxed K this clones through
+		// the Acquire-loaded pointer; for inline K it's an atomic copy.
+		let self_keys_ptr: *const _ = ptr::addr_of!(self.keys);
+		let split_key: K =
+			unsafe { SlotArray::load_raw(self_keys_ptr, split_pos as usize) };
+
+		// Update fence keys.
 		right.lower_fence = Some(split_key.clone());
 		right.upper_fence = self.upper_fence.clone();
 		self.upper_fence = Some(split_key);
 
-		// Move entries after split_pos to the right node
-		assert!(right.entries.is_empty());
-		let total = self.len.load_relaxed() as usize;
-		let right_start = (split_pos + 1) as usize;
-		right.entries.extend(self.entries.drain(right_start..));
-
-		// Mirror: move atomic_keys/atomic_values [right_start..total) to
-		// right.atomic_*[0..total-right_start). Atomic-pointer / atomic-
-		// integer shuffles via `SlotArray::move_raw` — no allocation
-		// and raw-pointer projection avoids `&Self` reborrow under the
-		// writer's `&mut LeafNode` tag tree.
+		// Move storage [right_start..total) from self to right[0..right_count).
 		// SAFETY: both leaves held under exclusive lock; src slots init,
-		// dst slots empty (right just allocated).
-		let self_ptr: *const Self = self;
+		// dst slots empty (right is newly allocated).
 		let right_ptr: *const Self = right;
-		let self_keys = unsafe { ptr::addr_of!((*self_ptr).atomic_keys) };
-		let self_values = unsafe { ptr::addr_of!((*self_ptr).atomic_values) };
-		let right_keys = unsafe { ptr::addr_of!((*right_ptr).atomic_keys) };
-		let right_values = unsafe { ptr::addr_of!((*right_ptr).atomic_values) };
+		let self_keys = self_keys_ptr;
+		let self_values = ptr::addr_of!(self.values);
+		let right_keys = unsafe { ptr::addr_of!((*right_ptr).keys) };
+		let right_values = unsafe { ptr::addr_of!((*right_ptr).values) };
 		for (dst_idx, src_pos) in (right_start..total).enumerate() {
 			unsafe {
 				SlotArray::move_raw(self_keys, src_pos, right_keys, dst_idx);
@@ -4190,14 +4181,16 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 			}
 		}
 
-		// Set sample keys for node relocation
-		// Use first key of each node (guaranteed to route to that node)
-		self.sample_key = Some(self.entries[0].0.clone());
-		right.sample_key = Some(right.entries[0].0.clone());
+		// Set sample keys for node relocation (load first key of each leaf).
+		// SAFETY: both leaves have at least one entry post-split.
+		let self_first: K = unsafe { SlotArray::load_raw(self_keys, 0) };
+		let right_first: K = unsafe { SlotArray::load_raw(right_keys, 0) };
+		self.sample_key = Some(self_first);
+		right.sample_key = Some(right_first);
 
-		// Update lengths
-		right.len.store(right.entries.len() as u16);
-		self.len.store(self.entries.len() as u16);
+		// Update lengths.
+		self.len.store(right_start as u16); // self retains [0..right_start)
+		right.len.store(right_count as u16);
 	}
 
 	/// Merges the `right` leaf into `self`.
@@ -4216,26 +4209,17 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 			return false;
 		}
 
-		// Mark right as empty
-		right.len.store(0);
-
 		// Inherit right's upper fence (we now cover its range too)
 		self.upper_fence = right.upper_fence.take();
 
-		// Move all entries from right to self
-		self.entries.extend(right.entries.drain(..));
-
-		// Mirror: move right.atomic_*[0..right_len) to
-		// self.atomic_*[self_len..self_len + right_len) via raw-pointer
-		// projection.
+		// Move right's storage [0..right_len) to self[self_len..self_len + right_len).
 		// SAFETY: both leaves under exclusive lock; src slots init in
 		// `right`, dst slots empty in `self` (beyond self_len).
-		let self_ptr: *const Self = self;
+		let self_keys = ptr::addr_of!(self.keys);
+		let self_values = ptr::addr_of!(self.values);
 		let right_ptr: *const Self = right;
-		let self_keys = unsafe { ptr::addr_of!((*self_ptr).atomic_keys) };
-		let self_values = unsafe { ptr::addr_of!((*self_ptr).atomic_values) };
-		let right_keys = unsafe { ptr::addr_of!((*right_ptr).atomic_keys) };
-		let right_values = unsafe { ptr::addr_of!((*right_ptr).atomic_values) };
+		let right_keys = unsafe { ptr::addr_of!((*right_ptr).keys) };
+		let right_values = unsafe { ptr::addr_of!((*right_ptr).values) };
 		for src_idx in 0..right_len {
 			let dst_idx = self_len + src_idx;
 			unsafe {
@@ -4244,16 +4228,22 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 			}
 		}
 
+		// Mark right as empty.
+		right.len.store(0);
+
 		// Update sample_key: prefer right's sample_key if available,
 		// otherwise ensure we have one if we have entries (prevents find_parent failures)
 		if let Some(sample) = right.sample_key.take() {
 			self.sample_key = Some(sample);
-		} else if self.sample_key.is_none() && !self.entries.is_empty() {
-			self.sample_key = Some(self.entries[0].0.clone());
+		} else if self.sample_key.is_none() && (self_len + right_len) > 0 {
+			// Load first key for sample_key.
+			// SAFETY: at least one entry exists in merged storage.
+			let first_key: K = unsafe { SlotArray::load_raw(self_keys, 0) };
+			self.sample_key = Some(first_key);
 		}
 
-		// Update length
-		self.len.store(self.entries.len() as u16);
+		// Update length to combined size.
+		self.len.store((self_len + right_len) as u16);
 		true
 	}
 }
@@ -4913,30 +4903,28 @@ impl<K: Clone + Ord + std::fmt::Debug + OptimisticRead, V: OptimisticRead, const
 					level, height
 				);
 
-				// Invariant 6: Length consistency
-				assert_eq!(
-					leaf.len.load() as usize,
-					leaf.entries.len(),
-					"Leaf len {} != entries.len() {}",
-					leaf.len.load(),
-					leaf.entries.len()
-				);
-
-				// Invariant 3: Key ordering
-				for i in 1..leaf.entries.len() {
+				// Invariant 3: Key ordering. Atomic-load each key into
+				// owned form for comparison.
+				let leaf_len = leaf.len.load() as usize;
+				let keys_owned: Vec<K> = (0..leaf_len)
+					.map(|i| unsafe {
+						SlotArray::load_raw(ptr::addr_of!(leaf.keys), i)
+					})
+					.collect();
+				for i in 1..leaf_len {
 					assert!(
-						leaf.entries[i - 1].0 < leaf.entries[i].0,
+						keys_owned[i - 1] < keys_owned[i],
 						"Keys not sorted at positions {} and {}: {:?} >= {:?}",
 						i - 1,
 						i,
-						leaf.entries[i - 1].0,
-						leaf.entries[i].0
+						keys_owned[i - 1],
+						keys_owned[i]
 					);
 				}
 
 				// Invariant 4: Fence key consistency
 				if let Some(lower) = &leaf.lower_fence {
-					for (key, _) in &leaf.entries[..] {
+					for key in &keys_owned {
 						assert!(
 							key > lower,
 							"Key {:?} not greater than lower_fence {:?}",
@@ -4946,14 +4934,14 @@ impl<K: Clone + Ord + std::fmt::Debug + OptimisticRead, V: OptimisticRead, const
 					}
 				}
 				if let Some(upper) = &leaf.upper_fence {
-					for (key, _) in &leaf.entries[..] {
+					for key in &keys_owned {
 						assert!(key <= upper, "Key {:?} not <= upper_fence {:?}", key, upper);
 					}
 				}
 
 				// Check against parent's expected bounds
 				if let Some(lower) = expected_lower {
-					for (key, _) in &leaf.entries[..] {
+					for key in &keys_owned {
 						assert!(
 							key > lower,
 							"Key {:?} not greater than parent lower bound {:?}",
@@ -4963,7 +4951,7 @@ impl<K: Clone + Ord + std::fmt::Debug + OptimisticRead, V: OptimisticRead, const
 					}
 				}
 				if let Some(upper) = expected_upper {
-					for (key, _) in &leaf.entries[..] {
+					for key in &keys_owned {
 						assert!(
 							key <= upper,
 							"Key {:?} not <= parent upper bound {:?}",
@@ -5175,35 +5163,38 @@ mod tests {
 
 		// insert_defer reports key was new.
 		assert!(!tree.insert_defer(1, blob.clone()));
-		// Strong count: the leaf holds two clones (one in `entries`,
-		// one in the atomic mirror used by the optimistic-read fast
-		// path); our local `blob` is the third.
-		assert_eq!(std::sync::Arc::strong_count(&blob.0), 3);
+		// Strong count: the leaf's atomic storage holds one clone of
+		// the Arc; our local `blob` is the second.
+		assert_eq!(std::sync::Arc::strong_count(&blob.0), 2);
 
-		// Optimistic lookup clones through the mirror, bumping the
-		// refcount once more.
+		// Optimistic lookup clones through the atomic-loaded pointer,
+		// bumping the refcount once more.
 		let got =
 			tree.lookup_optimistic(&1, |v| v.clone()).expect("inserted value should be present");
-		assert_eq!(std::sync::Arc::strong_count(&blob.0), 4);
+		assert_eq!(std::sync::Arc::strong_count(&blob.0), 3);
 		assert_eq!(&got.0[..], b"hello world");
 		drop(got);
-		assert_eq!(std::sync::Arc::strong_count(&blob.0), 3);
+		assert_eq!(std::sync::Arc::strong_count(&blob.0), 2);
 
-		// Overwriting: insert_defer returns true (was present), defers
-		// the displaced entries-side and mirror-side drops.
+		// Overwriting: insert_defer returns true (was present). The
+		// displaced slot value is deferred for epoch-safe drop and the
+		// load-clone returned through `iter::insert` is also deferred
+		// (via `optimistic::drop_or_defer` inside `insert_defer`), so
+		// two refcounts on the old V are parked in the deferral queue.
 		let blob2 = RefcountedBlob(std::sync::Arc::new(b"replaced".to_vec()));
 		assert!(tree.insert_defer(1, blob2.clone()));
-		// Tree leaf now holds blob2 (twice — entries + mirror); the
-		// old blob's leaf-side refcounts (also two) are parked inside
-		// the epoch deferral until the next epoch tick.
+		// blob.0 strong count: local(1) + displaced Box's inner Arc(1) +
+		// load-clone in defer queue(1) = 3.
 		assert_eq!(std::sync::Arc::strong_count(&blob.0), 3);
-		assert_eq!(std::sync::Arc::strong_count(&blob2.0), 3);
+		// blob2.0: local(1) + new slot's Box's inner Arc(1) = 2.
+		assert_eq!(std::sync::Arc::strong_count(&blob2.0), 2);
 
-		// remove_defer reports presence and defers both displaced drops.
+		// remove_defer reports presence and defers the displaced drop.
 		assert!(tree.remove_defer(&1));
 		assert!(!tree.remove_defer(&1));
-		// blob2's leaf refcounts (entries + mirror) are now in epoch
-		// deferral.
+		// blob2's leaf refcount (the slot's Box's inner Arc) is now
+		// in epoch deferral, plus the load-clone from remove_defer's
+		// `optimistic::drop_or_defer` is also deferred.
 		assert_eq!(std::sync::Arc::strong_count(&blob2.0), 3);
 	}
 
@@ -5577,9 +5568,9 @@ mod tests {
 		assert!(unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 20, 200) }.is_some()); // Insert in middle
 
 		assert_eq!(leaf.len.load(), 3);
-		assert_eq!(*leaf.key_at(0).unwrap(), 10);
-		assert_eq!(*leaf.key_at(1).unwrap(), 20);
-		assert_eq!(*leaf.key_at(2).unwrap(), 30);
+		assert_eq!(leaf.key_at(0).unwrap(), 10);
+		assert_eq!(leaf.key_at(1).unwrap(), 20);
+		assert_eq!(leaf.key_at(2).unwrap(), 30);
 
 		let eg = epoch::pin();
 		let (k, v) = unsafe { LeafNode::remove_at_raw(&mut leaf, 1, &eg) };
@@ -5632,10 +5623,10 @@ mod tests {
 		assert!(result);
 
 		assert_eq!(left.len.load(), 4);
-		assert_eq!(*left.key_at(0).unwrap(), 10);
-		assert_eq!(*left.key_at(1).unwrap(), 20);
-		assert_eq!(*left.key_at(2).unwrap(), 30);
-		assert_eq!(*left.key_at(3).unwrap(), 40);
+		assert_eq!(left.key_at(0).unwrap(), 10);
+		assert_eq!(left.key_at(1).unwrap(), 20);
+		assert_eq!(left.key_at(2).unwrap(), 30);
+		assert_eq!(left.key_at(3).unwrap(), 40);
 
 		// Left inherits right's upper fence
 		assert_eq!(left.upper_fence, Some(50));
@@ -6124,7 +6115,7 @@ mod tests {
 		let node: Node<i32, i32, 64, 64> = Node::Leaf(leaf);
 		let keys = node.keys();
 
-		assert_eq!(keys.as_slice(), &[&10, &20, &30]);
+		assert_eq!(keys.as_slice(), &[10, 20, 30]);
 	}
 
 	// -----------------------------------------------------------------------
