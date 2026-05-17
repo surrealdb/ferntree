@@ -195,12 +195,27 @@ impl<T, const N: usize> InlineVec<T, N> {
 	/// # Panics
 	///
 	/// Panics if `pos > len`. Debug-asserts that there is capacity.
+	#[inline]
 	pub(crate) fn insert(&mut self, pos: usize, value: T) {
 		let len = self.len as usize;
 		assert!(pos <= len, "InlineVec::insert index out of bounds");
 		debug_assert!(len < N, "InlineVec capacity exceeded");
-		// SAFETY: pos <= len <= N - 1 (per debug_assert). Shift elements
-		// [pos..len) right by one, then write into the freed slot.
+		// Fast path: append to the end. This is the common case for
+		// the B+ tree under sorted inserts (every new key lands at
+		// position == len in the rightmost leaf). `ptr::copy(_, _, 0)`
+		// would be semantically a no-op but LLVM doesn't always elide
+		// the memcpy intrinsic call.
+		if pos == len {
+			// SAFETY: `pos == len < N`; slot is uninitialised.
+			unsafe {
+				self.data.as_mut_ptr().add(pos).write(MaybeUninit::new(value));
+			}
+			self.len += 1;
+			return;
+		}
+		// SAFETY: pos < len < N (per debug_assert + the fast-path
+		// branch above). Shift elements [pos..len) right by one, then
+		// write into the freed slot.
 		unsafe {
 			let base = self.data.as_mut_ptr();
 			ptr::copy(base.add(pos), base.add(pos + 1), len - pos);
@@ -214,11 +229,18 @@ impl<T, const N: usize> InlineVec<T, N> {
 	/// # Panics
 	///
 	/// Panics if `pos >= len`.
+	#[inline]
 	pub(crate) fn remove(&mut self, pos: usize) -> T {
 		let len = self.len as usize;
 		assert!(pos < len, "InlineVec::remove index out of bounds");
-		// SAFETY: pos < len, so the slot is initialised. Shift elements
-		// [pos+1..len) left by one, then decrement len.
+		// Note: no pop-tail fast path here. Removes in the tree are
+		// dominated by scattered positions, so a `pos+1==len` branch
+		// adds a near-always-taken jump without a payoff on the
+		// common path. The trailing `ptr::copy(_, _, 0)` for the
+		// tail case is a no-op semantically and is cheap in practice.
+		// SAFETY: pos < len, so the slot is initialised. Shift
+		// [pos+1..len) left by one (zero elements when removing the
+		// last slot), then decrement len.
 		unsafe {
 			let base = self.data.as_mut_ptr();
 			let value = base.add(pos).read().assume_init();
@@ -233,6 +255,7 @@ impl<T, const N: usize> InlineVec<T, N> {
 	/// # Panics (debug)
 	///
 	/// Debug-asserts on capacity overflow.
+	#[inline]
 	pub(crate) fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
 		for value in iter {
 			self.push(value);
