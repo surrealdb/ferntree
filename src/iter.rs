@@ -1668,17 +1668,27 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: Clone + OptimisticRead, const IC: u
 		// Seek to the key's position
 		if self.seek_exact(&key) {
 			// Key exists - update both entries and the atomic mirror at
-			// the cursor position. Reading the cursor before advancing
-			// gives us the position; `swap_value_at` handles both stores
-			// under exclusive lock and routes the displaced mirror
-			// entry through the epoch GC.
+			// the cursor position via raw-pointer projection so no
+			// `&mut LeafNode` reborrow is created.
 			let (guard, cursor) = self.leaf.as_mut().expect("seek_exact set up leaf");
 			let pos = match *cursor {
 				Cursor::Before(p) => p,
 				Cursor::After(p) => p + 1,
 			};
-			let leaf = guard.as_leaf_mut();
-			let old = leaf.swap_value_at(pos, value, &self.eg);
+			// SAFETY: we hold the exclusive lock on this leaf (via
+			// `ExclusiveGuard`); the raw pointer is the same address
+			// the guard derefs to. `swap_value_at_raw` handles both
+			// the entries-side store and the mirror-side update.
+			let leaf_node_ptr =
+				guard.as_mut_ptr() as *mut crate::Node<K, V, IC, LC>;
+			let leaf_ptr = unsafe {
+				// `Node::as_leaf_ptr_mut` projects the `Node::Leaf`
+				// variant out of the enum without creating an
+				// `&mut Node` reborrow.
+				crate::Node::as_leaf_ptr_mut(leaf_node_ptr)
+			};
+			let old =
+				unsafe { crate::LeafNode::swap_value_at_raw(leaf_ptr, pos, value, &self.eg) };
 			// Advance cursor past the just-replaced entry.
 			*cursor = Cursor::After(pos);
 			Some(old)
@@ -1717,7 +1727,14 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: Clone + OptimisticRead, const IC: u
 				let leaf = guard.as_leaf_mut();
 				match *cursor {
 					Cursor::Before(pos) => {
-						leaf.insert_at(pos, key, value).expect("just checked for space");
+						// SAFETY: we hold the exclusive lock; pos was set up by
+					// seek_exact / seek_for_prev which guarantees pos <= len < LC.
+					unsafe {
+						let node_ptr = guard.as_mut_ptr();
+						let leaf_ptr = crate::Node::as_leaf_ptr_mut(node_ptr);
+						crate::LeafNode::insert_at_raw(leaf_ptr, pos, key, value)
+							.expect("just checked for space");
+					}
 					}
 					Cursor::After(_) => {
 						// seek_exact always positions Before
@@ -1824,7 +1841,11 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: Clone + OptimisticRead, const IC: u
 					return None;
 				}
 
-				let removed = leaf.remove_at(pos, &self.eg);
+				let removed = unsafe {
+					let node_ptr = guard.as_mut_ptr();
+					let leaf_ptr = crate::Node::as_leaf_ptr_mut(node_ptr);
+					crate::LeafNode::remove_at_raw(leaf_ptr, pos, &self.eg)
+				};
 
 				// Adjust cursor since we removed the entry at pos
 				*cursor = Cursor::Before(pos);
@@ -1866,7 +1887,11 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: Clone + OptimisticRead, const IC: u
 					Cursor::Before(pos) => {
 						let curr_pos = *pos;
 						if curr_pos < leaf.len.load() {
-							Some(leaf.remove_at(curr_pos, &self.eg))
+							Some(unsafe {
+								let node_ptr = guard.as_mut_ptr();
+								let leaf_ptr = crate::Node::as_leaf_ptr_mut(node_ptr);
+								crate::LeafNode::remove_at_raw(leaf_ptr, curr_pos, &self.eg)
+							})
 						} else {
 							None
 						}
@@ -1875,7 +1900,11 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: Clone + OptimisticRead, const IC: u
 						let pos = *pos;
 						let curr_pos = pos + 1;
 						if curr_pos < leaf.len.load() {
-							Some(leaf.remove_at(curr_pos, &self.eg))
+							Some(unsafe {
+								let node_ptr = guard.as_mut_ptr();
+								let leaf_ptr = crate::Node::as_leaf_ptr_mut(node_ptr);
+								crate::LeafNode::remove_at_raw(leaf_ptr, curr_pos, &self.eg)
+							})
 						} else {
 							None
 						}

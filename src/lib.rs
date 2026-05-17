@@ -2079,7 +2079,11 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			self.find_exact_exclusive_leaf_and_optimistic_parent(key, &eg)
 		{
 			// Remove the key-value pair from the leaf
-			let kv = guard.as_leaf_mut().remove_at(pos, &eg);
+			let kv = unsafe {
+				let node_ptr = guard.as_mut_ptr();
+				let leaf_ptr = Node::as_leaf_ptr_mut(node_ptr);
+				LeafNode::remove_at_raw(leaf_ptr, pos, &eg)
+			};
 
 			// Check if the leaf is now underfull and needs merging
 			if guard.is_underfull() {
@@ -3374,6 +3378,38 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Nod
 		}
 	}
 
+	/// Mutable raw-pointer projection from a `*mut Node` to its inner
+	/// `*mut LeafNode`, without creating any `&mut Node` reborrow.
+	///
+	/// Used by writer code paths that hold the leaf's exclusive lock
+	/// (via [`crate::latch::ExclusiveGuard`]) but want to mutate the
+	/// leaf's atomic mirror without establishing a Tree-Borrows
+	/// "Reserved" tag on the surrounding node — that tag would conflict
+	/// with concurrent optimistic readers' atomic loads from sibling
+	/// `*const Node` raw pointers.
+	///
+	/// # Safety
+	///
+	/// - `this` must be a valid pointer to a `Node` whose current
+	///   variant is `Node::Leaf` (caller's responsibility — usually
+	///   guaranteed by the tree's structural invariants and the
+	///   exclusive lock).
+	/// - Caller must hold the exclusive lock so no concurrent variant
+	///   change happens.
+	#[inline]
+	pub(crate) unsafe fn as_leaf_ptr_mut(this: *mut Self) -> *mut LeafNode<K, V, LC> {
+		debug_assert!(matches!(
+			unsafe { Self::variant_raw(this as *const Self) },
+			NodeKindRaw::Leaf(_)
+		));
+		let payload_offset = core::mem::align_of::<Self>();
+		// SAFETY: `#[repr(C, u8)]` places the variant payload at
+		// `align_of::<Self>()`; `this` is a valid mutable pointer per
+		// caller's invariant.
+		let payload = unsafe { (this as *mut u8).add(payload_offset) };
+		payload.cast::<LeafNode<K, V, LC>>()
+	}
+
 	/// Returns a reference to the inner leaf node, if this is a leaf.
 	///
 	/// Returns `None` if this is an internal node.
@@ -3937,50 +3973,79 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	/// are routed through the epoch GC so an in-flight reader's
 	/// `Acquire`-loaded pointer stays valid until no reader could still
 	/// be using it.
-	pub(crate) fn remove_at(&mut self, pos: u16, eg: &epoch::Guard) -> (K, V) {
-		let len = self.len.load_relaxed() as usize;
-		// Atomic-mirror updates via raw-pointer projection so no
-		// `&SlotArray` / `&Slot` reborrow is created under the writer's
-		// `&mut Self` tag tree. Concurrent optimistic readers' atomic
-		// reborrows descend from `*const Self` via the same raw path
-		// and are foreign-safe under Tree Borrows.
+	///
+	/// Takes `*mut Self` (not `&mut self`) so that no Tree-Borrows
+	/// "Reserved" tag is established on the leaf — concurrent
+	/// optimistic readers' atomic reads stay foreign-safe while the
+	/// writer is mid-mutation.
+	///
+	/// # Safety
+	///
+	/// - `this` must be a valid `*mut LeafNode` owned by an
+	///   [`crate::latch::ExclusiveGuard`] (i.e. the caller holds the
+	///   exclusive lock).
+	/// - `pos < len`.
+	pub(crate) unsafe fn remove_at_raw(this: *mut Self, pos: u16, eg: &epoch::Guard) -> (K, V) {
+		let len = unsafe { AtomicLen::load_raw(ptr::addr_of!((*this).len)) } as usize;
+		// Atomic-mirror updates via raw-pointer projection.
 		// SAFETY: caller holds exclusive lock; pos < len <= LC.
-		let self_ptr: *const Self = self;
-		let keys_ptr = unsafe { ptr::addr_of!((*self_ptr).atomic_keys) };
-		let values_ptr = unsafe { ptr::addr_of!((*self_ptr).atomic_values) };
+		let keys_ptr = unsafe { ptr::addr_of!((*this).atomic_keys) };
+		let values_ptr = unsafe { ptr::addr_of!((*this).atomic_values) };
 		let displaced_k = unsafe { SlotArray::shift_remove_raw(keys_ptr, len, pos as usize) };
 		let displaced_v = unsafe { SlotArray::shift_remove_raw(values_ptr, len, pos as usize) };
-		// Defer-drop the displaced mirror entries so concurrent
-		// optimistic readers' interior pointers stay valid until the
-		// next epoch tick.
 		eg.defer(move || drop(displaced_k));
 		eg.defer(move || drop(displaced_v));
 
-		self.len.fetch_sub(1);
-		self.entries.remove(pos as usize)
+		// Update len atomically via the raw `AtomicLen` field.
+		let len_ptr: *const AtomicLen = unsafe { ptr::addr_of!((*this).len) };
+		unsafe { (*len_ptr).fetch_sub(1) };
+
+		// Remove from entries via raw-pointer projection on InlineVec.
+		// We use a brief `&mut InlineVec` scoped to the call only.
+		let entries_ptr = unsafe { ptr::addr_of_mut!((*this).entries) };
+		unsafe { (*entries_ptr).remove(pos as usize) }
 	}
 
 	/// Replace the value at `pos` and return the previous value.
 	/// Maintains the atomic mirror via raw-pointer projection.
 	///
-	/// Used by `iter::insert`'s overwrite path so the mirror stays in
-	/// sync with `entries`.
-	pub(crate) fn swap_value_at(&mut self, pos: u16, value: V, eg: &epoch::Guard) -> V
+	/// Takes `*mut Self` (not `&mut self`) so that no Tree-Borrows
+	/// "Reserved" tag is established on the leaf for the duration of
+	/// the call — concurrent optimistic readers' atomic reads stay
+	/// foreign-safe while the writer is mid-mutation.
+	///
+	/// # Safety
+	///
+	/// - `this` must be a valid `*mut LeafNode` owned by an
+	///   [`crate::latch::ExclusiveGuard`] (i.e. the caller holds the
+	///   exclusive lock).
+	/// - `pos < len`.
+	pub(crate) unsafe fn swap_value_at_raw(
+		this: *mut Self,
+		pos: u16,
+		value: V,
+		eg: &epoch::Guard,
+	) -> V
 	where
 		V: Clone,
 	{
-		let len = self.len.load_relaxed() as usize;
+		let len = unsafe { AtomicLen::load_raw(ptr::addr_of!((*this).len)) } as usize;
 		debug_assert!((pos as usize) < len);
-		// Update mirror via raw-pointer projection; the displaced is
-		// routed through epoch GC.
-		// SAFETY: under exclusive lock; pos < len, slot is init.
-		let self_ptr: *const Self = self;
-		let values_ptr = unsafe { ptr::addr_of!((*self_ptr).atomic_values) };
+		// Mirror update via raw-pointer projection (no `&Self` /
+		// `&mut Self` reborrow).
+		let values_ptr = unsafe { ptr::addr_of!((*this).atomic_values) };
 		let displaced_mirror =
 			unsafe { SlotArray::swap_init_raw(values_ptr, pos as usize, value.clone()) };
 		eg.defer(move || drop(displaced_mirror));
-		// Update entries.
-		std::mem::replace(&mut self.entries[pos as usize].1, value)
+		// Update entries via raw-pointer projection. We avoid an
+		// `&mut InlineVec` reborrow so no Tree-Borrows tag is
+		// established at the field level.
+		let entries_ptr = unsafe { ptr::addr_of_mut!((*this).entries) };
+		let entry_ptr = unsafe {
+			InlineVec::<(K, V), LC>::raw_data_ptr(entries_ptr).add(pos as usize) as *mut (K, V)
+		};
+		let entry_v_ptr = unsafe { ptr::addr_of_mut!((*entry_ptr).1) };
+		unsafe { ptr::replace(entry_v_ptr, value) }
 	}
 
 	/// Checks if a key falls within this leaf's fence boundaries.
@@ -4019,31 +4084,48 @@ impl<K: Clone + OptimisticRead, V: Clone + OptimisticRead, const LC: usize> Leaf
 	///
 	/// - `Some(pos)` if insertion succeeded
 	/// - `None` if the node is full
-	pub(crate) fn insert_at(&mut self, pos: u16, key: K, value: V) -> Option<u16> {
-		if !self.has_space() {
+	/// Takes `*mut Self` (not `&mut self`) so that no Tree-Borrows
+	/// "Reserved" tag is established on the leaf — concurrent
+	/// optimistic readers' atomic reads stay foreign-safe while the
+	/// writer is mid-mutation.
+	///
+	/// # Safety
+	///
+	/// - `this` must be a valid `*mut LeafNode` owned by an
+	///   [`crate::latch::ExclusiveGuard`].
+	/// - `pos <= len`.
+	pub(crate) unsafe fn insert_at_raw(
+		this: *mut Self,
+		pos: u16,
+		key: K,
+		value: V,
+	) -> Option<u16> {
+		let len_ptr: *const AtomicLen = unsafe { ptr::addr_of!((*this).len) };
+		let len = unsafe { AtomicLen::load_raw(len_ptr) } as usize;
+		if len >= LC {
 			return None;
 		}
 
-		// Set sample_key if not already set (ensures find_parent can locate this node)
-		if self.sample_key.is_none() {
-			self.sample_key = Some(key.clone());
+		// sample_key check via raw projection.
+		let sample_key_ptr: *mut Option<K> =
+			unsafe { ptr::addr_of_mut!((*this).sample_key) };
+		// SAFETY: under exclusive lock; no concurrent writer.
+		if unsafe { (*sample_key_ptr).is_none() } {
+			unsafe { ptr::write(sample_key_ptr, Some(key.clone())) };
 		}
 
-		let len = self.len.load_relaxed() as usize;
-		// Mirror updates via raw-pointer projection under exclusive lock;
-		// pos <= len < LC. Bypassing `&self` reborrows keeps the writer
-		// out of Tree-Borrows-protected tag tree on the atomic mirror.
-		// SAFETY: bounds enforced by `has_space()` check above and the
-		// caller's contract that `pos <= len`.
-		let self_ptr: *const Self = self;
-		let keys_ptr = unsafe { ptr::addr_of!((*self_ptr).atomic_keys) };
-		let values_ptr = unsafe { ptr::addr_of!((*self_ptr).atomic_values) };
+		// Mirror updates via raw-pointer projection; pos <= len < LC.
+		let keys_ptr = unsafe { ptr::addr_of!((*this).atomic_keys) };
+		let values_ptr = unsafe { ptr::addr_of!((*this).atomic_values) };
 		unsafe { SlotArray::shift_insert_raw(keys_ptr, len, pos as usize, key.clone()) };
 		unsafe { SlotArray::shift_insert_raw(values_ptr, len, pos as usize, value.clone()) };
 
-		// Insert the entry at the specified position
-		self.entries.insert(pos as usize, (key, value));
-		self.len.fetch_add(1);
+		// Insert entries via raw projection on InlineVec.
+		let entries_ptr = unsafe { ptr::addr_of_mut!((*this).entries) };
+		unsafe { (*entries_ptr).insert(pos as usize, (key, value)) };
+
+		// Update len atomically.
+		unsafe { (*len_ptr).fetch_add(1) };
 
 		Some(pos)
 	}
@@ -5375,9 +5457,9 @@ mod tests {
 	#[test]
 	fn leaf_lower_bound_exact_match() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
-		leaf.insert_at(0, 10, 100);
-		leaf.insert_at(1, 20, 200);
-		leaf.insert_at(2, 30, 300);
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 10, 100) };
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 20, 200) };
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 2, 30, 300) };
 
 		let (pos, exact) = leaf.lower_bound(&20);
 		assert_eq!(pos, 1);
@@ -5387,9 +5469,9 @@ mod tests {
 	#[test]
 	fn leaf_lower_bound_between_keys() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
-		leaf.insert_at(0, 10, 100);
-		leaf.insert_at(1, 20, 200);
-		leaf.insert_at(2, 30, 300);
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 10, 100) };
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 20, 200) };
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 2, 30, 300) };
 
 		let (pos, exact) = leaf.lower_bound(&25);
 		assert_eq!(pos, 2); // Would insert at position 2
@@ -5399,8 +5481,8 @@ mod tests {
 	#[test]
 	fn leaf_lower_bound_before_all() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
-		leaf.insert_at(0, 10, 100);
-		leaf.insert_at(1, 20, 200);
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 10, 100) };
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 20, 200) };
 
 		let (pos, exact) = leaf.lower_bound(&5);
 		assert_eq!(pos, 0);
@@ -5410,8 +5492,8 @@ mod tests {
 	#[test]
 	fn leaf_lower_bound_after_all() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
-		leaf.insert_at(0, 10, 100);
-		leaf.insert_at(1, 20, 200);
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 10, 100) };
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 20, 200) };
 
 		let (pos, exact) = leaf.lower_bound(&25);
 		assert_eq!(pos, 2);
@@ -5422,8 +5504,8 @@ mod tests {
 	fn leaf_lower_bound_respects_lower_fence() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
 		leaf.lower_fence = Some(50);
-		leaf.insert_at(0, 60, 600);
-		leaf.insert_at(1, 70, 700);
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 60, 600) };
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 70, 700) };
 
 		// Key below lower fence
 		let (pos, exact) = leaf.lower_bound(&40);
@@ -5435,8 +5517,8 @@ mod tests {
 	fn leaf_lower_bound_respects_upper_fence() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
 		leaf.upper_fence = Some(50);
-		leaf.insert_at(0, 30, 300);
-		leaf.insert_at(1, 40, 400);
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 30, 300) };
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 40, 400) };
 
 		// Key above upper fence
 		let (pos, exact) = leaf.lower_bound(&60);
@@ -5490,9 +5572,9 @@ mod tests {
 	fn leaf_insert_at_and_remove_at() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
 
-		assert!(leaf.insert_at(0, 10, 100).is_some());
-		assert!(leaf.insert_at(1, 30, 300).is_some());
-		assert!(leaf.insert_at(1, 20, 200).is_some()); // Insert in middle
+		assert!(unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 10, 100) }.is_some());
+		assert!(unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 30, 300) }.is_some());
+		assert!(unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 20, 200) }.is_some()); // Insert in middle
 
 		assert_eq!(leaf.len.load(), 3);
 		assert_eq!(*leaf.key_at(0).unwrap(), 10);
@@ -5500,7 +5582,7 @@ mod tests {
 		assert_eq!(*leaf.key_at(2).unwrap(), 30);
 
 		let eg = epoch::pin();
-		let (k, v) = leaf.remove_at(1, &eg);
+		let (k, v) = unsafe { LeafNode::remove_at_raw(&mut leaf, 1, &eg) };
 		assert_eq!(k, 20);
 		assert_eq!(v, 200);
 		assert_eq!(leaf.len.load(), 2);
@@ -5510,7 +5592,7 @@ mod tests {
 	fn leaf_split_sets_fences_correctly() {
 		let mut left: LeafNode<i32, i32, 64> = LeafNode::new();
 		for i in 0..10 {
-			left.insert_at(i as u16, i * 10, i * 100);
+			unsafe { LeafNode::insert_at_raw(&mut left, i as u16, i * 10, i * 100) };
 		}
 
 		let mut right: LeafNode<i32, i32, 64> = LeafNode::new();
@@ -5535,15 +5617,15 @@ mod tests {
 	#[test]
 	fn leaf_merge_combines_entries() {
 		let mut left: LeafNode<i32, i32, 64> = LeafNode::new();
-		left.insert_at(0, 10, 100);
-		left.insert_at(1, 20, 200);
+		unsafe { LeafNode::insert_at_raw(&mut left, 0, 10, 100) };
+		unsafe { LeafNode::insert_at_raw(&mut left, 1, 20, 200) };
 		left.upper_fence = Some(25);
 
 		let mut right: LeafNode<i32, i32, 64> = LeafNode::new();
 		right.lower_fence = Some(25);
 		right.upper_fence = Some(50);
-		right.insert_at(0, 30, 300);
-		right.insert_at(1, 40, 400);
+		unsafe { LeafNode::insert_at_raw(&mut right, 0, 30, 300) };
+		unsafe { LeafNode::insert_at_raw(&mut right, 1, 40, 400) };
 		right.sample_key = Some(30);
 
 		let result = left.merge(&mut right);
@@ -5567,13 +5649,13 @@ mod tests {
 	#[test]
 	fn leaf_merge_fails_when_too_full() {
 		let mut left: LeafNode<i32, i32, 4> = LeafNode::new();
-		left.insert_at(0, 10, 100);
-		left.insert_at(1, 20, 200);
-		left.insert_at(2, 30, 300);
+		unsafe { LeafNode::insert_at_raw(&mut left, 0, 10, 100) };
+		unsafe { LeafNode::insert_at_raw(&mut left, 1, 20, 200) };
+		unsafe { LeafNode::insert_at_raw(&mut left, 2, 30, 300) };
 
 		let mut right: LeafNode<i32, i32, 4> = LeafNode::new();
-		right.insert_at(0, 40, 400);
-		right.insert_at(1, 50, 500);
+		unsafe { LeafNode::insert_at_raw(&mut right, 0, 40, 400) };
+		unsafe { LeafNode::insert_at_raw(&mut right, 1, 50, 500) };
 
 		// Combined size (5) > capacity (4)
 		let result = left.merge(&mut right);
@@ -5588,13 +5670,13 @@ mod tests {
 		let mut leaf: LeafNode<i32, i32, 3> = LeafNode::new();
 		assert!(leaf.has_space());
 
-		leaf.insert_at(0, 1, 1);
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 1, 1) };
 		assert!(leaf.has_space());
 
-		leaf.insert_at(1, 2, 2);
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 2, 2) };
 		assert!(leaf.has_space());
 
-		leaf.insert_at(2, 3, 3);
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 2, 3, 3) };
 		assert!(!leaf.has_space());
 	}
 
@@ -5607,12 +5689,12 @@ mod tests {
 		assert!(leaf.is_underfull());
 
 		for i in 0..3 {
-			leaf.insert_at(i as u16, i, i);
+			unsafe { LeafNode::insert_at_raw(&mut leaf, i as u16, i, i) };
 		}
 		// 3 entries with capacity 10 = 30%, still underfull
 		assert!(leaf.is_underfull());
 
-		leaf.insert_at(3, 3, 3);
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 3, 3, 3) };
 		// 4 entries = 40%, at threshold, NOT underfull
 		assert!(!leaf.is_underfull());
 	}
@@ -6035,9 +6117,9 @@ mod tests {
 	#[test]
 	fn node_keys_returns_keys() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
-		leaf.insert_at(0, 10, 100);
-		leaf.insert_at(1, 20, 200);
-		leaf.insert_at(2, 30, 300);
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 10, 100) };
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 20, 200) };
+		unsafe { LeafNode::insert_at_raw(&mut leaf, 2, 30, 300) };
 
 		let node: Node<i32, i32, 64, 64> = Node::Leaf(leaf);
 		let keys = node.keys();
