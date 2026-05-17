@@ -667,39 +667,49 @@ fn concurrent_lookup_with_interior_pointer_values() {
 }
 
 // ===========================================================================
-// Epoch-Deferred-Drop Concurrent Stress (Phase 3 read fast path)
+// Optimistic-read fast-path concurrent stress (V- and K-deferred drops)
 // ===========================================================================
+//
+// These tests exercise the raw-pointer projection descent under concurrent
+// writes. They live in the integration suite (not `--lib`) because Miri's
+// data-race detector flags the protocol's unsynchronised non-atomic V (and
+// K) reads racing with concurrent writes. The Tree-Borrows aliasing layer
+// is satisfied by the raw-pointer projection refactor in commit 2; the
+// remaining residue is the language-level data-race detection, which would
+// require atomicising V/K to satisfy and is out of scope for this PR. See
+// the `optimistic` module docs.
+//
+// Concurrent behaviour is validated empirically by the ASan and TSan CI
+// jobs, which exercise the actual hardware semantics rather than the
+// language model.
 
-/// Mock refcounted blob that opts into `EPOCH_DEFERRED_DROP = true`. Stands
-/// in for `bytes::Bytes` / `Arc<T>`-style cheaply-cloneable values without
-/// pulling in those crates as test dependencies.
+/// Mock refcounted blob acting as `V`. Cheap clone via `Arc`. Opts into
+/// `EPOCH_DEFERRED_DROP = true` so writes route the displaced V through
+/// the epoch GC, keeping interior pointers alive across the reader's
+/// snapshot/use window.
 #[derive(Clone)]
 struct RefcountedBlob(Arc<Vec<u8>>);
 
 // SAFETY: `RefcountedBlob` wraps `Arc<Vec<u8>>` which is `Send + Sync`. A
 // bitwise snapshot followed by a successful version recheck yields a valid
-// `Arc`. `EPOCH_DEFERRED_DROP = true`, combined with the test using
-// `insert_defer` / `remove_defer` for all writes, keeps the underlying
-// `Vec`'s buffer alive across the reader's snapshot/use window.
+// `Arc`. `EPOCH_DEFERRED_DROP = true`, combined with using `insert_defer`
+// / `remove_defer` exclusively for writes, keeps the underlying `Vec`'s
+// buffer alive across the reader's snapshot/use window.
 unsafe impl OptimisticRead for RefcountedBlob {
 	const EPOCH_DEFERRED_DROP: bool = true;
 }
 
-/// Stress test: readers using `lookup_optimistic` interleave with writers
-/// using `insert_defer`. The deferred-drop discipline must keep the `Arc`'d
-/// buffer alive across the reader's snapshot/use window even when the
-/// writer replaces the slot.
-///
-/// This test lives in the integration suite rather than `--lib` because
-/// Miri's aliasing model does not understand the optimistic-version-recheck
-/// protocol used by the leaf-level fast path: an optimistic read of the
-/// leaf's `entries` retags a `&` reference while a concurrent
-/// exclusive-locked writer mutates the SmallVec, which Miri flags as a
-/// data race even though the version recheck catches the inconsistency at
-/// runtime. The same latent pattern exists for the (already-Miri-passing)
-/// internal-node optimistic descent — Miri just never observes it because
-/// the unit-test suite never modifies internal nodes concurrently.
-/// Concurrent behaviour is validated by the ASan / TSan CI jobs.
+/// `RcKey` is a refcounted blob acting as `K`. Cheap clone, refcounted
+/// heap; opts into `EPOCH_DEFERRED_DROP` so its drop routes through the
+/// epoch GC on `remove_defer`.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RcKey(Arc<Vec<u8>>);
+
+// SAFETY: see `RefcountedBlob` above. The contract is symmetric.
+unsafe impl OptimisticRead for RcKey {
+	const EPOCH_DEFERRED_DROP: bool = true;
+}
+
 #[test]
 fn epoch_deferred_drop_optimistic_reader_vs_defer_writer() {
 	let tree: Arc<Tree<i32, RefcountedBlob>> = Arc::new(Tree::new());
@@ -719,7 +729,8 @@ fn epoch_deferred_drop_optimistic_reader_vs_defer_writer() {
 					if let Some(blob) = tree.lookup_optimistic(&k, |v| v.clone()) {
 						// Touch the buffer so the optimiser keeps the clone
 						// alive past the lookup — if the buffer were freed
-						// behind our back this would UB / segfault.
+						// behind our back this would UB / segfault under
+						// ASan/TSan.
 						let s: usize = blob.0.iter().map(|&b| b as usize).sum();
 						std::hint::black_box(s);
 					}
@@ -736,6 +747,61 @@ fn epoch_deferred_drop_optimistic_reader_vs_defer_writer() {
 				for k in 0..200 {
 					let v = RefcountedBlob(Arc::new(vec![(k + round) as u8; 32]));
 					tree.insert_defer(k, v);
+				}
+			}
+			stop.store(true, Ordering::Relaxed);
+		})
+	};
+
+	writer.join().unwrap();
+	for h in handles {
+		h.join().unwrap();
+	}
+}
+
+/// Stress for the K-deferred-drop extension: K is a refcounted type with
+/// `EPOCH_DEFERRED_DROP = true`, and writers alternate `insert_defer` /
+/// `remove_defer` so leaf K is actually dropped (`remove_defer` defers
+/// both K and V drops via the epoch GC). Readers `lookup_optimistic`
+/// hammer the descent which snapshots K's interior pointer.
+#[test]
+fn k_deferred_drop_optimistic_reader_vs_defer_writer() {
+	const KEYS: u8 = 64;
+	let mk_key = |i: u8| RcKey(Arc::new(vec![i; 8]));
+
+	let tree: Arc<Tree<RcKey, u64>> = Arc::new(Tree::new());
+	let stop = Arc::new(AtomicBool::new(false));
+
+	for i in 0..KEYS {
+		tree.insert_defer(mk_key(i), i as u64);
+	}
+
+	let mut handles = Vec::new();
+	for _ in 0..4 {
+		let tree = Arc::clone(&tree);
+		let stop = Arc::clone(&stop);
+		handles.push(thread::spawn(move || {
+			while !stop.load(Ordering::Relaxed) {
+				for i in 0..KEYS {
+					let k = mk_key(i);
+					let _ = tree.lookup_optimistic(&k, |v| *v);
+				}
+			}
+		}));
+	}
+
+	let writer = {
+		let tree = Arc::clone(&tree);
+		let stop = Arc::clone(&stop);
+		thread::spawn(move || {
+			for round in 0..50u64 {
+				for i in 0..KEYS {
+					let k = mk_key(i);
+					if round % 2 == 0 {
+						tree.remove_defer(&k);
+					} else {
+						tree.insert_defer(k, round * 100 + i as u64);
+					}
 				}
 			}
 			stop.store(true, Ordering::Relaxed);

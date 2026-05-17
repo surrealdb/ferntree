@@ -4953,14 +4953,24 @@ mod tests {
 		assert_eq!(std::sync::Arc::strong_count(&blob2.0), 2);
 	}
 
-	// Note: the concurrent reader/writer stress test for
-	// epoch-deferred-drop values lives in tests/concurrency.rs. It is
-	// intentionally outside `--lib` because Miri's aliasing model does not
-	// understand the optimistic-version-recheck protocol and would flag
-	// the (intentionally unsynchronised) optimistic leaf read racing with
-	// a concurrent exclusive-locked writer — the same latent pattern that
-	// exists for internal-node descent. Concurrent behaviour is validated
-	// instead by the ASan / TSan CI jobs.
+	// Note: the concurrent stress tests for the optimistic-read fast
+	// path (epoch_deferred_drop_optimistic_reader_vs_defer_writer and
+	// k_deferred_drop_optimistic_reader_vs_defer_writer) live in
+	// `tests/concurrency.rs` rather than here. The raw-pointer
+	// projection refactor fixes the Tree-Borrows-retag race that PR-6
+	// introduced (Miri's TB analysis no longer complains about an `&`
+	// reborrow racing with a writer's exclusive-lock mutation), but
+	// Miri's data-race detector independently flags the underlying
+	// pattern: an optimistic reader's non-atomic `ptr::read(V)` racing
+	// with a writer's non-atomic `mem::replace(V)` is a data race by
+	// the Rust/C memory model, regardless of whether the version
+	// recheck catches inconsistency at runtime. Making the protocol
+	// pass Miri's data-race detector would require atomicising the V
+	// field (e.g. `AtomicPtr<V>` indirection), which restricts V to
+	// pointer-sized types — a much bigger redesign that is out of
+	// scope here. The integration tests under ASan/TSan continue to
+	// validate concurrent behaviour empirically. See the
+	// `optimistic` module docs for the full discussion.
 
 	#[test]
 	fn insert_update() {
