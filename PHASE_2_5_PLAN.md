@@ -252,13 +252,44 @@ This is the test the issue's first acceptance criterion calls for.
 
 6. **Full LeafNode storage migration** — TODO. The substantive remaining
    work. Drop the `entries` field. Rewrite every method on LeafNode to
-   use the atomic storage. For closure-based reads (`Tree::lookup`),
-   load V atomically into a stack-local and pass `&V` to the closure
-   (one extra clone per lookup for boxed V; zero overhead for Copy V).
-   For iterators (`RawSharedIter::next`, `Range::next`, etc.), add an
-   internal buffer field; return `&'_ K, &'_ V` borrows from the buffer
-   with lifetime tied to `&mut self`. For mut iterators, write back via
-   `swap_init` on the slot, route the displaced through `eg.defer`.
+   use the atomic storage.
+
+   **Foundation provided in commit 0de2e92:**
+   [`OptimisticSlot::load_into`](src/atomic_slot.rs) returns
+   `&T` materialised from atomic storage:
+   - For [`BoxedSlot`](src/atomic_slot.rs), the borrow points into the
+     `Box<T>` directly — no clone, valid for the surrounding lock.
+   - For [`InlineSlot`](src/atomic_slot.rs), the value's bits are
+     loaded into a caller-provided `MaybeUninit<T>` buffer.
+
+   **Migration mechanics:**
+   - Closure-based reads (`Tree::lookup`): supply a stack-local
+     `MaybeUninit<V>` buffer; `load_into` returns `&V` for the
+     closure call. Zero clone for boxed V, zero clone for inline V
+     (just a u64 copy into buf for primitives).
+   - Iterators (`RawSharedIter::next`, `Range::next`, etc.): add
+     `MaybeUninit<K>` / `MaybeUninit<V>` buffer fields on the iterator
+     struct. Each `next()` calls `load_into`, then returns the borrow.
+     The iterator's `Option<(&K, &V)>` API stays intact; the
+     references' lifetimes are tied to `&mut self` of `next()`.
+   - For mut iterators (`RawExclusiveIter` `&mut V` returns), the same
+     buffer pattern. Mutations to the buffer are written back to the
+     atomic slot via `swap_init`. The displaced value is routed
+     through `eg.defer` on the iterator's pinned epoch guard.
+
+   **Key insight (re-read of issue scope):** shared-lock leaf body
+   accesses (`Tree::lookup`'s closure call, `iter::next` returning
+   `&K, &V`) are already memory-model-synchronised by the leaf's
+   shared/exclusive lock — they are NOT the data race documented in
+   #7. The data race documented in the issue is at:
+   (a) the optimistic-fast-path leaf reads (no lock at all), and
+   (b) the internal-node descent (held under optimistic guard, not
+       shared lock).
+
+   So the migration's job is to make the underlying storage atomic
+   (so loads/stores commute at the memory-model level) without
+   changing the shared-lock-reader API surface. `load_into` does
+   exactly that.
 
 7. **InternalNode K migration** — TODO. Replace
    `keys: InlineVec<K, IC>` with `keys: SlotArray<K::Slot, IC>`.
