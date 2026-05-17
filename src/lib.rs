@@ -1741,12 +1741,6 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 					return Ok(None);
 				}
 
-				// Bitwise-snapshot the V via raw projection. The snapshot
-				// may be torn at this point; the version recheck below
-				// confirms it.
-				// SAFETY: leaf_ptr is a valid pointer for the lifetime
-				// of the optimistic guard.
-				let entries_ptr = unsafe { LeafNode::entries_ptr_raw(leaf_ptr) };
 				// Bound by the compile-time capacity LC since `len` may be
 				// inconsistent under concurrent mutation. We have
 				// `pos <= LC` because `lower_bound_raw`'s `upper` is
@@ -1754,24 +1748,50 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				if (pos as usize) >= LC {
 					return Err(error::Error::Unwind);
 				}
-				// SAFETY: `pos < LC`, entries_ptr is valid for at least
-				// LC elements. The read is bitwise; if recheck below
-				// fails we forget the snapshot without running `Drop`.
-				// V: OptimisticRead certifies this discipline.
-				let snapshot =
-					unsafe { ptr::read(ptr::addr_of!((*entries_ptr.add(pos as usize)).1)) };
 
-				// Validate that the snapshot is internally consistent.
+				// Atomic load from the leaf's atomic mirror via raw-
+				// pointer projection (no `&LeafNode` reborrow). For
+				// boxed-storage V, `try_load_raw` performs
+				// `AtomicPtr::load(Acquire)` and clones through the
+				// pointer; for inline-storage V, it does an atomic-sized
+				// load of V's bits. Either way, the load synchronises
+				// with the writer's `Release` store in `swap_init` /
+				// `shift_*`, so Miri's data-race detector is satisfied.
+				// `try_load` returns `None` if the slot was concurrently
+				// emptied (boxed null pointer), which we treat as a
+				// recheck-must-retry condition.
+				//
+				// SAFETY: `leaf_ptr` is valid for the lifetime of the
+				// optimistic guard; `atomic_values` is a `SlotArray<…,
+				// LC>` at a known field offset; `pos < LC` checked.
+				let values_ptr: *const SlotArray<V::Slot, LC> =
+					unsafe { ptr::addr_of!((*leaf_ptr).atomic_values) };
+				let snapshot: V = match unsafe {
+					SlotArray::try_load_raw(values_ptr, pos as usize)
+				} {
+					Some(v) => v,
+					None => {
+						// Slot was concurrently emptied; retry.
+						std::hint::cold_path();
+						return Err(error::Error::Unwind);
+					}
+				};
+
+				// Validate that the snapshot is internally consistent
+				// (i.e. no concurrent writer touched the leaf between
+				// our binary search and the atomic load above).
 				if let Err(err) = leaf_guard.recheck() {
 					core::mem::forget(snapshot);
 					return Err(err);
 				}
 
 				// The snapshot is validated. Hand a borrow to the user
-				// closure, then forget the snapshot so its `Drop` does
-				// not run (the live copy still lives in the leaf).
+				// closure. For boxed storage `snapshot` is a Clone of
+				// the boxed V (its drop releases the cloned heap
+				// allocation); for inline storage `snapshot` is a copy
+				// of the V's bits (drop is a no-op).
 				let result = f(&snapshot);
-				core::mem::forget(snapshot);
+				drop(snapshot);
 				Ok(Some(result))
 			};
 
@@ -3795,25 +3815,36 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		// Bound `upper` by the InlineVec's compile-time capacity LC since
 		// `len` may be inconsistent under concurrent mutation (recheck
 		// will catch).
-		// SAFETY: see `Self::entries_ptr_raw`.
-		let entries_ptr = unsafe { Self::entries_ptr_raw(this) };
+		// SAFETY: `atomic_keys` is a `SlotArray<K::Slot, LC>` at a known
+		// field offset; raw projection without `&LeafNode` reborrow.
+		let keys_ptr: *const SlotArray<K::Slot, LC> =
+			unsafe { ptr::addr_of!((*this).atomic_keys) };
 		let mut lower: u16 = 0;
 		let mut upper: u16 = len.min(LC as u16);
 
 		while lower < upper {
 			let mid = ((upper - lower) / 2) + lower;
 
-			// Snapshot the K at position mid bitwise into a stack
-			// ManuallyDrop. The retag created by `&*mid_key_snapshot`
-			// below is on stack memory, not on the shared node.
+			// Atomic-load the K at position mid into a stack
+			// ManuallyDrop. `try_load_raw` returns `None` if the slot
+			// was concurrently emptied (boxed null pointer race); we
+			// treat that as "trust the bounds we already have" — the
+			// caller's outer recheck will fail and we'll retry. For
+			// inline storage `try_load_raw` always returns `Some`.
 			//
-			// SAFETY: `mid` < `upper` <= LC; entries_ptr is valid for
-			// at least LC elements. The K read is bitwise; we rely on
-			// `K: OptimisticRead` for soundness.
-			let mid_key_snapshot: core::mem::ManuallyDrop<K> = unsafe {
-				core::mem::ManuallyDrop::new(ptr::read(ptr::addr_of!(
-					(*entries_ptr.add(mid as usize)).0
-				)))
+			// SAFETY: `mid` < `upper` <= LC; the bounds check on the
+			// snapshot is validated later by the caller's recheck.
+			let mid_key_opt: Option<K> =
+				unsafe { SlotArray::try_load_raw(keys_ptr, mid as usize) };
+			let mid_key_snapshot: core::mem::ManuallyDrop<K> = match mid_key_opt {
+				Some(k) => core::mem::ManuallyDrop::new(k),
+				None => {
+					// Concurrent removal raced our read; return
+					// conservative bounds so the caller's recheck
+					// triggers a retry.
+					std::hint::cold_path();
+					return (lower, false);
+				}
 			};
 			let mid_key: &K = &mid_key_snapshot;
 
@@ -5073,24 +5104,146 @@ mod tests {
 		assert_eq!(std::sync::Arc::strong_count(&blob2.0), 3);
 	}
 
-	// Note: the concurrent stress tests for the optimistic-read fast
-	// path (epoch_deferred_drop_optimistic_reader_vs_defer_writer and
-	// k_deferred_drop_optimistic_reader_vs_defer_writer) live in
-	// `tests/concurrency.rs` rather than here. The raw-pointer
-	// projection refactor fixes the Tree-Borrows-retag race that PR-6
-	// introduced (Miri's TB analysis no longer complains about an `&`
-	// reborrow racing with a writer's exclusive-lock mutation), but
-	// Miri's data-race detector independently flags the underlying
-	// pattern: an optimistic reader's non-atomic `ptr::read(V)` racing
-	// with a writer's non-atomic `mem::replace(V)` is a data race by
-	// the Rust/C memory model, regardless of whether the version
-	// recheck catches inconsistency at runtime. Making the protocol
-	// pass Miri's data-race detector would require atomicising the V
-	// field (e.g. `AtomicPtr<V>` indirection), which restricts V to
-	// pointer-sized types — a much bigger redesign that is out of
-	// scope here. The integration tests under ASan/TSan continue to
-	// validate concurrent behaviour empirically. See the
-	// `optimistic` module docs for the full discussion.
+	// Concurrent stress tests for the optimistic-read fast path. These
+	// used to live in `tests/concurrency.rs` (kept out of `cargo miri
+	// test --lib`) because the optimistic reader's non-atomic
+	// `ptr::read(V)` would race with the writer's non-atomic
+	// `mem::replace(V)` per Miri's data-race detector. The atomic
+	// mirror migration (see [`crate::atomic_slot`]) replaces those
+	// non-atomic reads/writes with atomic loads/stores at matching
+	// `Acquire` / `Release` orderings, so the tests now run cleanly
+	// under Miri's `--lib` job.
+
+	#[test]
+	fn epoch_deferred_drop_optimistic_reader_vs_defer_writer() {
+		use std::sync::Arc;
+		use std::sync::atomic::AtomicBool;
+		use std::thread;
+
+		// Drastically scaled down for Miri's slower interpreter; the
+		// non-Miri build still gets a meaningful concurrent workload.
+		let keys: i32 = if cfg!(miri) { 8 } else { 200 };
+		let rounds: i32 = if cfg!(miri) { 4 } else { 50 };
+		let reader_threads = if cfg!(miri) { 2 } else { 4 };
+
+		let tree: Arc<Tree<i32, RefcountedBlob>> = Arc::new(Tree::new());
+		let stop = Arc::new(AtomicBool::new(false));
+
+		for i in 0..keys {
+			tree.insert_defer(i, RefcountedBlob(Arc::new(vec![i as u8; 32])));
+		}
+
+		let mut handles = Vec::new();
+		for _ in 0..reader_threads {
+			let tree = Arc::clone(&tree);
+			let stop = Arc::clone(&stop);
+			handles.push(thread::spawn(move || {
+				while !stop.load(Ordering::Relaxed) {
+					for k in 0..keys {
+						if let Some(blob) = tree.lookup_optimistic(&k, |v| v.clone()) {
+							// Touch the buffer so the optimiser cannot
+							// dead-code the clone away.
+							let s: usize = blob.0.iter().map(|&b| b as usize).sum();
+							std::hint::black_box(s);
+						}
+					}
+				}
+			}));
+		}
+
+		let writer = {
+			let tree = Arc::clone(&tree);
+			let stop = Arc::clone(&stop);
+			thread::spawn(move || {
+				for round in 0..rounds {
+					for k in 0..keys {
+						let v = RefcountedBlob(Arc::new(vec![(k + round) as u8; 32]));
+						tree.insert_defer(k, v);
+					}
+				}
+				stop.store(true, Ordering::Relaxed);
+			})
+		};
+
+		writer.join().unwrap();
+		for h in handles {
+			h.join().unwrap();
+		}
+	}
+
+	/// Stress for the K-deferred-drop extension: K is a refcounted type
+	/// with `EPOCH_DEFERRED_DROP = true`, and writers alternate
+	/// `insert_defer` / `remove_defer` so leaf K is actually dropped
+	/// (`remove_defer` defers both K and V drops via the epoch GC).
+	#[test]
+	fn k_deferred_drop_optimistic_reader_vs_defer_writer() {
+		use std::sync::Arc;
+		use std::sync::atomic::AtomicBool;
+		use std::thread;
+
+		// Wraps an Arc<Vec<u8>> so cloning is cheap and the K's `Drop`
+		// frees a shared heap buffer.
+		#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+		struct RcKey(Arc<Vec<u8>>);
+
+		// SAFETY: refcounted K with epoch-deferred drop semantics —
+		// concurrent optimistic readers' interior pointers stay valid
+		// until the next epoch tick.
+		unsafe impl OptimisticRead for RcKey {
+			const EPOCH_DEFERRED_DROP: bool = true;
+			type Slot = crate::atomic_slot::BoxedSlot<Self>;
+		}
+
+		let keys: u8 = if cfg!(miri) { 8 } else { 64 };
+		let rounds: u64 = if cfg!(miri) { 4 } else { 50 };
+		let reader_threads = if cfg!(miri) { 2 } else { 4 };
+
+		let mk_key = |i: u8| RcKey(Arc::new(vec![i; 8]));
+
+		let tree: Arc<Tree<RcKey, u64>> = Arc::new(Tree::new());
+		let stop = Arc::new(AtomicBool::new(false));
+
+		for i in 0..keys {
+			tree.insert_defer(mk_key(i), i as u64);
+		}
+
+		let mut handles = Vec::new();
+		for _ in 0..reader_threads {
+			let tree = Arc::clone(&tree);
+			let stop = Arc::clone(&stop);
+			handles.push(thread::spawn(move || {
+				while !stop.load(Ordering::Relaxed) {
+					for i in 0..keys {
+						let k = mk_key(i);
+						let _ = tree.lookup_optimistic(&k, |v| *v);
+					}
+				}
+			}));
+		}
+
+		let writer = {
+			let tree = Arc::clone(&tree);
+			let stop = Arc::clone(&stop);
+			thread::spawn(move || {
+				for round in 0..rounds {
+					for i in 0..keys {
+						let k = mk_key(i);
+						if round % 2 == 0 {
+							tree.remove_defer(&k);
+						} else {
+							tree.insert_defer(k, round * 100 + i as u64);
+						}
+					}
+				}
+				stop.store(true, Ordering::Relaxed);
+			})
+		};
+
+		writer.join().unwrap();
+		for h in handles {
+			h.join().unwrap();
+		}
+	}
 
 	#[test]
 	fn insert_update() {

@@ -260,6 +260,42 @@ pub unsafe trait OptimisticSlot: Default + Send + Sync + Sized {
 	/// The value type held in this slot.
 	type Value;
 
+	/// Attempt an atomic load that tolerates a concurrently emptied
+	/// slot. For inline storage this is equivalent to
+	/// [`load`](Self::load) wrapped in `Some`. For boxed storage it
+	/// returns `None` if the underlying `AtomicPtr` is null (i.e. the
+	/// slot was emptied between the caller observing `len` and the
+	/// load), letting the caller treat it as a recheck failure rather
+	/// than dereferencing a null pointer.
+	///
+	/// # Safety
+	///
+	/// - The caller must not assume the slot is init (the whole point
+	///   of this method is to tolerate concurrent emptying).
+	/// - For inline storage the load returns the current bit-pattern
+	///   regardless of init state; the caller's outer recheck disambiguates.
+	unsafe fn try_load(&self) -> Option<Self::Value>;
+
+	/// Same as [`try_load`](Self::try_load) but through a raw pointer,
+	/// without ever creating an `&Self` reborrow. Used by the optimistic-
+	/// read fast path under raw-pointer projection so that the read does
+	/// not conflict with the writer's protected `&mut` tag on the
+	/// surrounding node under Tree Borrows.
+	///
+	/// The trait's default implementation reborrows via `&*this`, which
+	/// is fine for slot types that consist solely of interior-mutable
+	/// atomic primitives. Custom slots that wrap non-atomic state must
+	/// override this method to project directly to their inner atomic.
+	///
+	/// # Safety
+	///
+	/// - `this` must be a valid pointer to `Self`.
+	/// - Caller must validate via the surrounding latch's version recheck.
+	#[inline]
+	unsafe fn try_load_raw_ptr(this: *const Self) -> Option<Self::Value> {
+		unsafe { (*this).try_load() }
+	}
+
 	/// The displaced-owner type returned when a value leaves the slot
 	/// (via [`swap_init`](Self::swap_init) or [`take_init`](Self::take_init)).
 	///
@@ -408,6 +444,26 @@ unsafe impl<T: AtomicLoadable + Default> OptimisticSlot for InlineSlot<T> {
 	}
 
 	#[inline]
+	unsafe fn try_load(&self) -> Option<T> {
+		// Inline storage always holds a valid bit-pattern (zero default
+		// for empty slots); the caller's outer recheck distinguishes.
+		Some(T::load_acquire(&self.inner))
+	}
+
+	#[inline]
+	unsafe fn try_load_raw_ptr(this: *const Self) -> Option<T> {
+		// Project directly to the inner `T::Atomic` without an
+		// `&InlineSlot` reborrow. `&T::Atomic` is interior-mutable
+		// (UnsafeCell underneath in stdlib atomics) and is Tree-Borrows-
+		// safe to reborrow concurrently with a writer's `&mut` on the
+		// surrounding node.
+		// SAFETY: `this` is a valid pointer; `inner` is at a known
+		// offset.
+		let atomic_ptr: *const T::Atomic = unsafe { ptr::addr_of!((*this).inner) };
+		Some(T::load_acquire(unsafe { &*atomic_ptr }))
+	}
+
+	#[inline]
 	unsafe fn store_into_empty(&self, value: T) {
 		// For inline storage, empty / init are tracked by the leaf's
 		// `len`; the underlying atomic always holds a valid T bit-pattern
@@ -508,6 +564,36 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 	}
 
 	#[inline]
+	unsafe fn try_load(&self) -> Option<T> {
+		let raw = self.inner.load(Ordering::Acquire);
+		if raw.is_null() {
+			return None;
+		}
+		// SAFETY: raw is non-null and points at a `T` whose lifetime is
+		// at least as long as the surrounding epoch guard the caller
+		// holds (writer routes displaced Boxes through epoch defer).
+		Some(unsafe { (*raw).clone() })
+	}
+
+	#[inline]
+	unsafe fn try_load_raw_ptr(this: *const Self) -> Option<T> {
+		// Project directly to the inner `AtomicPtr<T>` without going
+		// through an `&BoxedSlot` reborrow. `&AtomicPtr` is
+		// interior-mutable (UnsafeCell underneath) and is Tree-Borrows-
+		// safe to reborrow concurrently with a writer's `&mut` on the
+		// surrounding node; `&BoxedSlot` is not.
+		// SAFETY: `this` is a valid pointer to `BoxedSlot<T>` (caller's
+		// invariant); `inner` is at a known field offset.
+		let atomic_ptr: *const AtomicPtr<T> =
+			unsafe { ptr::addr_of!((*this).inner) };
+		let raw = unsafe { (*atomic_ptr).load(Ordering::Acquire) };
+		if raw.is_null() {
+			return None;
+		}
+		Some(unsafe { (*raw).clone() })
+	}
+
+	#[inline]
 	unsafe fn store_into_empty(&self, value: T) {
 		let raw = Box::into_raw(Box::new(value));
 		// `Release` ordering pairs with `Acquire` loads on readers.
@@ -602,6 +688,10 @@ unsafe impl OptimisticSlot for UnitSlot {
 	unsafe fn load_into<'a>(&'a self, buf: &'a mut MaybeUninit<()>) -> &'a () {
 		buf.write(())
 	}
+	#[inline]
+	unsafe fn try_load(&self) -> Option<()> {
+		Some(())
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +782,25 @@ where
 		// `S: OptimisticSlot` has interior mutability (atomic types).
 		let slot = unsafe { &*Self::slots_ptr(this).add(pos) };
 		unsafe { slot.load() }
+	}
+
+	/// Attempt an atomic load that tolerates a concurrently emptied
+	/// slot. See [`OptimisticSlot::try_load`]. Uses raw-pointer
+	/// projection through the slot's inner atomic (via
+	/// [`OptimisticSlot::try_load_raw_ptr`]) so no `&S` reborrow is
+	/// created — making this safe under Tree Borrows even when a
+	/// writer concurrently holds `&mut` on the surrounding node.
+	///
+	/// # Safety
+	///
+	/// - `this` must be a valid pointer to a `SlotArray<S, N>`.
+	/// - `pos < N`.
+	/// - Caller must validate via the surrounding latch's version recheck.
+	#[inline]
+	pub unsafe fn try_load_raw(this: *const Self, pos: usize) -> Option<S::Value> {
+		debug_assert!(pos < N);
+		let slot_ptr = unsafe { Self::slots_ptr(this).add(pos) };
+		unsafe { S::try_load_raw_ptr(slot_ptr) }
 	}
 
 	/// Load the value at `pos` into a caller-provided buffer for
