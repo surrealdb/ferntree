@@ -562,6 +562,27 @@ impl<'a, T> OptimisticGuard<'a, T> {
 	pub fn latch(&self) -> &'a HybridLatch<T> {
 		self.latch
 	}
+
+	/// Returns a raw pointer to the protected data.
+	///
+	/// This is the only way to access the protected `T` without creating
+	/// an `&T` reborrow. Used by the optimistic read fast path to project
+	/// to individual fields via [`core::ptr::addr_of!`] / [`core::ptr::read`]
+	/// without retags that would race (under Tree Borrows) with a
+	/// concurrent writer's non-atomic mutation under exclusive lock.
+	///
+	/// # Safety contract for callers
+	///
+	/// The pointer is valid for the lifetime of the guard. Any data read
+	/// through it is potentially torn until the caller verifies version
+	/// consistency via [`recheck`](Self::recheck). The returned pointer
+	/// must NOT be reborrowed as `&T` until after a successful recheck
+	/// (and even then, only if the data has no interior pointers that a
+	/// concurrent writer could have invalidated).
+	#[inline]
+	pub fn as_ptr(&self) -> *const T {
+		self.data
+	}
 }
 
 impl<'a, T> std::ops::Deref for OptimisticGuard<'a, T> {

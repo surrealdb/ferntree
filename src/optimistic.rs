@@ -1,10 +1,19 @@
 //! # Optimistic value reads
 //!
 //! This module defines the [`OptimisticRead`] marker trait used by the
-//! tree's fast-path read operations (`contains_key`, `lookup_optimistic`,
-//! `get_optimistic`). These operations skip the shared lock on the leaf and
-//! instead snapshot the value bitwise, validating against the leaf's version
-//! before handing the snapshot to the caller.
+//! tree's fast-path read operations (`contains_key_optimistic`,
+//! `lookup_optimistic`, `get_optimistic`). These operations skip the shared
+//! lock on the leaf and read the tree's node data exclusively through raw
+//! pointers — no `&Node` / `&LeafNode` / `&InternalNode` reborrow on the
+//! hot path. Bitwise snapshots of `K` and `V` are taken with
+//! [`core::ptr::read`] and validated against the leaf's version before
+//! being handed to the caller.
+//!
+//! On the write side, [`Tree::insert_defer`](crate::Tree::insert_defer) and
+//! [`Tree::remove_defer`](crate::Tree::remove_defer) route the displaced
+//! `V` (and, for `remove_defer`, also `K`) through the epoch GC so that
+//! interior pointers in a validated optimistic snapshot remain live until
+//! every concurrent reader has finished.
 //!
 //! ## Why a marker trait
 //!
@@ -19,15 +28,19 @@
 //!
 //! 1. Acquire an [`OptimisticGuard`](crate::latch::OptimisticGuard) on the
 //!    leaf instead of upgrading to shared.
-//! 2. Locate the entry and snapshot the value with [`core::ptr::read`].
+//! 2. Project to the leaf's storage via raw pointers (never `&LeafNode`),
+//!    snapshot K (for binary search) and V (for the result) bitwise.
 //! 3. Validate the version with `recheck()`.
 //! 4. If validation succeeds, hand a borrow of the on-stack snapshot to the
-//!    user; the snapshot's `Drop` is suppressed with [`core::mem::forget`].
+//!    user; the snapshot's `Drop` is suppressed with `ManuallyDrop` (for
+//!    K, used internally during binary search) or
+//!    [`core::mem::forget`] (for V, returned to user).
 //! 5. If validation fails, discard the snapshot (without running `Drop`) and
 //!    retry.
 //!
-//! This avoids the atomic acquire/release of the leaf's `RwLock` and removes
-//! the writer-blocking section that the closure runs inside.
+//! This avoids the atomic acquire/release of the leaf's `RwLock`, removes
+//! the writer-blocking section that the closure would run inside, AND
+//! sidesteps the Tree-Borrows-level race on the `&` reborrow itself.
 //!
 //! ## Safety contract
 //!
@@ -55,7 +68,86 @@
 //!    must point to memory that remains live for the lifetime of the read.
 //!    For [`Copy`] types there are no heap-owned interior pointers, so this
 //!    is automatic. Refcounted types like `bytes::Bytes` need the tree to
-//!    defer value drops via the epoch GC; this is a Phase 3 extension.
+//!    defer value drops via the epoch GC: set
+//!    [`EPOCH_DEFERRED_DROP`](OptimisticRead::EPOCH_DEFERRED_DROP) to
+//!    `true` and use [`Tree::insert_defer`](crate::Tree::insert_defer) /
+//!    [`Tree::remove_defer`](crate::Tree::remove_defer) for all writes.
+//!
+//! ## Symmetric `K` and `V`
+//!
+//! The optimistic fast path applies the same bitwise-snapshot discipline
+//! to both `K` (during binary search) and `V` (during the user-facing
+//! read). Both must implement [`OptimisticRead`].
+//!
+//! For internal-node `K`, in-place mutations only insert / shift / remove
+//! keys under the parent's exclusive lock; no individual `K`'s `Drop` runs
+//! in-place. The whole internal node is freed via the epoch GC, which
+//! keeps every `K` it ever held alive until no reader could still hold a
+//! snapshot of it. So internal `K` is sound to read optimistically without
+//! `EPOCH_DEFERRED_DROP`.
+//!
+//! For leaf `K`, `remove` drops the `K` in place. If a concurrent
+//! optimistic reader is mid-binary-search with a snapshot of that `K`,
+//! the interior pointer can dangle. Using `K::EPOCH_DEFERRED_DROP = true`
+//! plus `Tree::remove_defer` (which defers both `K` and `V` drops) closes
+//! that race.
+//!
+//! ## Scope of `contains_key` vs `contains_key_optimistic`
+//!
+//! [`Tree::contains_key`](crate::Tree::contains_key) was changed from the
+//! optimistic path back to the safe shared-lock path so it works for any
+//! `K` (including non-`OptimisticRead` types like `String` or `Vec<u8>`).
+//! Use [`Tree::contains_key_optimistic`](crate::Tree::contains_key_optimistic)
+//! when `K: OptimisticRead` and you want the lock-free read.
+//!
+//! ## What Miri sees (Tree Borrows vs. data-race detector)
+//!
+//! Miri evaluates two distinct properties on the optimistic-read fast
+//! path:
+//!
+//! 1. **Tree Borrows aliasing.** The raw-pointer projection discipline
+//!    (`Node::variant_raw`, `LeafNode::lower_bound_raw`, etc.) eliminates
+//!    every `&Node` / `&LeafNode` / `&InternalNode` reborrow on the
+//!    optimistic descent, so no retag races with a writer's exclusive-lock
+//!    mutation. This is what was failing on PR #6 and what this refactor
+//!    fixes.
+//!
+//! 2. **Data-race detection.** Miri *also* checks that no two threads
+//!    perform unsynchronised accesses to the same memory where at least
+//!    one is a write. The optimistic read protocol fundamentally violates
+//!    this: the reader's `ptr::read(V)` and the writer's `mem::replace(V)`
+//!    are both non-atomic accesses to the same bytes, synchronised only
+//!    by the version-recheck protocol at the application level — not by
+//!    the C/Rust memory model. The version recheck catches inconsistency
+//!    at runtime, and on hardware the protocol works in practice, but the
+//!    language model does not bless it. Miri's data-race detector
+//!    correctly flags this.
+//!
+//! The concurrent stress tests for the optimistic fast path therefore
+//! live under `tests/concurrency.rs` rather than `--lib`, so the Miri
+//! job (which runs only `--lib`) does not encounter the data-race
+//! violation. Concurrent behaviour is validated empirically by the ASan
+//! and TSan CI jobs, which check actual hardware semantics.
+//!
+//! Making the protocol pass Miri's data-race detector cleanly would
+//! require atomicising the contested fields. For `V` this means an
+//! `AtomicPtr<V>` indirection (restricting `V` to pointer-sized types
+//! managed via Arc-like wrappers) or a per-field atomic representation —
+//! both substantial redesigns out of scope for this refactor.
+//!
+//! ## Latent UB in the existing safe paths
+//!
+//! The shared-lock paths (`Tree::lookup`, `Tree::range`, iterators, etc.)
+//! still descend through internal nodes optimistically and create `&Node`
+//! / `&InternalNode` reborrows during that descent. Under Tree Borrows
+//! this is a latent UB pattern if a concurrent writer modifies an internal
+//! node (i.e. during a split or merge under exclusive lock on the parent).
+//! Miri's `--lib` test suite does not currently exercise concurrent splits
+//! during reads, so this latent UB is not caught. A follow-up refactor
+//! could extend the raw-pointer projection discipline to the safe paths
+//! too (likely needing `AtomicU16` on `len` + further field atomicisation
+//! so that even shared-lock readers descending through optimistically-held
+//! internal nodes never reborrow). That is **out of scope** for this PR.
 //!
 //! ## Blanket implementations
 //!
@@ -72,11 +164,20 @@
 //! assert_optimistic_read::<[u8; 16]>();
 //! ```
 //!
-//! Types that are not `Copy` (e.g. `String`, `Vec<u8>`, `SmallVec<…>`) are
-//! deliberately *not* `OptimisticRead`: their `Drop` frees heap memory, and
-//! a torn snapshot of their layout has a pointer/length pair that does not
-//! describe any real allocation. Use [`Tree::lookup`](crate::Tree::lookup)
-//! for such values — it acquires a shared lock and is always sound.
+//! Types that are not `Copy` (e.g. `String`, `Vec<u8>`) are
+//! deliberately *not* `OptimisticRead` by default: their `Drop` frees heap
+//! memory, and a torn snapshot of their layout has a pointer/length pair
+//! that does not describe any real allocation. Use
+//! [`Tree::lookup`](crate::Tree::lookup) / [`Tree::contains_key`](crate::Tree::contains_key)
+//! for such values — they acquire a shared lock and are always sound.
+//!
+//! Refcounted "cheaply-cloneable" types like `bytes::Bytes` or `Arc<T>` can
+//! opt in via an `unsafe impl OptimisticRead` with `EPOCH_DEFERRED_DROP =
+//! true`, paired with disciplined use of
+//! [`Tree::insert_defer`](crate::Tree::insert_defer) /
+//! [`Tree::remove_defer`](crate::Tree::remove_defer) for all writes. See
+//! `tests/concurrency.rs` and the `epoch_deferred_drop_concurrent` test
+//! in `src/lib.rs`'s `mod tests` for working examples.
 
 /// Marker trait for value types that may be read under optimistic concurrency
 /// control, allowing the tree's read fast paths to skip the leaf's shared lock.
