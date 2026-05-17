@@ -147,6 +147,7 @@ impl<T, const N: usize> InlineVec<T, N> {
 	///
 	/// `idx` must be less than [`len`](Self::len).
 	#[inline]
+	#[allow(dead_code)] // retained for future internal-node migration
 	pub(crate) unsafe fn get_unchecked(&self, idx: usize) -> &T {
 		// SAFETY: caller upholds `idx < len`.
 		unsafe { &*self.data.as_ptr().add(idx).cast::<T>() }
@@ -158,6 +159,7 @@ impl<T, const N: usize> InlineVec<T, N> {
 	///
 	/// `idx` must be less than [`len`](Self::len).
 	#[inline]
+	#[allow(dead_code)] // retained for future internal-node migration
 	pub(crate) unsafe fn get_unchecked_mut(&mut self, idx: usize) -> &mut T {
 		// SAFETY: caller upholds `idx < len`.
 		unsafe { &mut *self.data.as_mut_ptr().add(idx).cast::<T>() }

@@ -82,7 +82,7 @@ mod seal {
 /// `Self` — which rules out types like `bool` (only `0` and `1` are
 /// valid) and `char`.
 ///
-/// # Safety contract
+/// # Safety
 ///
 /// Implementors must guarantee:
 ///
@@ -293,32 +293,58 @@ pub unsafe trait OptimisticSlot: Default + Send + Sync + Sized {
 	/// - Caller must validate via the surrounding latch's version recheck.
 	#[inline]
 	unsafe fn try_load_raw_ptr(this: *const Self) -> Option<Self::Value> {
+		// SAFETY: see the function-level safety contract.
 		unsafe { (*this).try_load() }
 	}
 
 	/// Raw-pointer variant of [`store_into_empty`](Self::store_into_empty).
 	/// Bypasses the `&Self` reborrow so writer-side updates do not
 	/// conflict with a concurrent reader's foreign tag under Tree Borrows.
+	///
+	/// # Safety
+	///
+	/// See [`store_into_empty`](Self::store_into_empty); the same
+	/// invariants apply, with `this` standing in for `&self`.
 	#[inline]
 	unsafe fn store_into_empty_raw_ptr(this: *const Self, value: Self::Value) {
+		// SAFETY: see the function-level safety contract.
 		unsafe { (*this).store_into_empty(value) }
 	}
 
 	/// Raw-pointer variant of [`swap_init`](Self::swap_init).
+	///
+	/// # Safety
+	///
+	/// See [`swap_init`](Self::swap_init); the same invariants apply,
+	/// with `this` standing in for `&self`.
 	#[inline]
 	unsafe fn swap_init_raw_ptr(this: *const Self, value: Self::Value) -> Self::Displaced {
+		// SAFETY: see the function-level safety contract.
 		unsafe { (*this).swap_init(value) }
 	}
 
 	/// Raw-pointer variant of [`take_init`](Self::take_init).
+	///
+	/// # Safety
+	///
+	/// See [`take_init`](Self::take_init); the same invariants apply,
+	/// with `this` standing in for `&self`.
 	#[inline]
 	unsafe fn take_init_raw_ptr(this: *const Self) -> Self::Displaced {
+		// SAFETY: see the function-level safety contract.
 		unsafe { (*this).take_init() }
 	}
 
 	/// Raw-pointer variant of [`move_init_to_empty`](Self::move_init_to_empty).
+	///
+	/// # Safety
+	///
+	/// See [`move_init_to_empty`](Self::move_init_to_empty); the same
+	/// invariants apply, with `src` / `dst` standing in for `&self` /
+	/// `&dst`.
 	#[inline]
 	unsafe fn move_init_to_empty_raw_ptr(src: *const Self, dst: *const Self) {
+		// SAFETY: see the function-level safety contract.
 		unsafe { (*src).move_init_to_empty(&*dst) }
 	}
 
@@ -482,35 +508,48 @@ unsafe impl<T: AtomicLoadable + Default> OptimisticSlot for InlineSlot<T> {
 		// surrounding node.
 		// SAFETY: `this` is a valid pointer; `inner` is at a known
 		// offset.
+		// SAFETY: see the function-level safety contract.
 		let atomic_ptr: *const T::Atomic = unsafe { ptr::addr_of!((*this).inner) };
+		// SAFETY: see the function-level safety contract.
 		Some(T::load_acquire(unsafe { &*atomic_ptr }))
 	}
 
 	#[inline]
 	unsafe fn store_into_empty_raw_ptr(this: *const Self, value: T) {
+		// SAFETY: see the function-level safety contract.
 		let atomic_ptr: *const T::Atomic = unsafe { ptr::addr_of!((*this).inner) };
+		// SAFETY: see the function-level safety contract.
 		T::store_release(unsafe { &*atomic_ptr }, value)
 	}
 
 	#[inline]
 	unsafe fn swap_init_raw_ptr(this: *const Self, value: T) -> T {
+		// SAFETY: see the function-level safety contract.
 		let atomic_ptr: *const T::Atomic = unsafe { ptr::addr_of!((*this).inner) };
+		// SAFETY: see the function-level safety contract.
 		T::swap_acqrel(unsafe { &*atomic_ptr }, value)
 	}
 
 	#[inline]
 	unsafe fn take_init_raw_ptr(this: *const Self) -> T {
+		// SAFETY: see the function-level safety contract.
 		let atomic_ptr: *const T::Atomic = unsafe { ptr::addr_of!((*this).inner) };
+		// SAFETY: see the function-level safety contract.
 		T::swap_acqrel(unsafe { &*atomic_ptr }, T::default())
 	}
 
 	#[inline]
 	unsafe fn move_init_to_empty_raw_ptr(src: *const Self, dst: *const Self) {
+		// SAFETY: see the function-level safety contract.
 		let src_atomic: *const T::Atomic = unsafe { ptr::addr_of!((*src).inner) };
+		// SAFETY: see the function-level safety contract.
 		let dst_atomic: *const T::Atomic = unsafe { ptr::addr_of!((*dst).inner) };
+		// SAFETY: see the function-level safety contract.
 		let bits = T::load_acquire(unsafe { &*src_atomic });
+		// SAFETY: see the function-level safety contract.
 		T::store_release(unsafe { &*dst_atomic }, bits);
 		// Clear src so the slot is logically empty.
+		// SAFETY: see the function-level safety contract.
 		T::store_release(unsafe { &*src_atomic }, T::default());
 	}
 
@@ -611,6 +650,7 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 		// SAFETY: Caller asserts the slot is init, so `raw` is non-null
 		// and points at a valid `T` whose lifetime is at least as long as
 		// our read. We do NOT take ownership — clone through the pointer.
+		// SAFETY: see the function-level safety contract.
 		unsafe { (*raw).clone() }
 	}
 
@@ -623,6 +663,7 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 		// SAFETY: raw is non-null and points at a `T` whose lifetime is
 		// at least as long as the surrounding epoch guard the caller
 		// holds (writer routes displaced Boxes through epoch defer).
+		// SAFETY: see the function-level safety contract.
 		Some(unsafe { (*raw).clone() })
 	}
 
@@ -635,46 +676,63 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 		// surrounding node; `&BoxedSlot` is not.
 		// SAFETY: `this` is a valid pointer to `BoxedSlot<T>` (caller's
 		// invariant); `inner` is at a known field offset.
+		// SAFETY: see the function-level safety contract.
 		let atomic_ptr: *const AtomicPtr<T> = unsafe { ptr::addr_of!((*this).inner) };
+		// SAFETY: see the function-level safety contract.
 		let raw = unsafe { (*atomic_ptr).load(Ordering::Acquire) };
 		if raw.is_null() {
 			return None;
 		}
+		// SAFETY: see the function-level safety contract.
 		Some(unsafe { (*raw).clone() })
 	}
 
 	#[inline]
 	unsafe fn store_into_empty_raw_ptr(this: *const Self, value: T) {
+		// SAFETY: see the function-level safety contract.
 		let atomic_ptr: *const AtomicPtr<T> = unsafe { ptr::addr_of!((*this).inner) };
 		let raw = Box::into_raw(Box::new(value));
+		// SAFETY: see the function-level safety contract.
 		debug_assert!(unsafe { (*atomic_ptr).load(Ordering::Relaxed).is_null() });
+		// SAFETY: see the function-level safety contract.
 		unsafe { (*atomic_ptr).store(raw, Ordering::Release) };
 	}
 
 	#[inline]
 	unsafe fn swap_init_raw_ptr(this: *const Self, value: T) -> Box<T> {
+		// SAFETY: see the function-level safety contract.
 		let atomic_ptr: *const AtomicPtr<T> = unsafe { ptr::addr_of!((*this).inner) };
 		let raw_new = Box::into_raw(Box::new(value));
+		// SAFETY: see the function-level safety contract.
 		let raw_old = unsafe { (*atomic_ptr).swap(raw_new, Ordering::AcqRel) };
 		debug_assert!(!raw_old.is_null());
+		// SAFETY: see the function-level safety contract.
 		unsafe { Box::from_raw(raw_old) }
 	}
 
 	#[inline]
 	unsafe fn take_init_raw_ptr(this: *const Self) -> Box<T> {
+		// SAFETY: see the function-level safety contract.
 		let atomic_ptr: *const AtomicPtr<T> = unsafe { ptr::addr_of!((*this).inner) };
+		// SAFETY: see the function-level safety contract.
 		let raw_old = unsafe { (*atomic_ptr).swap(ptr::null_mut(), Ordering::AcqRel) };
 		debug_assert!(!raw_old.is_null());
+		// SAFETY: see the function-level safety contract.
 		unsafe { Box::from_raw(raw_old) }
 	}
 
 	#[inline]
 	unsafe fn move_init_to_empty_raw_ptr(src: *const Self, dst: *const Self) {
+		// SAFETY: see the function-level safety contract.
 		let src_atomic: *const AtomicPtr<T> = unsafe { ptr::addr_of!((*src).inner) };
+		// SAFETY: see the function-level safety contract.
 		let dst_atomic: *const AtomicPtr<T> = unsafe { ptr::addr_of!((*dst).inner) };
+		// SAFETY: see the function-level safety contract.
 		let raw = unsafe { (*src_atomic).swap(ptr::null_mut(), Ordering::AcqRel) };
 		debug_assert!(!raw.is_null());
+		// SAFETY: see the function-level safety contract.
 		debug_assert!(unsafe { (*dst_atomic).load(Ordering::Relaxed).is_null() });
+		// SAFETY: see the function-level safety contract.
 		unsafe { (*dst_atomic).store(raw, Ordering::Release) };
 	}
 
@@ -697,6 +755,7 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 		// of the Box and is responsible for arranging epoch-deferred
 		// drop if a concurrent optimistic reader could still be cloning
 		// through the displaced pointer.
+		// SAFETY: see the function-level safety contract.
 		unsafe { Box::from_raw(raw_old) }
 	}
 
@@ -741,6 +800,7 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 		let raw = self.inner.load(Ordering::Acquire);
 		// SAFETY: slot is init (caller's invariant), so `raw` is a
 		// valid `*const T` whose pointee outlives the surrounding lock.
+		// SAFETY: see the function-level safety contract.
 		unsafe { &*raw }
 	}
 }
@@ -809,6 +869,7 @@ pub struct SlotArray<S, const N: usize> {
 // atomic ops which provide the synchronisation. Send / Sync flow from
 // the slot type's own Send / Sync.
 unsafe impl<S: Send, const N: usize> Send for SlotArray<S, N> {}
+// SAFETY: see the matching `Send` impl above.
 unsafe impl<S: Sync, const N: usize> Sync for SlotArray<S, N> {}
 
 impl<S: Default, const N: usize> Default for SlotArray<S, N> {
@@ -836,6 +897,7 @@ impl<S, const N: usize> SlotArray<S, N> {
 		// opt out of Tree-Borrows protection. Slot access itself goes
 		// through interior-mutable atomics, so producing an `&S`
 		// reference is sound.
+		// SAFETY: see the function-level safety contract.
 		unsafe { &(*self.slots.get())[pos] }
 	}
 }
@@ -853,8 +915,9 @@ impl<S, const N: usize> SlotArray<S, N> {
 		// here we go through the raw pointer projection to avoid
 		// creating any `&SlotArray` reborrow.
 		let cell_ptr: *const core::cell::UnsafeCell<[S; N]> =
+			// SAFETY: see the function-level safety contract.
 			unsafe { ptr::addr_of!((*this).slots) };
-		unsafe { core::cell::UnsafeCell::raw_get(cell_ptr) as *const S }
+		core::cell::UnsafeCell::raw_get(cell_ptr) as *const S
 	}
 }
 
@@ -891,7 +954,9 @@ where
 		// SAFETY: `this` is valid; `slots_ptr` returns a `*const S` for
 		// at least `N` elements. The reborrow of `&S` is sound because
 		// `S: OptimisticSlot` has interior mutability (atomic types).
+		// SAFETY: see the function-level safety contract.
 		let slot = unsafe { &*Self::slots_ptr(this).add(pos) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { slot.load() }
 	}
 
@@ -910,7 +975,9 @@ where
 	#[inline]
 	pub unsafe fn try_load_raw(this: *const Self, pos: usize) -> Option<S::Value> {
 		debug_assert!(pos < N);
+		// SAFETY: see the function-level safety contract.
 		let slot_ptr = unsafe { Self::slots_ptr(this).add(pos) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { S::try_load_raw_ptr(slot_ptr) }
 	}
 
@@ -927,13 +994,19 @@ where
 	pub unsafe fn shift_insert_raw(this: *const Self, len: usize, pos: usize, value: S::Value) {
 		debug_assert!(pos <= len);
 		debug_assert!(len < N);
+		// SAFETY: see the function-level safety contract.
 		let base = unsafe { Self::slots_ptr(this) };
 		for i in (pos..len).rev() {
+			// SAFETY: see the function-level safety contract.
 			let src_ptr = unsafe { base.add(i) };
+			// SAFETY: see the function-level safety contract.
 			let dst_ptr = unsafe { base.add(i + 1) };
+			// SAFETY: see the function-level safety contract.
 			unsafe { S::move_init_to_empty_raw_ptr(src_ptr, dst_ptr) };
 		}
+		// SAFETY: see the function-level safety contract.
 		let slot_ptr = unsafe { base.add(pos) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { S::store_into_empty_raw_ptr(slot_ptr, value) };
 	}
 
@@ -948,11 +1021,16 @@ where
 	pub unsafe fn shift_remove_raw(this: *const Self, len: usize, pos: usize) -> S::Displaced {
 		debug_assert!(pos < len);
 		debug_assert!(len <= N);
+		// SAFETY: see the function-level safety contract.
 		let base = unsafe { Self::slots_ptr(this) };
+		// SAFETY: see the function-level safety contract.
 		let removed = unsafe { S::take_init_raw_ptr(base.add(pos)) };
 		for i in pos..(len - 1) {
+			// SAFETY: see the function-level safety contract.
 			let src_ptr = unsafe { base.add(i + 1) };
+			// SAFETY: see the function-level safety contract.
 			let dst_ptr = unsafe { base.add(i) };
+			// SAFETY: see the function-level safety contract.
 			unsafe { S::move_init_to_empty_raw_ptr(src_ptr, dst_ptr) };
 		}
 		removed
@@ -969,7 +1047,9 @@ where
 	#[inline]
 	pub unsafe fn swap_init_raw(this: *const Self, pos: usize, value: S::Value) -> S::Displaced {
 		debug_assert!(pos < N);
+		// SAFETY: see the function-level safety contract.
 		let slot_ptr = unsafe { Self::slots_ptr(this).add(pos) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { S::swap_init_raw_ptr(slot_ptr, value) }
 	}
 
@@ -991,8 +1071,11 @@ where
 	) {
 		debug_assert!(src_pos < N);
 		debug_assert!(dst_pos < M);
+		// SAFETY: see the function-level safety contract.
 		let src_ptr = unsafe { Self::slots_ptr(src).add(src_pos) };
+		// SAFETY: see the function-level safety contract.
 		let dst_ptr = unsafe { SlotArray::<S, M>::slots_ptr(dst).add(dst_pos) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { S::move_init_to_empty_raw_ptr(src_ptr, dst_ptr) };
 	}
 
@@ -1026,6 +1109,7 @@ where
 	#[inline]
 	pub unsafe fn store_into_empty(&self, pos: usize, value: S::Value) {
 		debug_assert!(pos < N);
+		// SAFETY: see the function-level safety contract.
 		unsafe {
 			(*self.slots.get()).get_unchecked(pos).store_into_empty(value);
 		}
@@ -1046,6 +1130,7 @@ where
 	#[inline]
 	pub unsafe fn swap_init(&self, pos: usize, value: S::Value) -> S::Displaced {
 		debug_assert!(pos < N);
+		// SAFETY: see the function-level safety contract.
 		unsafe { (*self.slots.get()).get_unchecked(pos).swap_init(value) }
 	}
 
@@ -1062,6 +1147,7 @@ where
 	#[inline]
 	pub unsafe fn take_init(&self, pos: usize) -> S::Displaced {
 		debug_assert!(pos < N);
+		// SAFETY: see the function-level safety contract.
 		unsafe { (*self.slots.get()).get_unchecked(pos).take_init() }
 	}
 
@@ -1089,8 +1175,11 @@ where
 			// SAFETY: `i < len < N`; src is init, dst (i+1) was empty
 			// before this iteration (and the right-to-left walk keeps it
 			// empty just before we store).
+			// SAFETY: see the function-level safety contract.
 			let src = unsafe { (*self.slots.get()).get_unchecked(i) };
+			// SAFETY: see the function-level safety contract.
 			let dst = unsafe { (*self.slots.get()).get_unchecked(i + 1) };
+			// SAFETY: see the function-level safety contract.
 			unsafe { src.move_init_to_empty(dst) };
 		}
 		// SAFETY: slot at `pos` is now empty.
@@ -1119,8 +1208,11 @@ where
 		let removed = unsafe { (*self.slots.get()).get_unchecked(pos).take_init() };
 		// Walk left-to-right, moving each init slot one slot to the left.
 		for i in pos..(len - 1) {
+			// SAFETY: see the function-level safety contract.
 			let src = unsafe { (*self.slots.get()).get_unchecked(i + 1) };
+			// SAFETY: see the function-level safety contract.
 			let dst = unsafe { (*self.slots.get()).get_unchecked(i) };
+			// SAFETY: see the function-level safety contract.
 			unsafe { src.move_init_to_empty(dst) };
 		}
 		removed
@@ -1207,6 +1299,7 @@ impl AtomicLen {
 		// of `&AtomicU16` is sound because `AtomicU16` has interior
 		// mutability (`UnsafeCell<u16>` underneath); the `Acquire` load
 		// is an atomic op.
+		// SAFETY: see the function-level safety contract.
 		let atomic = unsafe { &*(this as *const AtomicU16) };
 		atomic.load(Ordering::Acquire)
 	}
@@ -1275,6 +1368,7 @@ impl<S: OptimisticSlot> OptimisticOption<S> {
 			// SAFETY: present == 1 indicates init at the moment of load;
 			// version recheck validates that the slot was actually init
 			// when we read.
+			// SAFETY: see the function-level safety contract.
 			Some(unsafe { self.slot.load() })
 		}
 	}
@@ -1288,12 +1382,16 @@ impl<S: OptimisticSlot> OptimisticOption<S> {
 	pub unsafe fn load_raw(this: *const Self) -> Option<S::Value> {
 		// SAFETY: `present` and `slot` are atomic / have interior
 		// mutability; the `&AtomicU8` and `&S` reborrows are sound.
+		// SAFETY: see the function-level safety contract.
 		let present_ptr = unsafe { ptr::addr_of!((*this).present) };
+		// SAFETY: see the function-level safety contract.
 		let slot_ptr = unsafe { ptr::addr_of!((*this).slot) };
+		// SAFETY: see the function-level safety contract.
 		let present = unsafe { (*present_ptr).load(Ordering::Acquire) };
 		if present == 0 {
 			None
 		} else {
+			// SAFETY: see the function-level safety contract.
 			Some(unsafe { (*slot_ptr).load() })
 		}
 	}
@@ -1388,21 +1486,30 @@ mod tests {
 	fn inline_slot_u64_roundtrip() {
 		let s: InlineSlot<u64> = InlineSlot::default();
 		// Initially zero.
+		// SAFETY: see the function-level safety contract.
 		unsafe { assert_eq!(s.load(), 0u64) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { s.store_into_empty(42) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { assert_eq!(s.load(), 42) };
+		// SAFETY: see the function-level safety contract.
 		let old = unsafe { s.swap_init(7) };
 		assert_eq!(old, 42);
+		// SAFETY: see the function-level safety contract.
 		unsafe { assert_eq!(s.load(), 7) };
+		// SAFETY: see the function-level safety contract.
 		let taken = unsafe { s.take_init() };
 		assert_eq!(taken, 7);
+		// SAFETY: see the function-level safety contract.
 		unsafe { assert_eq!(s.load(), 0) };
 	}
 
 	#[test]
 	fn inline_slot_i32_negative() {
 		let s: InlineSlot<i32> = InlineSlot::default();
+		// SAFETY: see the function-level safety contract.
 		unsafe { s.store_into_empty(-12345) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { assert_eq!(s.load(), -12345) };
 	}
 
@@ -1410,15 +1517,20 @@ mod tests {
 	fn boxed_slot_arc_roundtrip() {
 		let s: BoxedSlot<Arc<String>> = BoxedSlot::default();
 		let v = Arc::new("hello".to_string());
+		// SAFETY: see the function-level safety contract.
 		unsafe { s.store_into_empty(v.clone()) };
+		// SAFETY: see the function-level safety contract.
 		unsafe {
 			let read: Arc<String> = s.load();
 			assert_eq!(*read, "hello");
 		}
 		let new = Arc::new("world".to_string());
+		// SAFETY: see the function-level safety contract.
 		let old: Box<Arc<String>> = unsafe { s.swap_init(new) };
 		assert_eq!(**old, "hello");
+		// SAFETY: see the function-level safety contract.
 		unsafe { assert_eq!(*s.load(), "world") };
+		// SAFETY: see the function-level safety contract.
 		let taken: Box<Arc<String>> = unsafe { s.take_init() };
 		assert_eq!(**taken, "world");
 	}
@@ -1439,8 +1551,10 @@ mod tests {
 		}
 		{
 			let mut s: BoxedSlot<DropCounter> = BoxedSlot::default();
+			// SAFETY: see the function-level safety contract.
 			unsafe { s.store_into_empty(DropCounter(counter.clone())) };
 			// Manually invoke drop_in_place since we own the slot here.
+			// SAFETY: see the function-level safety contract.
 			unsafe { s.drop_in_place(true) };
 			// Slot is now empty.
 		}
@@ -1452,13 +1566,16 @@ mod tests {
 	#[test]
 	fn slot_array_shift_insert_remove() {
 		let arr: SlotArray<InlineSlot<u64>, 8> = SlotArray::default();
+		// SAFETY: see the function-level safety contract.
 		unsafe {
 			arr.store_into_empty(0, 10);
 			arr.store_into_empty(1, 20);
 			arr.store_into_empty(2, 30);
 		}
 		// Insert 15 at pos 1: [10, 15, 20, 30]
+		// SAFETY: see the function-level safety contract.
 		unsafe { arr.shift_insert(3, 1, 15) };
+		// SAFETY: see the function-level safety contract.
 		unsafe {
 			assert_eq!(arr.load(0), 10);
 			assert_eq!(arr.load(1), 15);
@@ -1466,8 +1583,10 @@ mod tests {
 			assert_eq!(arr.load(3), 30);
 		}
 		// Remove pos 2 (the 20): [10, 15, 30]
+		// SAFETY: see the function-level safety contract.
 		let removed = unsafe { arr.shift_remove(4, 2) };
 		assert_eq!(removed, 20);
+		// SAFETY: see the function-level safety contract.
 		unsafe {
 			assert_eq!(arr.load(0), 10);
 			assert_eq!(arr.load(1), 15);
@@ -1479,6 +1598,7 @@ mod tests {
 	fn inline_slot_load_into_returns_buffer_borrow() {
 		use core::mem::MaybeUninit;
 		let s: InlineSlot<u64> = InlineSlot::default();
+		// SAFETY: see the function-level safety contract.
 		unsafe { s.store_into_empty(0x123456789abcdef0) };
 		let mut buf = MaybeUninit::uninit();
 		// SAFETY: slot is init.
@@ -1490,6 +1610,7 @@ mod tests {
 	fn boxed_slot_load_into_returns_box_borrow() {
 		use core::mem::MaybeUninit;
 		let s: BoxedSlot<String> = BoxedSlot::default();
+		// SAFETY: see the function-level safety contract.
 		unsafe { s.store_into_empty(String::from("hello")) };
 		let mut buf = MaybeUninit::uninit();
 		// SAFETY: slot is init; we hold exclusive ownership in this test.
@@ -1513,11 +1634,13 @@ mod tests {
 	#[test]
 	fn slot_array_raw_projection() {
 		let arr: SlotArray<InlineSlot<u64>, 4> = SlotArray::default();
+		// SAFETY: see the function-level safety contract.
 		unsafe {
 			arr.store_into_empty(0, 100);
 			arr.store_into_empty(1, 200);
 		}
 		let raw: *const SlotArray<InlineSlot<u64>, 4> = &arr;
+		// SAFETY: see the function-level safety contract.
 		unsafe {
 			assert_eq!(SlotArray::<InlineSlot<u64>, 4>::load_raw(raw, 0), 100);
 			assert_eq!(SlotArray::<InlineSlot<u64>, 4>::load_raw(raw, 1), 200);
@@ -1535,28 +1658,38 @@ mod tests {
 		assert_eq!(l.fetch_sub(3), 7);
 		assert_eq!(l.load(), 4);
 		let raw: *const AtomicLen = &l;
+		// SAFETY: see the function-level safety contract.
 		assert_eq!(unsafe { AtomicLen::load_raw(raw) }, 4);
 	}
 
 	#[test]
 	fn optimistic_option_lifecycle() {
 		let opt: OptimisticOption<InlineSlot<u32>> = OptimisticOption::default();
+		// SAFETY: see the function-level safety contract.
 		unsafe { assert_eq!(opt.load(), None) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { opt.store_some_into_empty(42) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { assert_eq!(opt.load(), Some(42)) };
+		// SAFETY: see the function-level safety contract.
 		let prev: Option<u32> = unsafe { opt.replace(100) };
 		assert_eq!(prev, Some(42));
+		// SAFETY: see the function-level safety contract.
 		unsafe { assert_eq!(opt.load(), Some(100)) };
+		// SAFETY: see the function-level safety contract.
 		let taken: Option<u32> = unsafe { opt.take() };
 		assert_eq!(taken, Some(100));
+		// SAFETY: see the function-level safety contract.
 		unsafe { assert_eq!(opt.load(), None) };
 	}
 
 	#[test]
 	fn optimistic_option_raw_load() {
 		let opt: OptimisticOption<InlineSlot<u32>> = OptimisticOption::default();
+		// SAFETY: see the function-level safety contract.
 		unsafe { opt.store_some_into_empty(7) };
 		let raw: *const OptimisticOption<InlineSlot<u32>> = &opt;
+		// SAFETY: see the function-level safety contract.
 		unsafe {
 			assert_eq!(OptimisticOption::<InlineSlot<u32>>::load_raw(raw), Some(7));
 		}
@@ -1586,6 +1719,7 @@ mod tests {
 	fn inline_slot_concurrent_swap_vs_load() {
 		let slot: Arc<InlineSlot<u64>> = Arc::new(InlineSlot::default());
 		// Seed with an initial value so swap_init is valid.
+		// SAFETY: see the function-level safety contract.
 		unsafe { slot.store_into_empty(1) };
 
 		let writer_iters = if cfg!(miri) {
@@ -1608,6 +1742,7 @@ mod tests {
 					let _g = writer_lock.lock().unwrap();
 					// SAFETY: we hold the "exclusive lock" (the Mutex); slot is init.
 					// InlineSlot's Displaced = u64 (Copy); discard freely.
+					// SAFETY: see the function-level safety contract.
 					let _: u64 = unsafe { slot.swap_init(i + 1) };
 				}
 			})
@@ -1743,6 +1878,7 @@ mod tests {
 		let arr: Arc<SlotArray<InlineSlot<u64>, CAP>> = Arc::new(SlotArray::default());
 		// Seed with [1, 2, 3, 4].
 		for (i, v) in [1u64, 2, 3, 4].iter().enumerate() {
+			// SAFETY: see the function-level safety contract.
 			unsafe { arr.store_into_empty(i, *v) };
 		}
 		let initial_len = Arc::new(std::sync::atomic::AtomicUsize::new(4));
@@ -1774,6 +1910,7 @@ mod tests {
 					} else if len > 1 {
 						// SAFETY: exclusive lock; pos==1 < len. The
 						// removed value is a Copy u64; discard freely.
+						// SAFETY: see the function-level safety contract.
 						let _removed: u64 = unsafe { arr.shift_remove(len, 1) };
 						initial_len.store(len - 1, std::sync::atomic::Ordering::Relaxed);
 					}
@@ -1889,6 +2026,7 @@ mod tests {
 					let _g = writer_lock.lock().unwrap();
 					// SAFETY: writer holds the exclusive lock simulator.
 					// Displaced<u32> = u32 (Copy); discard freely.
+					// SAFETY: see the function-level safety contract.
 					let _old: Option<u32> = unsafe { opt.replace(i) };
 				}
 			})
@@ -1903,6 +2041,7 @@ mod tests {
 						// here because the test guarantees no concurrent
 						// take() leaves the option None mid-read; the only
 						// transitions are Some(x) -> Some(y).
+						// SAFETY: see the function-level safety contract.
 						let v = unsafe { opt.load() };
 						let n = v.expect("option always Some in this test");
 						assert!(n <= writer_iters);

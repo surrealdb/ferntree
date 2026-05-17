@@ -271,7 +271,7 @@ pub(crate) mod sync;
 use sync::epoch::{self as epoch, Atomic, Owned};
 use sync::{AtomicUsize, Ordering};
 
-use atomic_slot::{AtomicLen, OptimisticSlot, SlotArray};
+use atomic_slot::{AtomicLen, SlotArray};
 use inline_vec::InlineVec;
 use latch::{ExclusiveGuard, HybridGuard, HybridLatch, OptimisticGuard, SharedGuard};
 pub use optimistic::OptimisticRead;
@@ -504,6 +504,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		// SAFETY: `eg` is pinned for the lifetime of this borrow, so crossbeam-epoch
 		// cannot reclaim the loaded `HybridLatch` while we hold the reference. The
 		// root pointer is always non-null after `Tree::new` initialises it.
+		// SAFETY: see the function-level safety contract.
 		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 		let root_latch_ptr = root_latch as *const _;
 
@@ -564,6 +565,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
 			// before this reference is dropped. The swip is non-null because internal
 			// nodes always have populated child pointers for `pos <= len`.
+			// SAFETY: see the function-level safety contract.
 			let c_latch = unsafe { c_swip.load(Ordering::Acquire, eg).deref() };
 			let c_latch_ptr = c_latch as *const _;
 
@@ -645,6 +647,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		let tree_guard = self.root.optimistic_or_spin();
 		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
 		// for the lifetime of `root_latch`.
+		// SAFETY: see the function-level safety contract.
 		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 		let root_latch_ptr = root_latch as *const _;
 		let root_guard = root_latch.optimistic_or_spin();
@@ -792,6 +795,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
 		// before this reference is dropped. The swip is populated under the parent
 		// latch before being made reachable by other threads.
+		// SAFETY: see the function-level safety contract.
 		let c_latch = unsafe { swip.load(Ordering::Acquire, eg).deref() };
 
 		// Step 2: Acquire optimistic access to the child
@@ -816,6 +820,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	) -> error::Result<SharedGuard<'e, Node<K, V, IC, LC>>> {
 		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
 		// before `c_latch` is dropped.
+		// SAFETY: see the function-level safety contract.
 		let c_latch = unsafe { swip.load(Ordering::Acquire, eg).deref() };
 
 		// Acquire shared (blocking) access to the child
@@ -838,6 +843,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	) -> error::Result<ExclusiveGuard<'e, Node<K, V, IC, LC>>> {
 		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
 		// before `c_latch` is dropped.
+		// SAFETY: see the function-level safety contract.
 		let c_latch = unsafe { swip.load(Ordering::Acquire, eg).deref() };
 
 		// Acquire exclusive (blocking) access to the child
@@ -922,6 +928,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		let tree_guard = self.root.optimistic_or_spin();
 		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
 		// for the lifetime of `root_latch`.
+		// SAFETY: see the function-level safety contract.
 		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
@@ -944,6 +951,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		let tree_guard = self.root.optimistic_or_spin();
 		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
 		// for the lifetime of `root_latch`.
+		// SAFETY: see the function-level safety contract.
 		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
@@ -979,6 +987,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		let tree_guard = self.root.optimistic_or_spin();
 		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
 		// for the lifetime of `root_latch`.
+		// SAFETY: see the function-level safety contract.
 		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
@@ -1068,6 +1077,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				let tree_guard = self.root.optimistic_or_spin();
 				// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be
 				// reclaimed for the lifetime of `root_latch`.
+				// SAFETY: see the function-level safety contract.
 				let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 				let root_guard = root_latch.optimistic_or_spin();
 				tree_guard.recheck()?;
@@ -1188,6 +1198,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		let tree_guard = self.root.optimistic_or_spin();
 		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be
 		// reclaimed for the lifetime of `root_latch`.
+		// SAFETY: see the function-level safety contract.
 		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
@@ -1206,6 +1217,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			// optimistic guard on; the read of the discriminant is
 			// validated by `recheck()` on the next iteration's
 			// `lock_coupling`.
+			// SAFETY: see the function-level safety contract.
 			let kind = unsafe { Node::variant_raw(target_ptr) };
 			let c_swip_ptr = match kind {
 				NodeKindRaw::Internal(internal_ptr) => {
@@ -1213,6 +1225,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 					// raw projection; OptimisticRead bound on K
 					// certifies the binary-search snapshot
 					// discipline.
+					// SAFETY: see the function-level safety contract.
 					let (pos, _) = unsafe { InternalNode::lower_bound_raw(internal_ptr, key) };
 					// SAFETY: same conditions as lower_bound_raw above.
 					unsafe { InternalNode::edge_at_raw(internal_ptr, pos)? }
@@ -1241,6 +1254,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			// SAFETY: c_swip_ptr is valid for the lifetime of the parent
 			// guard; the `&` reborrow only lives for the lock_coupling
 			// call which performs an atomic load and parent recheck.
+			// SAFETY: see the function-level safety contract.
 			let c_swip = unsafe { &*c_swip_ptr };
 			let guard = GenericTree::lock_coupling(&target_guard, c_swip, eg)?;
 			target_guard = guard;
@@ -1330,6 +1344,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				let tree_guard = self.root.optimistic_or_spin();
 				// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be
 				// reclaimed for the lifetime of `root_latch`.
+				// SAFETY: see the function-level safety contract.
 				let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
 				let root_guard = root_latch.optimistic_or_spin();
 				tree_guard.recheck()?;
@@ -1646,6 +1661,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				// SAFETY: `leaf_guard` is an OptimisticGuard on the
 				// HybridLatch holding this Node; the raw discriminant
 				// read is validated by `recheck()` below.
+				// SAFETY: see the function-level safety contract.
 				let leaf_ptr = match unsafe { Node::variant_raw(node_ptr) } {
 					NodeKindRaw::Leaf(l) => l,
 					NodeKindRaw::Internal(_) => {
@@ -1659,6 +1675,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				// SAFETY: leaf_ptr is a valid pointer for the lifetime
 				// of the optimistic guard. K: OptimisticRead certifies
 				// the comparison snapshot discipline.
+				// SAFETY: see the function-level safety contract.
 				let (_, exact) = unsafe { LeafNode::lower_bound_raw(leaf_ptr, key) };
 
 				// Validate the descent and the position we observed.
@@ -1735,6 +1752,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				let node_ptr = leaf_guard.as_ptr();
 				// SAFETY: leaf_guard is an OptimisticGuard on the
 				// HybridLatch holding this Node.
+				// SAFETY: see the function-level safety contract.
 				let leaf_ptr = match unsafe { Node::variant_raw(node_ptr) } {
 					NodeKindRaw::Leaf(l) => l,
 					NodeKindRaw::Internal(_) => {
@@ -1745,6 +1763,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 
 				// SAFETY: see `LeafNode::lower_bound_raw`. K: OptimisticRead
 				// certifies the binary-search snapshot discipline.
+				// SAFETY: see the function-level safety contract.
 				let (pos, exact) = unsafe { LeafNode::lower_bound_raw(leaf_ptr, key) };
 
 				if !exact {
@@ -1777,7 +1796,9 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				// optimistic guard; `values` is a `SlotArray<…,
 				// LC>` at a known field offset; `pos < LC` checked.
 				let values_ptr: *const SlotArray<V::Slot, LC> =
+					// SAFETY: see the function-level safety contract.
 					unsafe { ptr::addr_of!((*leaf_ptr).values) };
+				// SAFETY: see the function-level safety contract.
 				let snapshot: V = match unsafe { SlotArray::try_load_raw(values_ptr, pos as usize) }
 				{
 					Some(v) => v,
@@ -2086,10 +2107,11 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		// Pin the epoch for memory safety during the operation
 		let eg = epoch::pin();
 
-		let result = if let Some(((mut guard, pos), _parent_opt)) =
+		let result = if let Some(((guard, pos), _parent_opt)) =
 			self.find_exact_exclusive_leaf_and_optimistic_parent(key, &eg)
 		{
 			// Remove the key-value pair from the leaf
+			// SAFETY: see the function-level safety contract.
 			let kv = unsafe {
 				let node_ptr = guard.as_mut_ptr();
 				let leaf_ptr = Node::as_leaf_ptr_mut(node_ptr);
@@ -2305,6 +2327,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			// readers still holding it will fail validation on their next `recheck()`.
 			// Crossbeam-epoch defers `Drop` until every guard pinned at this moment
 			// has been released.
+			// SAFETY: see the function-level safety contract.
 			unsafe { eg.defer_destroy(old_root) };
 		}
 
@@ -2391,6 +2414,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be
 				// reclaimed for the lifetime of `root_latch`. `tree_guard_x` holds
 				// the root pointer exclusively, preventing concurrent replacement.
+				// SAFETY: see the function-level safety contract.
 				let root_latch = unsafe { tree_guard_x.load(Ordering::Acquire, eg).deref() };
 				let mut root_guard_x = root_latch.exclusive();
 
@@ -2773,6 +2797,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 											// bumped on unlock. Crossbeam-epoch defers `Drop`
 											// until every currently pinned epoch guard has
 											// been released.
+											// SAFETY: see the function-level safety contract.
 											unsafe { eg.defer_destroy(shared) };
 										}
 									} else {
@@ -2794,6 +2819,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 											// bumped on unlock. Crossbeam-epoch defers `Drop`
 											// until every currently pinned epoch guard has
 											// been released.
+											// SAFETY: see the function-level safety contract.
 											unsafe { eg.defer_destroy(shared) };
 										}
 									}
@@ -2832,6 +2858,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 											// bumped on unlock. Crossbeam-epoch defers `Drop`
 											// until every currently pinned epoch guard has
 											// been released.
+											// SAFETY: see the function-level safety contract.
 											unsafe { eg.defer_destroy(shared) };
 										}
 									} else {
@@ -2851,6 +2878,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 											// bumped on unlock. Crossbeam-epoch defers `Drop`
 											// until every currently pinned epoch guard has
 											// been released.
+											// SAFETY: see the function-level safety contract.
 											unsafe { eg.defer_destroy(shared) };
 										}
 									}
@@ -2918,6 +2946,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 												// bumped on unlock. Crossbeam-epoch defers `Drop`
 												// until every currently pinned epoch guard has
 												// been released.
+												// SAFETY: see the function-level safety contract.
 												unsafe { eg.defer_destroy(shared) };
 											}
 										} else {
@@ -2937,6 +2966,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 												// bumped on unlock. Crossbeam-epoch defers `Drop`
 												// until every currently pinned epoch guard has
 												// been released.
+												// SAFETY: see the function-level safety contract.
 												unsafe { eg.defer_destroy(shared) };
 											}
 										}
@@ -2974,6 +3004,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 												// bumped on unlock. Crossbeam-epoch defers `Drop`
 												// until every currently pinned epoch guard has
 												// been released.
+												// SAFETY: see the function-level safety contract.
 												unsafe { eg.defer_destroy(shared) };
 											}
 										} else {
@@ -2993,6 +3024,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 												// bumped on unlock. Crossbeam-epoch defers `Drop`
 												// until every currently pinned epoch guard has
 												// been released.
+												// SAFETY: see the function-level safety contract.
 												unsafe { eg.defer_destroy(shared) };
 											}
 										}
@@ -3372,6 +3404,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Nod
 		//
 		// SAFETY: `this` is a valid pointer per the caller; the u8
 		// discriminant is at the very start.
+		// SAFETY: see the function-level safety contract.
 		let tag = unsafe { ptr::read(this as *const u8) };
 		// Compute the payload offset: it sits at `align_of::<Self>()`
 		// from the start (the discriminant is in the same bucket but
@@ -3379,6 +3412,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Nod
 		let payload_offset = core::mem::align_of::<Self>();
 		// SAFETY: see `tag` above; `payload_offset` is the documented
 		// `#[repr(C, u8)]` layout offset.
+		// SAFETY: see the function-level safety contract.
 		let payload = unsafe { (this as *const u8).add(payload_offset) };
 		match tag {
 			0 => NodeKindRaw::Internal(payload.cast::<InternalNode<K, V, IC, LC>>()),
@@ -3415,6 +3449,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Nod
 	#[inline]
 	pub(crate) unsafe fn as_leaf_ptr_mut(this: *mut Self) -> *mut LeafNode<K, V, LC> {
 		debug_assert!(matches!(
+			// SAFETY: see the function-level safety contract.
 			unsafe { Self::variant_raw(this as *const Self) },
 			NodeKindRaw::Leaf(_)
 		));
@@ -3422,6 +3457,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Nod
 		// SAFETY: `#[repr(C, u8)]` places the variant payload at
 		// `align_of::<Self>()`; `this` is a valid mutable pointer per
 		// caller's invariant.
+		// SAFETY: see the function-level safety contract.
 		let payload = unsafe { (this as *mut u8).add(payload_offset) };
 		payload.cast::<LeafNode<K, V, LC>>()
 	}
@@ -3558,6 +3594,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Nod
 			Node::Leaf(ref leaf) => {
 				let len = leaf.len.load() as usize;
 				(0..len)
+					// SAFETY: see the function-level safety contract.
 					.map(|i| unsafe { SlotArray::load_raw(ptr::addr_of!(leaf.keys), i) })
 					.collect()
 			}
@@ -3750,6 +3787,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 			// SAFETY: `mid < upper <= LC`; slot is init while we hold a
 			// shared / exclusive guard on the leaf.
 			let mid_key_opt: Option<K> =
+				// SAFETY: see the function-level safety contract.
 				unsafe { SlotArray::try_load_raw(ptr::addr_of!(self.keys), mid as usize) };
 			let mid_key = match mid_key_opt {
 				Some(k) => k,
@@ -3803,6 +3841,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	pub(crate) unsafe fn len_raw(this: *const Self) -> u16 {
 		// SAFETY: `len` is a u16 at a known field offset; the read is an
 		// unsynchronised aligned load with no retag.
+		// SAFETY: see the function-level safety contract.
 		unsafe { AtomicLen::load_raw(ptr::addr_of!((*this).len)) }
 	}
 
@@ -3830,6 +3869,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		// Fence checks via raw projection.
 		// SAFETY: `lower_fence` is `Option<K>` at a known field offset;
 		// `addr_of!` does not reborrow.
+		// SAFETY: see the function-level safety contract.
 		let lower_fence: *const Option<K> = unsafe { ptr::addr_of!((*this).lower_fence) };
 		// SAFETY: see `lower_fence` above.
 		let upper_fence: *const Option<K> = unsafe { ptr::addr_of!((*this).upper_fence) };
@@ -3842,6 +3882,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		// bitwise read is sound for `K: OptimisticRead` (permits torn
 		// snapshot, validated by recheck-or-discard via ManuallyDrop).
 		let lf_snapshot: core::mem::ManuallyDrop<Option<K>> =
+			// SAFETY: see the function-level safety contract.
 			unsafe { core::mem::ManuallyDrop::new(ptr::read(lower_fence)) };
 		if let Some(fk) = lf_snapshot.as_ref() {
 			if key < fk.borrow() {
@@ -3853,6 +3894,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		let len = unsafe { Self::len_raw(this) };
 		// SAFETY: see `lf_snapshot` above.
 		let uf_snapshot: core::mem::ManuallyDrop<Option<K>> =
+			// SAFETY: see the function-level safety contract.
 			unsafe { core::mem::ManuallyDrop::new(ptr::read(upper_fence)) };
 		if let Some(fk) = uf_snapshot.as_ref() {
 			if key > fk.borrow() {
@@ -3866,6 +3908,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		// will catch).
 		// SAFETY: `keys` is a `SlotArray<K::Slot, LC>` at a known
 		// field offset; raw projection without `&LeafNode` reborrow.
+		// SAFETY: see the function-level safety contract.
 		let keys_ptr: *const SlotArray<K::Slot, LC> = unsafe { ptr::addr_of!((*this).keys) };
 		let mut lower: u16 = 0;
 		let mut upper: u16 = len.min(LC as u16);
@@ -3882,6 +3925,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 			//
 			// SAFETY: `mid` < `upper` <= LC; the bounds check on the
 			// snapshot is validated later by the caller's recheck.
+			// SAFETY: see the function-level safety contract.
 			let mid_key_opt: Option<K> = unsafe { SlotArray::try_load_raw(keys_ptr, mid as usize) };
 			let mid_key_snapshot: core::mem::ManuallyDrop<K> = match mid_key_opt {
 				Some(k) => core::mem::ManuallyDrop::new(k),
@@ -3935,6 +3979,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		if pos as usize >= self.len.load_relaxed() as usize {
 			return Err(error::Error::Unwind);
 		}
+		// SAFETY: see the function-level safety contract.
 		unsafe { SlotArray::try_load_raw(ptr::addr_of!(self.keys), pos as usize) }
 			.ok_or(error::Error::Unwind)
 	}
@@ -3959,6 +4004,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	pub(crate) unsafe fn kv_at_unchecked(&self, pos: u16) -> (K, V) {
 		// SAFETY: caller guarantees pos < len and init.
 		let k = unsafe { SlotArray::load_raw(ptr::addr_of!(self.keys), pos as usize) };
+		// SAFETY: see the function-level safety contract.
 		let v = unsafe { SlotArray::load_raw(ptr::addr_of!(self.values), pos as usize) };
 		(k, v)
 	}
@@ -3995,28 +4041,36 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	///   exclusive lock).
 	/// - `pos < len`.
 	pub(crate) unsafe fn remove_at_raw(this: *mut Self, pos: u16, eg: &epoch::Guard) -> (K, V) {
+		// SAFETY: see the function-level safety contract.
 		let len = unsafe { AtomicLen::load_raw(ptr::addr_of!((*this).len)) } as usize;
 		// SAFETY: caller holds exclusive lock; pos < len <= LC.
 		let keys_ptr = unsafe { ptr::addr_of!((*this).keys) };
+		// SAFETY: see the function-level safety contract.
 		let values_ptr = unsafe { ptr::addr_of!((*this).values) };
 
 		// Atomic-load a copy of (K, V) for the caller. For inline
 		// storage this is a Copy; for boxed storage this clones through
 		// the Acquire-loaded pointer (refcount bump for refcounted V).
+		// SAFETY: see the function-level safety contract.
 		let removed_k: K = unsafe { SlotArray::load_raw(keys_ptr, pos as usize) };
+		// SAFETY: see the function-level safety contract.
 		let removed_v: V = unsafe { SlotArray::load_raw(values_ptr, pos as usize) };
 
 		// Shift the storage to fill the gap. The displaced owners
 		// (Box<K> / Box<V> for boxed storage, K / V for inline) are
 		// routed through the epoch GC so concurrent optimistic readers'
 		// pointers stay valid.
+		// SAFETY: see the function-level safety contract.
 		let displaced_k = unsafe { SlotArray::shift_remove_raw(keys_ptr, len, pos as usize) };
+		// SAFETY: see the function-level safety contract.
 		let displaced_v = unsafe { SlotArray::shift_remove_raw(values_ptr, len, pos as usize) };
 		eg.defer(move || drop(displaced_k));
 		eg.defer(move || drop(displaced_v));
 
 		// Update len atomically.
+		// SAFETY: see the function-level safety contract.
 		let len_ptr: *const AtomicLen = unsafe { ptr::addr_of!((*this).len) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { (*len_ptr).fetch_sub(1) };
 
 		(removed_k, removed_v)
@@ -4042,17 +4096,21 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		value: V,
 		eg: &epoch::Guard,
 	) -> V {
+		// SAFETY: see the function-level safety contract.
 		let len = unsafe { AtomicLen::load_raw(ptr::addr_of!((*this).len)) } as usize;
 		debug_assert!((pos as usize) < len);
 		// Atomic load + swap on the values slot. For inline storage the
 		// swap is one AcqRel atomic op; for boxed storage it allocates
 		// a fresh `Box<V>` from `value` and AcqRel-swaps the AtomicPtr.
+		// SAFETY: see the function-level safety contract.
 		let values_ptr = unsafe { ptr::addr_of!((*this).values) };
 		// Capture a copy of the old V to return to the caller.
+		// SAFETY: see the function-level safety contract.
 		let old_v: V = unsafe { SlotArray::load_raw(values_ptr, pos as usize) };
 		// Now swap in the new V. The displaced owner is routed through
 		// the epoch GC so concurrent optimistic readers still hold
 		// valid pointers until the next epoch tick.
+		// SAFETY: see the function-level safety contract.
 		let displaced = unsafe { SlotArray::swap_init_raw(values_ptr, pos as usize, value) };
 		eg.defer(move || drop(displaced));
 		old_v
@@ -4094,6 +4152,7 @@ impl<K: Clone + OptimisticRead, V: Clone + OptimisticRead, const LC: usize> Leaf
 	///
 	/// - `Some(pos)` if insertion succeeded
 	/// - `None` if the node is full
+	///
 	/// Takes `*mut Self` (not `&mut self`) so that no Tree-Borrows
 	/// "Reserved" tag is established on the leaf — concurrent
 	/// optimistic readers' atomic reads stay foreign-safe while the
@@ -4105,26 +4164,35 @@ impl<K: Clone + OptimisticRead, V: Clone + OptimisticRead, const LC: usize> Leaf
 	///   [`crate::latch::ExclusiveGuard`].
 	/// - `pos <= len`.
 	pub(crate) unsafe fn insert_at_raw(this: *mut Self, pos: u16, key: K, value: V) -> Option<u16> {
+		// SAFETY: see the function-level safety contract.
 		let len_ptr: *const AtomicLen = unsafe { ptr::addr_of!((*this).len) };
+		// SAFETY: see the function-level safety contract.
 		let len = unsafe { AtomicLen::load_raw(len_ptr) } as usize;
 		if len >= LC {
 			return None;
 		}
 
 		// sample_key check via raw projection.
+		// SAFETY: see the function-level safety contract.
 		let sample_key_ptr: *mut Option<K> = unsafe { ptr::addr_of_mut!((*this).sample_key) };
 		// SAFETY: under exclusive lock; no concurrent writer.
 		if unsafe { (*sample_key_ptr).is_none() } {
+			// SAFETY: see the function-level safety contract.
 			unsafe { ptr::write(sample_key_ptr, Some(key.clone())) };
 		}
 
 		// Storage updates via raw-pointer projection; pos <= len < LC.
+		// SAFETY: see the function-level safety contract.
 		let keys_ptr = unsafe { ptr::addr_of!((*this).keys) };
+		// SAFETY: see the function-level safety contract.
 		let values_ptr = unsafe { ptr::addr_of!((*this).values) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { SlotArray::shift_insert_raw(keys_ptr, len, pos as usize, key) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { SlotArray::shift_insert_raw(values_ptr, len, pos as usize, value) };
 
 		// Update len atomically.
+		// SAFETY: see the function-level safety contract.
 		unsafe { (*len_ptr).fetch_add(1) };
 
 		Some(pos)
@@ -4161,6 +4229,7 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 		// Atomic-load the split key. For boxed K this clones through
 		// the Acquire-loaded pointer; for inline K it's an atomic copy.
 		let self_keys_ptr: *const _ = ptr::addr_of!(self.keys);
+		// SAFETY: see the function-level safety contract.
 		let split_key: K = unsafe { SlotArray::load_raw(self_keys_ptr, split_pos as usize) };
 
 		// Update fence keys.
@@ -4174,9 +4243,12 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 		let right_ptr: *const Self = right;
 		let self_keys = self_keys_ptr;
 		let self_values = ptr::addr_of!(self.values);
+		// SAFETY: see the function-level safety contract.
 		let right_keys = unsafe { ptr::addr_of!((*right_ptr).keys) };
+		// SAFETY: see the function-level safety contract.
 		let right_values = unsafe { ptr::addr_of!((*right_ptr).values) };
 		for (dst_idx, src_pos) in (right_start..total).enumerate() {
+			// SAFETY: see the function-level safety contract.
 			unsafe {
 				SlotArray::move_raw(self_keys, src_pos, right_keys, dst_idx);
 				SlotArray::move_raw(self_values, src_pos, right_values, dst_idx);
@@ -4186,6 +4258,7 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 		// Set sample keys for node relocation (load first key of each leaf).
 		// SAFETY: both leaves have at least one entry post-split.
 		let self_first: K = unsafe { SlotArray::load_raw(self_keys, 0) };
+		// SAFETY: see the function-level safety contract.
 		let right_first: K = unsafe { SlotArray::load_raw(right_keys, 0) };
 		self.sample_key = Some(self_first);
 		right.sample_key = Some(right_first);
@@ -4220,10 +4293,13 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 		let self_keys = ptr::addr_of!(self.keys);
 		let self_values = ptr::addr_of!(self.values);
 		let right_ptr: *const Self = right;
+		// SAFETY: see the function-level safety contract.
 		let right_keys = unsafe { ptr::addr_of!((*right_ptr).keys) };
+		// SAFETY: see the function-level safety contract.
 		let right_values = unsafe { ptr::addr_of!((*right_ptr).values) };
 		for src_idx in 0..right_len {
 			let dst_idx = self_len + src_idx;
+			// SAFETY: see the function-level safety contract.
 			unsafe {
 				SlotArray::move_raw(right_keys, src_idx, self_keys, dst_idx);
 				SlotArray::move_raw(right_values, src_idx, self_values, dst_idx);
@@ -4482,6 +4558,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
 			// SAFETY: `upper_edge` is at a known field offset; addr_of!
 			// does not reborrow.
 			let upper_edge_ptr: *const Atomic<HybridLatch<Node<K, V, IC, LC>>> =
+				// SAFETY: see the function-level safety contract.
 				unsafe { ptr::addr_of!((*this).upper_edge) };
 			Ok(upper_edge_ptr)
 		} else if pos < IC as u16 {
@@ -4516,6 +4593,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
 		// permits torn snapshot, ManuallyDrop suppresses Drop until
 		// caller validates via recheck.
 		let lf_snapshot: core::mem::ManuallyDrop<Option<K>> =
+			// SAFETY: see the function-level safety contract.
 			unsafe { core::mem::ManuallyDrop::new(ptr::read(lower_fence)) };
 		if let Some(fk) = lf_snapshot.as_ref() {
 			if key < fk.borrow() {
@@ -4527,6 +4605,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
 		let len = unsafe { Self::len_raw(this) };
 		// SAFETY: see `lf_snapshot` above.
 		let uf_snapshot: core::mem::ManuallyDrop<Option<K>> =
+			// SAFETY: see the function-level safety contract.
 			unsafe { core::mem::ManuallyDrop::new(ptr::read(upper_fence)) };
 		if let Some(fk) = uf_snapshot.as_ref() {
 			if key > fk.borrow() {
@@ -4543,6 +4622,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
 			let mid = ((upper - lower) / 2) + lower;
 			// SAFETY: see LeafNode::lower_bound_raw.
 			let mid_key_snapshot: core::mem::ManuallyDrop<K> =
+				// SAFETY: see the function-level safety contract.
 				unsafe { core::mem::ManuallyDrop::new(ptr::read(keys_ptr.add(mid as usize))) };
 			let mid_key: &K = &mid_key_snapshot;
 			if key < mid_key.borrow() {
@@ -4885,6 +4965,7 @@ impl<
 		// validation. No concurrent writer can run because the test calls this
 		// while holding a `&mut` reference to the tree. The loaded `HybridLatch`
 		// is non-null (checked above) and cannot be reclaimed until `eg` retires.
+		// SAFETY: see the function-level safety contract.
 		let root_latch = unsafe { root_ptr.deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 
@@ -4924,6 +5005,7 @@ impl<
 				// owned form for comparison.
 				let leaf_len = leaf.len.load() as usize;
 				let keys_owned: Vec<K> = (0..leaf_len)
+					// SAFETY: see the function-level safety contract.
 					.map(|i| unsafe { SlotArray::load_raw(ptr::addr_of!(leaf.keys), i) })
 					.collect();
 				for i in 1..leaf_len {
@@ -5051,6 +5133,7 @@ impl<
 						// SAFETY: `eg` is pinned and is held for the duration of this
 						// validation pass; the non-null `child_ptr` is therefore safe
 						// to dereference.
+						// SAFETY: see the function-level safety contract.
 						let child_latch = unsafe { child_ptr.deref() };
 						let child_guard = child_latch.optimistic_or_spin();
 
@@ -5073,6 +5156,7 @@ impl<
 					// SAFETY: `eg` is pinned and is held for the duration of this
 					// validation pass; the non-null `child_ptr` is therefore safe
 					// to dereference.
+					// SAFETY: see the function-level safety contract.
 					let child_latch = unsafe { child_ptr.deref() };
 					let child_guard = child_latch.optimistic_or_spin();
 
@@ -5487,8 +5571,11 @@ mod tests {
 	#[test]
 	fn leaf_lower_bound_exact_match() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 10, 100) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 20, 200) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 2, 30, 300) };
 
 		let (pos, exact) = leaf.lower_bound(&20);
@@ -5499,8 +5586,11 @@ mod tests {
 	#[test]
 	fn leaf_lower_bound_between_keys() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 10, 100) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 20, 200) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 2, 30, 300) };
 
 		let (pos, exact) = leaf.lower_bound(&25);
@@ -5511,7 +5601,9 @@ mod tests {
 	#[test]
 	fn leaf_lower_bound_before_all() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 10, 100) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 20, 200) };
 
 		let (pos, exact) = leaf.lower_bound(&5);
@@ -5522,7 +5614,9 @@ mod tests {
 	#[test]
 	fn leaf_lower_bound_after_all() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 10, 100) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 20, 200) };
 
 		let (pos, exact) = leaf.lower_bound(&25);
@@ -5534,7 +5628,9 @@ mod tests {
 	fn leaf_lower_bound_respects_lower_fence() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
 		leaf.lower_fence = Some(50);
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 60, 600) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 70, 700) };
 
 		// Key below lower fence
@@ -5547,7 +5643,9 @@ mod tests {
 	fn leaf_lower_bound_respects_upper_fence() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
 		leaf.upper_fence = Some(50);
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 30, 300) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 40, 400) };
 
 		// Key above upper fence
@@ -5602,8 +5700,11 @@ mod tests {
 	fn leaf_insert_at_and_remove_at() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
 
+		// SAFETY: see the function-level safety contract.
 		assert!(unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 10, 100) }.is_some());
+		// SAFETY: see the function-level safety contract.
 		assert!(unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 30, 300) }.is_some());
+		// SAFETY: see the function-level safety contract.
 		assert!(unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 20, 200) }.is_some()); // Insert in middle
 
 		assert_eq!(leaf.len.load(), 3);
@@ -5612,6 +5713,7 @@ mod tests {
 		assert_eq!(leaf.key_at(2).unwrap(), 30);
 
 		let eg = epoch::pin();
+		// SAFETY: see the function-level safety contract.
 		let (k, v) = unsafe { LeafNode::remove_at_raw(&mut leaf, 1, &eg) };
 		assert_eq!(k, 20);
 		assert_eq!(v, 200);
@@ -5622,6 +5724,7 @@ mod tests {
 	fn leaf_split_sets_fences_correctly() {
 		let mut left: LeafNode<i32, i32, 64> = LeafNode::new();
 		for i in 0..10 {
+			// SAFETY: see the function-level safety contract.
 			unsafe { LeafNode::insert_at_raw(&mut left, i as u16, i * 10, i * 100) };
 		}
 
@@ -5647,14 +5750,18 @@ mod tests {
 	#[test]
 	fn leaf_merge_combines_entries() {
 		let mut left: LeafNode<i32, i32, 64> = LeafNode::new();
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut left, 0, 10, 100) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut left, 1, 20, 200) };
 		left.upper_fence = Some(25);
 
 		let mut right: LeafNode<i32, i32, 64> = LeafNode::new();
 		right.lower_fence = Some(25);
 		right.upper_fence = Some(50);
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut right, 0, 30, 300) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut right, 1, 40, 400) };
 		right.sample_key = Some(30);
 
@@ -5679,12 +5786,17 @@ mod tests {
 	#[test]
 	fn leaf_merge_fails_when_too_full() {
 		let mut left: LeafNode<i32, i32, 4> = LeafNode::new();
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut left, 0, 10, 100) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut left, 1, 20, 200) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut left, 2, 30, 300) };
 
 		let mut right: LeafNode<i32, i32, 4> = LeafNode::new();
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut right, 0, 40, 400) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut right, 1, 50, 500) };
 
 		// Combined size (5) > capacity (4)
@@ -5700,12 +5812,15 @@ mod tests {
 		let mut leaf: LeafNode<i32, i32, 3> = LeafNode::new();
 		assert!(leaf.has_space());
 
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 1, 1) };
 		assert!(leaf.has_space());
 
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 2, 2) };
 		assert!(leaf.has_space());
 
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 2, 3, 3) };
 		assert!(!leaf.has_space());
 	}
@@ -5719,11 +5834,13 @@ mod tests {
 		assert!(leaf.is_underfull());
 
 		for i in 0..3 {
+			// SAFETY: see the function-level safety contract.
 			unsafe { LeafNode::insert_at_raw(&mut leaf, i as u16, i, i) };
 		}
 		// 3 entries with capacity 10 = 30%, still underfull
 		assert!(leaf.is_underfull());
 
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 3, 3, 3) };
 		// 4 entries = 40%, at threshold, NOT underfull
 		assert!(!leaf.is_underfull());
@@ -5774,7 +5891,7 @@ mod tests {
 
 	#[test]
 	fn internal_has_space() {
-		let mut internal: InternalNode<i32, i32, 3, 64> = InternalNode::new();
+		let internal: InternalNode<i32, i32, 3, 64> = InternalNode::new();
 		assert!(internal.has_space());
 
 		internal.len.store(2);
@@ -5787,7 +5904,7 @@ mod tests {
 	#[test]
 	fn internal_is_underfull() {
 		// With capacity 10, underfull threshold is 4 (40%)
-		let mut internal: InternalNode<i32, i32, 10, 64> = InternalNode::new();
+		let internal: InternalNode<i32, i32, 10, 64> = InternalNode::new();
 
 		internal.len.store(3);
 		assert!(internal.is_underfull());
@@ -6147,8 +6264,11 @@ mod tests {
 	#[test]
 	fn node_keys_returns_keys() {
 		let mut leaf: LeafNode<i32, i32, 64> = LeafNode::new();
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 0, 10, 100) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 1, 20, 200) };
+		// SAFETY: see the function-level safety contract.
 		unsafe { LeafNode::insert_at_raw(&mut leaf, 2, 30, 300) };
 
 		let node: Node<i32, i32, 64, 64> = Node::Leaf(leaf);

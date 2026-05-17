@@ -10,7 +10,7 @@
 
 use ferntree::{OptimisticRead, Tree};
 use rand::prelude::*;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;

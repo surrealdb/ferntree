@@ -283,10 +283,12 @@ unsafe impl OptimisticRead for String {
 	const EPOCH_DEFERRED_DROP: bool = true;
 	type Slot = crate::atomic_slot::BoxedSlot<Self>;
 }
+// SAFETY: see `impl_optimistic_read_boxed!`.
 unsafe impl<T: Send + Sync + Clone + 'static> OptimisticRead for Vec<T> {
 	const EPOCH_DEFERRED_DROP: bool = true;
 	type Slot = crate::atomic_slot::BoxedSlot<Self>;
 }
+// SAFETY: see `impl_optimistic_read_boxed!`.
 unsafe impl<T: Send + Sync + 'static + ?Sized> OptimisticRead for std::sync::Arc<T> {
 	const EPOCH_DEFERRED_DROP: bool = true;
 	type Slot = crate::atomic_slot::BoxedSlot<Self>;
@@ -296,12 +298,14 @@ unsafe impl<T: Send + Sync + 'static + ?Sized> OptimisticRead for std::sync::Arc
 // boxed path; since its `Drop` is a no-op, EPOCH_DEFERRED_DROP can stay
 // `false`, but the BoxedSlot still routes the displaced Box through the
 // caller's epoch defer for the heap allocation itself.
+// SAFETY: see `impl_optimistic_read_boxed!`.
 unsafe impl OptimisticRead for &'static str {
 	const EPOCH_DEFERRED_DROP: bool = true;
 	type Slot = crate::atomic_slot::BoxedSlot<Self>;
 }
 
 // Unit type uses a no-op slot.
+// SAFETY: `()` is a ZST; loads and stores are trivial and require no synchronisation.
 unsafe impl OptimisticRead for () {
 	type Slot = crate::atomic_slot::UnitSlot;
 }

@@ -365,6 +365,7 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 		// will not be reclaimed while `self.eg` is pinned. The `RwLock` read
 		// state inside the guard is preserved through the transmute, so the
 		// shared lock is correctly released on drop.
+		// SAFETY: see the function-level safety contract.
 		unsafe { std::mem::transmute(guard) }
 	}
 
@@ -380,6 +381,7 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 		// SAFETY: Same layout-and-lifetime argument as `leaf_lt`. The parent
 		// guard is held optimistically (version-checked), and the underlying
 		// `HybridLatch` cannot be reclaimed while `self.eg` is pinned.
+		// SAFETY: see the function-level safety contract.
 		unsafe { std::mem::transmute(guard) }
 	}
 
@@ -1229,7 +1231,9 @@ impl<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
 		if let Some((_k, v, pos)) = self.buffer.take() {
 			if let Some((guard, _)) = self.leaf.as_ref() {
 				let node_ptr = guard.as_mut_ptr();
+				// SAFETY: see the function-level safety contract.
 				let leaf_ptr = unsafe { crate::Node::as_leaf_ptr_mut(node_ptr) };
+				// SAFETY: see the function-level safety contract.
 				unsafe {
 					crate::LeafNode::swap_value_at_raw(leaf_ptr, pos, v, &self.eg);
 				}
@@ -1267,7 +1271,9 @@ impl<
 			// buffered pos is the position from which we loaded.
 			if let Some((guard, _)) = self.leaf.as_ref() {
 				let node_ptr = guard.as_mut_ptr();
+				// SAFETY: see the function-level safety contract.
 				let leaf_ptr = unsafe { crate::Node::as_leaf_ptr_mut(node_ptr) };
+				// SAFETY: see the function-level safety contract.
 				unsafe {
 					crate::LeafNode::swap_value_at_raw(leaf_ptr, pos, v, &self.eg);
 				}
@@ -1296,6 +1302,7 @@ impl<
 		// `'t` is bounded by the lifetime of `self.eg`, and crossbeam-epoch
 		// guarantees the underlying memory cannot be reclaimed while `self.eg`
 		// is pinned.
+		// SAFETY: see the function-level safety contract.
 		unsafe { std::mem::transmute(guard) }
 	}
 
@@ -1307,6 +1314,7 @@ impl<
 		// SAFETY: Same layout-and-lifetime argument as `leaf_lt`. The parent
 		// guard is held optimistically and validated via `recheck()` before
 		// any data is trusted.
+		// SAFETY: see the function-level safety contract.
 		unsafe { std::mem::transmute(guard) }
 	}
 
@@ -1754,13 +1762,15 @@ impl<
 			// `ExclusiveGuard`); the raw pointer is the same address
 			// the guard derefs to. `swap_value_at_raw` handles both
 			// the entries-side store and the mirror-side update.
-			let leaf_node_ptr = guard.as_mut_ptr() as *mut crate::Node<K, V, IC, LC>;
+			let leaf_node_ptr = guard.as_mut_ptr();
+			// SAFETY: see the function-level safety contract.
 			let leaf_ptr = unsafe {
 				// `Node::as_leaf_ptr_mut` projects the `Node::Leaf`
 				// variant out of the enum without creating an
 				// `&mut Node` reborrow.
 				crate::Node::as_leaf_ptr_mut(leaf_node_ptr)
 			};
+			// SAFETY: see the function-level safety contract.
 			let old = unsafe { crate::LeafNode::swap_value_at_raw(leaf_ptr, pos, value, &self.eg) };
 			// Advance cursor past the just-replaced entry.
 			*cursor = Cursor::After(pos);
@@ -1801,6 +1811,7 @@ impl<
 					Cursor::Before(pos) => {
 						// SAFETY: we hold the exclusive lock; pos was set up by
 						// seek_exact / seek_for_prev which guarantees pos <= len < LC.
+						// SAFETY: see the function-level safety contract.
 						unsafe {
 							let node_ptr = guard.as_mut_ptr();
 							let leaf_ptr = crate::Node::as_leaf_ptr_mut(node_ptr);
@@ -1913,6 +1924,7 @@ impl<
 					return None;
 				}
 
+				// SAFETY: see the function-level safety contract.
 				let removed = unsafe {
 					let node_ptr = guard.as_mut_ptr();
 					let leaf_ptr = crate::Node::as_leaf_ptr_mut(node_ptr);
@@ -1959,6 +1971,7 @@ impl<
 					Cursor::Before(pos) => {
 						let curr_pos = *pos;
 						if curr_pos < leaf.len.load() {
+							// SAFETY: see the function-level safety contract.
 							Some(unsafe {
 								let node_ptr = guard.as_mut_ptr();
 								let leaf_ptr = crate::Node::as_leaf_ptr_mut(node_ptr);
@@ -1972,6 +1985,7 @@ impl<
 						let pos = *pos;
 						let curr_pos = pos + 1;
 						if curr_pos < leaf.len.load() {
+							// SAFETY: see the function-level safety contract.
 							Some(unsafe {
 								let node_ptr = guard.as_mut_ptr();
 								let leaf_ptr = crate::Node::as_leaf_ptr_mut(node_ptr);
@@ -2175,12 +2189,14 @@ impl<
 		// atomic-load (K, V), let the closure mutate V in a stack
 		// local, then write V back via swap_value_at_raw.
 		let node_ptr = guard.as_mut_ptr();
+		// SAFETY: see the function-level safety contract.
 		let leaf_ptr = unsafe { crate::Node::as_leaf_ptr_mut(node_ptr) };
 		for i in start..leaf_len {
 			// SAFETY: `i < leaf_len`, per the loop bound.
 			let (k, mut v) = unsafe { guard.as_leaf().kv_at_unchecked(i) };
 			f(&k, &mut v);
 			// Write the mutated V back to the slot.
+			// SAFETY: see the function-level safety contract.
 			unsafe {
 				crate::LeafNode::swap_value_at_raw(leaf_ptr, i, v, &self.eg);
 			}
