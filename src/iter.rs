@@ -55,11 +55,11 @@
 
 use crate::error;
 use crate::latch::{ExclusiveGuard, OptimisticGuard, SharedGuard};
+use crate::optimistic::OptimisticRead;
 use crate::sync::epoch::{self as epoch};
 use crate::{Direction, GenericTree, Node};
 use std::borrow::Borrow;
 use std::ops::Bound;
-use crate::optimistic::OptimisticRead;
 
 // ===========================================================================
 // Helper Enums
@@ -293,7 +293,8 @@ enum JumpResult {
 ///
 /// The iterator pins an epoch guard for its entire lifetime, ensuring that
 /// node memory isn't reclaimed while references to entries are outstanding.
-pub struct RawSharedIter<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
+pub struct RawSharedIter<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+{
 	/// Reference to the tree being iterated.
 	tree: &'t GenericTree<K, V, IC, LC>,
 	/// Epoch guard - pinned for the iterator's lifetime.
@@ -313,7 +314,9 @@ pub struct RawSharedIter<'t, K: OptimisticRead, V: OptimisticRead, const IC: usi
 	buffer: Option<(K, V)>,
 }
 
-impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> RawSharedIter<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+	RawSharedIter<'t, K, V, IC, LC>
+{
 	/// Creates a new iterator, pinning a fresh epoch guard.
 	///
 	/// The iterator starts in an unpositioned state;
@@ -1193,7 +1196,13 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 /// 2. Trigger a split operation
 /// 3. Re-seek to the correct position
 /// 4. Retry the insertion
-pub struct RawExclusiveIter<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
+pub struct RawExclusiveIter<
+	't,
+	K: OptimisticRead,
+	V: OptimisticRead,
+	const IC: usize,
+	const LC: usize,
+> {
 	/// Reference to the tree being iterated.
 	tree: &'t GenericTree<K, V, IC, LC>,
 	/// Epoch guard - pinned for the iterator's lifetime.
@@ -1229,7 +1238,14 @@ impl<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
 	}
 }
 
-impl<'t, K: Clone + Ord + OptimisticRead, V: Clone + OptimisticRead, const IC: usize, const LC: usize> RawExclusiveIter<'t, K, V, IC, LC> {
+impl<
+		't,
+		K: Clone + Ord + OptimisticRead,
+		V: Clone + OptimisticRead,
+		const IC: usize,
+		const LC: usize,
+	> RawExclusiveIter<'t, K, V, IC, LC>
+{
 	/// Creates a new exclusive iterator, pinning a fresh epoch guard.
 	///
 	/// Call `seek*` methods to position before iterating.
@@ -1251,8 +1267,7 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: Clone + OptimisticRead, const IC: u
 			// buffered pos is the position from which we loaded.
 			if let Some((guard, _)) = self.leaf.as_ref() {
 				let node_ptr = guard.as_mut_ptr();
-				let leaf_ptr =
-					unsafe { crate::Node::as_leaf_ptr_mut(node_ptr) };
+				let leaf_ptr = unsafe { crate::Node::as_leaf_ptr_mut(node_ptr) };
 				unsafe {
 					crate::LeafNode::swap_value_at_raw(leaf_ptr, pos, v, &self.eg);
 				}
@@ -1739,16 +1754,14 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: Clone + OptimisticRead, const IC: u
 			// `ExclusiveGuard`); the raw pointer is the same address
 			// the guard derefs to. `swap_value_at_raw` handles both
 			// the entries-side store and the mirror-side update.
-			let leaf_node_ptr =
-				guard.as_mut_ptr() as *mut crate::Node<K, V, IC, LC>;
+			let leaf_node_ptr = guard.as_mut_ptr() as *mut crate::Node<K, V, IC, LC>;
 			let leaf_ptr = unsafe {
 				// `Node::as_leaf_ptr_mut` projects the `Node::Leaf`
 				// variant out of the enum without creating an
 				// `&mut Node` reborrow.
 				crate::Node::as_leaf_ptr_mut(leaf_node_ptr)
 			};
-			let old =
-				unsafe { crate::LeafNode::swap_value_at_raw(leaf_ptr, pos, value, &self.eg) };
+			let old = unsafe { crate::LeafNode::swap_value_at_raw(leaf_ptr, pos, value, &self.eg) };
 			// Advance cursor past the just-replaced entry.
 			*cursor = Cursor::After(pos);
 			Some(old)
@@ -1787,13 +1800,13 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: Clone + OptimisticRead, const IC: u
 				match *cursor {
 					Cursor::Before(pos) => {
 						// SAFETY: we hold the exclusive lock; pos was set up by
-					// seek_exact / seek_for_prev which guarantees pos <= len < LC.
-					unsafe {
-						let node_ptr = guard.as_mut_ptr();
-						let leaf_ptr = crate::Node::as_leaf_ptr_mut(node_ptr);
-						crate::LeafNode::insert_at_raw(leaf_ptr, pos, key, value)
-							.expect("just checked for space");
-					}
+						// seek_exact / seek_for_prev which guarantees pos <= len < LC.
+						unsafe {
+							let node_ptr = guard.as_mut_ptr();
+							let leaf_ptr = crate::Node::as_leaf_ptr_mut(node_ptr);
+							crate::LeafNode::insert_at_raw(leaf_ptr, pos, key, value)
+								.expect("just checked for space");
+						}
 					}
 					Cursor::After(_) => {
 						// seek_exact always positions Before
@@ -2215,7 +2228,9 @@ pub struct Range<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, cons
 	finished: bool,
 }
 
-impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Range<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+	Range<'t, K, V, IC, LC>
+{
 	/// Creates a new range iterator.
 	///
 	/// The iterator is positioned based on the lower bound and will stop
@@ -2407,7 +2422,9 @@ pub struct RangeRev<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, c
 	finished: bool,
 }
 
-impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> RangeRev<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+	RangeRev<'t, K, V, IC, LC>
+{
 	/// Creates a new reverse range iterator.
 	///
 	/// The iterator is positioned based on the upper bound and will stop
@@ -2580,7 +2597,9 @@ pub struct Keys<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const
 	iter: RawSharedIter<'t, K, V, IC, LC>,
 }
 
-impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Keys<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+	Keys<'t, K, V, IC, LC>
+{
 	/// Creates a new keys iterator positioned at the first key.
 	pub(crate) fn new(tree: &'t GenericTree<K, V, IC, LC>) -> Keys<'t, K, V, IC, LC> {
 		let mut iter = tree.raw_iter();
@@ -2627,7 +2646,9 @@ pub struct Values<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, con
 	iter: RawSharedIter<'t, K, V, IC, LC>,
 }
 
-impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Values<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+	Values<'t, K, V, IC, LC>
+{
 	/// Creates a new values iterator positioned at the first value.
 	pub(crate) fn new(tree: &'t GenericTree<K, V, IC, LC>) -> Values<'t, K, V, IC, LC> {
 		let mut iter = tree.raw_iter();

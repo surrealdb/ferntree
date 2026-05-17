@@ -344,7 +344,9 @@ pub struct GenericTree<K: OptimisticRead, V: OptimisticRead, const IC: usize, co
 	height: AtomicUsize,
 }
 
-impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Default for GenericTree<K, V, IC, LC> {
+impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Default
+	for GenericTree<K, V, IC, LC>
+{
 	fn default() -> Self {
 		Self::new()
 	}
@@ -364,7 +366,14 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 /// # Lifetimes
 /// - `'r`: Lifetime of the tree guard (when node is root)
 /// - `'p`: Lifetime of the parent guard (when node has a parent)
-pub(crate) enum ParentHandler<'r, 'p, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
+pub(crate) enum ParentHandler<
+	'r,
+	'p,
+	K: OptimisticRead,
+	V: OptimisticRead,
+	const IC: usize,
+	const LC: usize,
+> {
 	/// The target node is the root of the tree.
 	Root {
 		/// Guard on the tree's root pointer, needed to replace the root during splits.
@@ -395,7 +404,9 @@ pub(crate) enum Direction {
 // GenericTree Implementation
 // ---------------------------------------------------------------------------
 
-impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> GenericTree<K, V, IC, LC> {
+impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+	GenericTree<K, V, IC, LC>
+{
 	// -----------------------------------------------------------------------
 	// Construction
 	// -----------------------------------------------------------------------
@@ -1767,9 +1778,8 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				// LC>` at a known field offset; `pos < LC` checked.
 				let values_ptr: *const SlotArray<V::Slot, LC> =
 					unsafe { ptr::addr_of!((*leaf_ptr).values) };
-				let snapshot: V = match unsafe {
-					SlotArray::try_load_raw(values_ptr, pos as usize)
-				} {
+				let snapshot: V = match unsafe { SlotArray::try_load_raw(values_ptr, pos as usize) }
+				{
 					Some(v) => v,
 					None => {
 						// Slot was concurrently emptied; retry.
@@ -3307,13 +3317,18 @@ pub(crate) enum Node<K: OptimisticRead, V: OptimisticRead, const IC: usize, cons
 /// fast path. Each variant carries a `*const` to the variant's inner type
 /// — never an `&` reborrow — so the caller can project further to leaf /
 /// internal fields without retags.
-pub(crate) enum NodeKindRaw<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
+pub(crate) enum NodeKindRaw<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+{
 	Internal(*const InternalNode<K, V, IC, LC>),
 	Leaf(*const LeafNode<K, V, LC>),
 }
 
-impl<K: fmt::Debug + OptimisticRead, V: fmt::Debug + OptimisticRead, const IC: usize, const LC: usize> fmt::Debug
-	for Node<K, V, IC, LC>
+impl<
+		K: fmt::Debug + OptimisticRead,
+		V: fmt::Debug + OptimisticRead,
+		const IC: usize,
+		const LC: usize,
+	> fmt::Debug for Node<K, V, IC, LC>
 {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		match self {
@@ -3543,9 +3558,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Nod
 			Node::Leaf(ref leaf) => {
 				let len = leaf.len.load() as usize;
 				(0..len)
-					.map(|i| unsafe {
-						SlotArray::load_raw(ptr::addr_of!(leaf.keys), i)
-					})
+					.map(|i| unsafe { SlotArray::load_raw(ptr::addr_of!(leaf.keys), i) })
 					.collect()
 			}
 		}
@@ -3662,7 +3675,9 @@ pub(crate) struct LeafNode<K: OptimisticRead, V: OptimisticRead, const LC: usize
 	pub(crate) sample_key: Option<K>,
 }
 
-impl<K: fmt::Debug + OptimisticRead, V: fmt::Debug + OptimisticRead, const LC: usize> fmt::Debug for LeafNode<K, V, LC> {
+impl<K: fmt::Debug + OptimisticRead, V: fmt::Debug + OptimisticRead, const LC: usize> fmt::Debug
+	for LeafNode<K, V, LC>
+{
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("LeafNode")
 			.field("len", &self.len.load_relaxed())
@@ -3734,9 +3749,8 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 			// with the writer's Release store under exclusive lock.
 			// SAFETY: `mid < upper <= LC`; slot is init while we hold a
 			// shared / exclusive guard on the leaf.
-			let mid_key_opt: Option<K> = unsafe {
-				SlotArray::try_load_raw(ptr::addr_of!(self.keys), mid as usize)
-			};
+			let mid_key_opt: Option<K> =
+				unsafe { SlotArray::try_load_raw(ptr::addr_of!(self.keys), mid as usize) };
 			let mid_key = match mid_key_opt {
 				Some(k) => k,
 				None => {
@@ -3852,8 +3866,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		// will catch).
 		// SAFETY: `keys` is a `SlotArray<K::Slot, LC>` at a known
 		// field offset; raw projection without `&LeafNode` reborrow.
-		let keys_ptr: *const SlotArray<K::Slot, LC> =
-			unsafe { ptr::addr_of!((*this).keys) };
+		let keys_ptr: *const SlotArray<K::Slot, LC> = unsafe { ptr::addr_of!((*this).keys) };
 		let mut lower: u16 = 0;
 		let mut upper: u16 = len.min(LC as u16);
 
@@ -3869,8 +3882,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 			//
 			// SAFETY: `mid` < `upper` <= LC; the bounds check on the
 			// snapshot is validated later by the caller's recheck.
-			let mid_key_opt: Option<K> =
-				unsafe { SlotArray::try_load_raw(keys_ptr, mid as usize) };
+			let mid_key_opt: Option<K> = unsafe { SlotArray::try_load_raw(keys_ptr, mid as usize) };
 			let mid_key_snapshot: core::mem::ManuallyDrop<K> = match mid_key_opt {
 				Some(k) => core::mem::ManuallyDrop::new(k),
 				None => {
@@ -3991,10 +4003,8 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		// Atomic-load a copy of (K, V) for the caller. For inline
 		// storage this is a Copy; for boxed storage this clones through
 		// the Acquire-loaded pointer (refcount bump for refcounted V).
-		let removed_k: K =
-			unsafe { SlotArray::load_raw(keys_ptr, pos as usize) };
-		let removed_v: V =
-			unsafe { SlotArray::load_raw(values_ptr, pos as usize) };
+		let removed_k: K = unsafe { SlotArray::load_raw(keys_ptr, pos as usize) };
+		let removed_v: V = unsafe { SlotArray::load_raw(values_ptr, pos as usize) };
 
 		// Shift the storage to fill the gap. The displaced owners
 		// (Box<K> / Box<V> for boxed storage, K / V for inline) are
@@ -4043,8 +4053,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		// Now swap in the new V. The displaced owner is routed through
 		// the epoch GC so concurrent optimistic readers still hold
 		// valid pointers until the next epoch tick.
-		let displaced =
-			unsafe { SlotArray::swap_init_raw(values_ptr, pos as usize, value) };
+		let displaced = unsafe { SlotArray::swap_init_raw(values_ptr, pos as usize, value) };
 		eg.defer(move || drop(displaced));
 		old_v
 	}
@@ -4095,12 +4104,7 @@ impl<K: Clone + OptimisticRead, V: Clone + OptimisticRead, const LC: usize> Leaf
 	/// - `this` must be a valid `*mut LeafNode` owned by an
 	///   [`crate::latch::ExclusiveGuard`].
 	/// - `pos <= len`.
-	pub(crate) unsafe fn insert_at_raw(
-		this: *mut Self,
-		pos: u16,
-		key: K,
-		value: V,
-	) -> Option<u16> {
+	pub(crate) unsafe fn insert_at_raw(this: *mut Self, pos: u16, key: K, value: V) -> Option<u16> {
 		let len_ptr: *const AtomicLen = unsafe { ptr::addr_of!((*this).len) };
 		let len = unsafe { AtomicLen::load_raw(len_ptr) } as usize;
 		if len >= LC {
@@ -4108,8 +4112,7 @@ impl<K: Clone + OptimisticRead, V: Clone + OptimisticRead, const LC: usize> Leaf
 		}
 
 		// sample_key check via raw projection.
-		let sample_key_ptr: *mut Option<K> =
-			unsafe { ptr::addr_of_mut!((*this).sample_key) };
+		let sample_key_ptr: *mut Option<K> = unsafe { ptr::addr_of_mut!((*this).sample_key) };
 		// SAFETY: under exclusive lock; no concurrent writer.
 		if unsafe { (*sample_key_ptr).is_none() } {
 			unsafe { ptr::write(sample_key_ptr, Some(key.clone())) };
@@ -4158,8 +4161,7 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 		// Atomic-load the split key. For boxed K this clones through
 		// the Acquire-loaded pointer; for inline K it's an atomic copy.
 		let self_keys_ptr: *const _ = ptr::addr_of!(self.keys);
-		let split_key: K =
-			unsafe { SlotArray::load_raw(self_keys_ptr, split_pos as usize) };
+		let split_key: K = unsafe { SlotArray::load_raw(self_keys_ptr, split_pos as usize) };
 
 		// Update fence keys.
 		right.lower_fence = Some(split_key.clone());
@@ -4281,7 +4283,12 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 ///
 /// Similar to leaf nodes, internal nodes have fence keys defining their
 /// key range. These are used for optimistic validation and node relocation.
-pub(crate) struct InternalNode<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
+pub(crate) struct InternalNode<
+	K: OptimisticRead,
+	V: OptimisticRead,
+	const IC: usize,
+	const LC: usize,
+> {
 	/// Number of keys (and regular edges) in this node.
 	///
 	/// Atomic so that readers descending through this node (including
@@ -4311,7 +4318,9 @@ pub(crate) struct InternalNode<K: OptimisticRead, V: OptimisticRead, const IC: u
 	pub(crate) sample_key: Option<K>,
 }
 
-impl<K: fmt::Debug + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> fmt::Debug for InternalNode<K, V, IC, LC> {
+impl<K: fmt::Debug + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> fmt::Debug
+	for InternalNode<K, V, IC, LC>
+{
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("InternalNode")
 			.field("len", &self.len.load_relaxed())
@@ -4325,7 +4334,9 @@ impl<K: fmt::Debug + OptimisticRead, V: OptimisticRead, const IC: usize, const L
 	}
 }
 
-impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
+impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+	InternalNode<K, V, IC, LC>
+{
 	/// Creates a new, empty internal node.
 	pub(crate) fn new() -> InternalNode<K, V, IC, LC> {
 		InternalNode {
@@ -4686,7 +4697,9 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Int
 	}
 }
 
-impl<K: Clone + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
+impl<K: Clone + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+	InternalNode<K, V, IC, LC>
+{
 	/// Splits this internal node, moving entries after `split_pos` to `right`.
 	///
 	/// Internal node splitting is more complex than leaf splitting because
@@ -4834,8 +4847,12 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: us
 /// Invariant validation for testing. Validates tree structure to ensure
 /// unreachable code paths are never reached.
 #[cfg(any(test, feature = "test-utils"))]
-impl<K: Clone + Ord + std::fmt::Debug + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
-	GenericTree<K, V, IC, LC>
+impl<
+		K: Clone + Ord + std::fmt::Debug + OptimisticRead,
+		V: OptimisticRead,
+		const IC: usize,
+		const LC: usize,
+	> GenericTree<K, V, IC, LC>
 {
 	/// Validates all tree invariants. Panics with diagnostic info if any invariant is violated.
 	///
@@ -4907,9 +4924,7 @@ impl<K: Clone + Ord + std::fmt::Debug + OptimisticRead, V: OptimisticRead, const
 				// owned form for comparison.
 				let leaf_len = leaf.len.load() as usize;
 				let keys_owned: Vec<K> = (0..leaf_len)
-					.map(|i| unsafe {
-						SlotArray::load_raw(ptr::addr_of!(leaf.keys), i)
-					})
+					.map(|i| unsafe { SlotArray::load_raw(ptr::addr_of!(leaf.keys), i) })
 					.collect();
 				for i in 1..leaf_len {
 					assert!(
@@ -5210,15 +5225,27 @@ mod tests {
 
 	#[test]
 	fn epoch_deferred_drop_optimistic_reader_vs_defer_writer() {
-		use std::sync::Arc;
 		use std::sync::atomic::AtomicBool;
+		use std::sync::Arc;
 		use std::thread;
 
 		// Drastically scaled down for Miri's slower interpreter; the
 		// non-Miri build still gets a meaningful concurrent workload.
-		let keys: i32 = if cfg!(miri) { 8 } else { 200 };
-		let rounds: i32 = if cfg!(miri) { 4 } else { 50 };
-		let reader_threads = if cfg!(miri) { 2 } else { 4 };
+		let keys: i32 = if cfg!(miri) {
+			8
+		} else {
+			200
+		};
+		let rounds: i32 = if cfg!(miri) {
+			4
+		} else {
+			50
+		};
+		let reader_threads = if cfg!(miri) {
+			2
+		} else {
+			4
+		};
 
 		let tree: Arc<Tree<i32, RefcountedBlob>> = Arc::new(Tree::new());
 		let stop = Arc::new(AtomicBool::new(false));
@@ -5271,8 +5298,8 @@ mod tests {
 	/// (`remove_defer` defers both K and V drops via the epoch GC).
 	#[test]
 	fn k_deferred_drop_optimistic_reader_vs_defer_writer() {
-		use std::sync::Arc;
 		use std::sync::atomic::AtomicBool;
+		use std::sync::Arc;
 		use std::thread;
 
 		// Wraps an Arc<Vec<u8>> so cloning is cheap and the K's `Drop`
@@ -5288,9 +5315,21 @@ mod tests {
 			type Slot = crate::atomic_slot::BoxedSlot<Self>;
 		}
 
-		let keys: u8 = if cfg!(miri) { 8 } else { 64 };
-		let rounds: u64 = if cfg!(miri) { 4 } else { 50 };
-		let reader_threads = if cfg!(miri) { 2 } else { 4 };
+		let keys: u8 = if cfg!(miri) {
+			8
+		} else {
+			64
+		};
+		let rounds: u64 = if cfg!(miri) {
+			4
+		} else {
+			50
+		};
+		let reader_threads = if cfg!(miri) {
+			2
+		} else {
+			4
+		};
 
 		let mk_key = |i: u8| RcKey(Arc::new(vec![i; 8]));
 

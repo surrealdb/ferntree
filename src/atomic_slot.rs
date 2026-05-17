@@ -423,10 +423,7 @@ pub unsafe trait OptimisticSlot: Default + Send + Sync + Sized {
 	/// - The slot must be currently **init**.
 	/// - The caller must hold a shared or exclusive lock on the
 	///   surrounding node so the underlying data is not freed.
-	unsafe fn load_into<'a>(
-		&'a self,
-		buf: &'a mut MaybeUninit<Self::Value>,
-	) -> &'a Self::Value;
+	unsafe fn load_into<'a>(&'a self, buf: &'a mut MaybeUninit<Self::Value>) -> &'a Self::Value;
 }
 
 // ---------------------------------------------------------------------------
@@ -638,8 +635,7 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 		// surrounding node; `&BoxedSlot` is not.
 		// SAFETY: `this` is a valid pointer to `BoxedSlot<T>` (caller's
 		// invariant); `inner` is at a known field offset.
-		let atomic_ptr: *const AtomicPtr<T> =
-			unsafe { ptr::addr_of!((*this).inner) };
+		let atomic_ptr: *const AtomicPtr<T> = unsafe { ptr::addr_of!((*this).inner) };
 		let raw = unsafe { (*atomic_ptr).load(Ordering::Acquire) };
 		if raw.is_null() {
 			return None;
@@ -649,8 +645,7 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 
 	#[inline]
 	unsafe fn store_into_empty_raw_ptr(this: *const Self, value: T) {
-		let atomic_ptr: *const AtomicPtr<T> =
-			unsafe { ptr::addr_of!((*this).inner) };
+		let atomic_ptr: *const AtomicPtr<T> = unsafe { ptr::addr_of!((*this).inner) };
 		let raw = Box::into_raw(Box::new(value));
 		debug_assert!(unsafe { (*atomic_ptr).load(Ordering::Relaxed).is_null() });
 		unsafe { (*atomic_ptr).store(raw, Ordering::Release) };
@@ -658,8 +653,7 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 
 	#[inline]
 	unsafe fn swap_init_raw_ptr(this: *const Self, value: T) -> Box<T> {
-		let atomic_ptr: *const AtomicPtr<T> =
-			unsafe { ptr::addr_of!((*this).inner) };
+		let atomic_ptr: *const AtomicPtr<T> = unsafe { ptr::addr_of!((*this).inner) };
 		let raw_new = Box::into_raw(Box::new(value));
 		let raw_old = unsafe { (*atomic_ptr).swap(raw_new, Ordering::AcqRel) };
 		debug_assert!(!raw_old.is_null());
@@ -668,8 +662,7 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 
 	#[inline]
 	unsafe fn take_init_raw_ptr(this: *const Self) -> Box<T> {
-		let atomic_ptr: *const AtomicPtr<T> =
-			unsafe { ptr::addr_of!((*this).inner) };
+		let atomic_ptr: *const AtomicPtr<T> = unsafe { ptr::addr_of!((*this).inner) };
 		let raw_old = unsafe { (*atomic_ptr).swap(ptr::null_mut(), Ordering::AcqRel) };
 		debug_assert!(!raw_old.is_null());
 		unsafe { Box::from_raw(raw_old) }
@@ -677,10 +670,8 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 
 	#[inline]
 	unsafe fn move_init_to_empty_raw_ptr(src: *const Self, dst: *const Self) {
-		let src_atomic: *const AtomicPtr<T> =
-			unsafe { ptr::addr_of!((*src).inner) };
-		let dst_atomic: *const AtomicPtr<T> =
-			unsafe { ptr::addr_of!((*dst).inner) };
+		let src_atomic: *const AtomicPtr<T> = unsafe { ptr::addr_of!((*src).inner) };
+		let dst_atomic: *const AtomicPtr<T> = unsafe { ptr::addr_of!((*dst).inner) };
 		let raw = unsafe { (*src_atomic).swap(ptr::null_mut(), Ordering::AcqRel) };
 		debug_assert!(!raw.is_null());
 		debug_assert!(unsafe { (*dst_atomic).load(Ordering::Relaxed).is_null() });
@@ -933,12 +924,7 @@ where
 	/// - `pos <= len < N`.
 	/// - Caller must hold the exclusive lock on the surrounding node.
 	#[inline]
-	pub unsafe fn shift_insert_raw(
-		this: *const Self,
-		len: usize,
-		pos: usize,
-		value: S::Value,
-	) {
+	pub unsafe fn shift_insert_raw(this: *const Self, len: usize, pos: usize, value: S::Value) {
 		debug_assert!(pos <= len);
 		debug_assert!(len < N);
 		let base = unsafe { Self::slots_ptr(this) };
@@ -959,11 +945,7 @@ where
 	/// - `pos < len <= N`.
 	/// - Caller must hold the exclusive lock on the surrounding node.
 	#[inline]
-	pub unsafe fn shift_remove_raw(
-		this: *const Self,
-		len: usize,
-		pos: usize,
-	) -> S::Displaced {
+	pub unsafe fn shift_remove_raw(this: *const Self, len: usize, pos: usize) -> S::Displaced {
 		debug_assert!(pos < len);
 		debug_assert!(len <= N);
 		let base = unsafe { Self::slots_ptr(this) };
@@ -985,11 +967,7 @@ where
 	/// - Slot at `pos` must be currently init.
 	/// - Caller must hold the exclusive lock on the surrounding node.
 	#[inline]
-	pub unsafe fn swap_init_raw(
-		this: *const Self,
-		pos: usize,
-		value: S::Value,
-	) -> S::Displaced {
+	pub unsafe fn swap_init_raw(this: *const Self, pos: usize, value: S::Value) -> S::Displaced {
 		debug_assert!(pos < N);
 		let slot_ptr = unsafe { Self::slots_ptr(this).add(pos) };
 		unsafe { S::swap_init_raw_ptr(slot_ptr, value) }
@@ -1610,8 +1588,16 @@ mod tests {
 		// Seed with an initial value so swap_init is valid.
 		unsafe { slot.store_into_empty(1) };
 
-		let writer_iters = if cfg!(miri) { 32 } else { 4096 };
-		let reader_iters = if cfg!(miri) { 64 } else { 8192 };
+		let writer_iters = if cfg!(miri) {
+			32
+		} else {
+			4096
+		};
+		let reader_iters = if cfg!(miri) {
+			64
+		} else {
+			8192
+		};
 
 		let writer_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
 		let writer = {
@@ -1656,7 +1642,11 @@ mod tests {
 		// SAFETY: slot is empty.
 		unsafe { slot.store_into_empty(value.clone()) };
 
-		let reader_iters = if cfg!(miri) { 32 } else { 4096 };
+		let reader_iters = if cfg!(miri) {
+			32
+		} else {
+			4096
+		};
 		let readers: Vec<_> = (0..4)
 			.map(|_| {
 				let slot = slot.clone();
@@ -1689,14 +1679,21 @@ mod tests {
 		// SAFETY: slot is empty.
 		unsafe { slot.store_into_empty(Arc::new(0)) };
 
-		let writer_iters = if cfg!(miri) { 16 } else { 1024 };
-		let reader_iters = if cfg!(miri) { 32 } else { 4096 };
+		let writer_iters = if cfg!(miri) {
+			16
+		} else {
+			1024
+		};
+		let reader_iters = if cfg!(miri) {
+			32
+		} else {
+			4096
+		};
 
 		// The deferred bag holds Box<Arc<u64>> values — the displaced
 		// owners returned from swap_init. Keeping them alive until
 		// readers join models what epoch GC does in the tree.
-		let deferred: Arc<Mutex<Vec<Box<Arc<u64>>>>> =
-			Arc::new(Mutex::new(Vec::new()));
+		let deferred: Arc<Mutex<Vec<Box<Arc<u64>>>>> = Arc::new(Mutex::new(Vec::new()));
 		let writer_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
 
 		let writer = {
@@ -1750,8 +1747,16 @@ mod tests {
 		}
 		let initial_len = Arc::new(std::sync::atomic::AtomicUsize::new(4));
 
-		let writer_iters = if cfg!(miri) { 8 } else { 512 };
-		let reader_iters = if cfg!(miri) { 32 } else { 4096 };
+		let writer_iters = if cfg!(miri) {
+			8
+		} else {
+			512
+		};
+		let reader_iters = if cfg!(miri) {
+			32
+		} else {
+			4096
+		};
 		let writer_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
 
 		let writer = {
@@ -1807,8 +1812,16 @@ mod tests {
 	fn atomic_len_concurrent_writers_readers() {
 		let len: Arc<AtomicLen> = Arc::new(AtomicLen::new(0));
 		let writers_n = 2;
-		let writer_iters = if cfg!(miri) { 32 } else { 4096 };
-		let reader_iters = if cfg!(miri) { 32 } else { 4096 };
+		let writer_iters = if cfg!(miri) {
+			32
+		} else {
+			4096
+		};
+		let reader_iters = if cfg!(miri) {
+			32
+		} else {
+			4096
+		};
 
 		let writers: Vec<_> = (0..writers_n)
 			.map(|_| {
@@ -1851,14 +1864,21 @@ mod tests {
 	/// `OptimisticOption` concurrent replace + load.
 	#[test]
 	fn optimistic_option_concurrent_replace_vs_load() {
-		let opt: Arc<OptimisticOption<InlineSlot<u32>>> =
-			Arc::new(OptimisticOption::default());
+		let opt: Arc<OptimisticOption<InlineSlot<u32>>> = Arc::new(OptimisticOption::default());
 		// Seed with Some(0).
 		// SAFETY: opt is empty.
 		unsafe { opt.store_some_into_empty(0) };
 
-		let writer_iters = if cfg!(miri) { 32 } else { 4096 };
-		let reader_iters = if cfg!(miri) { 32 } else { 4096 };
+		let writer_iters = if cfg!(miri) {
+			32
+		} else {
+			4096
+		};
+		let reader_iters = if cfg!(miri) {
+			32
+		} else {
+			4096
+		};
 
 		let writer_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
 		let writer = {
