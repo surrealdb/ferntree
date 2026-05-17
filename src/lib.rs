@@ -3939,9 +3939,17 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	/// be using it.
 	pub(crate) fn remove_at(&mut self, pos: u16, eg: &epoch::Guard) -> (K, V) {
 		let len = self.len.load_relaxed() as usize;
+		// Atomic-mirror updates via raw-pointer projection so no
+		// `&SlotArray` / `&Slot` reborrow is created under the writer's
+		// `&mut Self` tag tree. Concurrent optimistic readers' atomic
+		// reborrows descend from `*const Self` via the same raw path
+		// and are foreign-safe under Tree Borrows.
 		// SAFETY: caller holds exclusive lock; pos < len <= LC.
-		let displaced_k = unsafe { self.atomic_keys.shift_remove(len, pos as usize) };
-		let displaced_v = unsafe { self.atomic_values.shift_remove(len, pos as usize) };
+		let self_ptr: *const Self = self;
+		let keys_ptr = unsafe { ptr::addr_of!((*self_ptr).atomic_keys) };
+		let values_ptr = unsafe { ptr::addr_of!((*self_ptr).atomic_values) };
+		let displaced_k = unsafe { SlotArray::shift_remove_raw(keys_ptr, len, pos as usize) };
+		let displaced_v = unsafe { SlotArray::shift_remove_raw(values_ptr, len, pos as usize) };
 		// Defer-drop the displaced mirror entries so concurrent
 		// optimistic readers' interior pointers stay valid until the
 		// next epoch tick.
@@ -3953,7 +3961,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	}
 
 	/// Replace the value at `pos` and return the previous value.
-	/// Maintains the atomic mirror.
+	/// Maintains the atomic mirror via raw-pointer projection.
 	///
 	/// Used by `iter::insert`'s overwrite path so the mirror stays in
 	/// sync with `entries`.
@@ -3963,10 +3971,13 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	{
 		let len = self.len.load_relaxed() as usize;
 		debug_assert!((pos as usize) < len);
-		// Update mirror first; the displaced is routed through epoch GC.
+		// Update mirror via raw-pointer projection; the displaced is
+		// routed through epoch GC.
 		// SAFETY: under exclusive lock; pos < len, slot is init.
+		let self_ptr: *const Self = self;
+		let values_ptr = unsafe { ptr::addr_of!((*self_ptr).atomic_values) };
 		let displaced_mirror =
-			unsafe { self.atomic_values.swap_init(pos as usize, value.clone()) };
+			unsafe { SlotArray::swap_init_raw(values_ptr, pos as usize, value.clone()) };
 		eg.defer(move || drop(displaced_mirror));
 		// Update entries.
 		std::mem::replace(&mut self.entries[pos as usize].1, value)
@@ -4019,11 +4030,16 @@ impl<K: Clone + OptimisticRead, V: Clone + OptimisticRead, const LC: usize> Leaf
 		}
 
 		let len = self.len.load_relaxed() as usize;
-		// Mirror updates under exclusive lock; pos <= len < LC.
+		// Mirror updates via raw-pointer projection under exclusive lock;
+		// pos <= len < LC. Bypassing `&self` reborrows keeps the writer
+		// out of Tree-Borrows-protected tag tree on the atomic mirror.
 		// SAFETY: bounds enforced by `has_space()` check above and the
 		// caller's contract that `pos <= len`.
-		unsafe { self.atomic_keys.shift_insert(len, pos as usize, key.clone()) };
-		unsafe { self.atomic_values.shift_insert(len, pos as usize, value.clone()) };
+		let self_ptr: *const Self = self;
+		let keys_ptr = unsafe { ptr::addr_of!((*self_ptr).atomic_keys) };
+		let values_ptr = unsafe { ptr::addr_of!((*self_ptr).atomic_values) };
+		unsafe { SlotArray::shift_insert_raw(keys_ptr, len, pos as usize, key.clone()) };
+		unsafe { SlotArray::shift_insert_raw(values_ptr, len, pos as usize, value.clone()) };
 
 		// Insert the entry at the specified position
 		self.entries.insert(pos as usize, (key, value));
@@ -4074,17 +4090,21 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 
 		// Mirror: move atomic_keys/atomic_values [right_start..total) to
 		// right.atomic_*[0..total-right_start). Atomic-pointer / atomic-
-		// integer shuffles via `move_init_to_empty` — no allocation.
+		// integer shuffles via `SlotArray::move_raw` — no allocation
+		// and raw-pointer projection avoids `&Self` reborrow under the
+		// writer's `&mut LeafNode` tag tree.
 		// SAFETY: both leaves held under exclusive lock; src slots init,
 		// dst slots empty (right just allocated).
+		let self_ptr: *const Self = self;
+		let right_ptr: *const Self = right;
+		let self_keys = unsafe { ptr::addr_of!((*self_ptr).atomic_keys) };
+		let self_values = unsafe { ptr::addr_of!((*self_ptr).atomic_values) };
+		let right_keys = unsafe { ptr::addr_of!((*right_ptr).atomic_keys) };
+		let right_values = unsafe { ptr::addr_of!((*right_ptr).atomic_values) };
 		for (dst_idx, src_pos) in (right_start..total).enumerate() {
 			unsafe {
-				self.atomic_keys
-					.slot(src_pos)
-					.move_init_to_empty(right.atomic_keys.slot(dst_idx));
-				self.atomic_values
-					.slot(src_pos)
-					.move_init_to_empty(right.atomic_values.slot(dst_idx));
+				SlotArray::move_raw(self_keys, src_pos, right_keys, dst_idx);
+				SlotArray::move_raw(self_values, src_pos, right_values, dst_idx);
 			}
 		}
 
@@ -4124,20 +4144,21 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 		self.entries.extend(right.entries.drain(..));
 
 		// Mirror: move right.atomic_*[0..right_len) to
-		// self.atomic_*[self_len..self_len + right_len).
+		// self.atomic_*[self_len..self_len + right_len) via raw-pointer
+		// projection.
 		// SAFETY: both leaves under exclusive lock; src slots init in
 		// `right`, dst slots empty in `self` (beyond self_len).
+		let self_ptr: *const Self = self;
+		let right_ptr: *const Self = right;
+		let self_keys = unsafe { ptr::addr_of!((*self_ptr).atomic_keys) };
+		let self_values = unsafe { ptr::addr_of!((*self_ptr).atomic_values) };
+		let right_keys = unsafe { ptr::addr_of!((*right_ptr).atomic_keys) };
+		let right_values = unsafe { ptr::addr_of!((*right_ptr).atomic_values) };
 		for src_idx in 0..right_len {
 			let dst_idx = self_len + src_idx;
 			unsafe {
-				right
-					.atomic_keys
-					.slot(src_idx)
-					.move_init_to_empty(self.atomic_keys.slot(dst_idx));
-				right
-					.atomic_values
-					.slot(src_idx)
-					.move_init_to_empty(self.atomic_values.slot(dst_idx));
+				SlotArray::move_raw(right_keys, src_idx, self_keys, dst_idx);
+				SlotArray::move_raw(right_values, src_idx, self_values, dst_idx);
 			}
 		}
 

@@ -296,6 +296,32 @@ pub unsafe trait OptimisticSlot: Default + Send + Sync + Sized {
 		unsafe { (*this).try_load() }
 	}
 
+	/// Raw-pointer variant of [`store_into_empty`](Self::store_into_empty).
+	/// Bypasses the `&Self` reborrow so writer-side updates do not
+	/// conflict with a concurrent reader's foreign tag under Tree Borrows.
+	#[inline]
+	unsafe fn store_into_empty_raw_ptr(this: *const Self, value: Self::Value) {
+		unsafe { (*this).store_into_empty(value) }
+	}
+
+	/// Raw-pointer variant of [`swap_init`](Self::swap_init).
+	#[inline]
+	unsafe fn swap_init_raw_ptr(this: *const Self, value: Self::Value) -> Self::Displaced {
+		unsafe { (*this).swap_init(value) }
+	}
+
+	/// Raw-pointer variant of [`take_init`](Self::take_init).
+	#[inline]
+	unsafe fn take_init_raw_ptr(this: *const Self) -> Self::Displaced {
+		unsafe { (*this).take_init() }
+	}
+
+	/// Raw-pointer variant of [`move_init_to_empty`](Self::move_init_to_empty).
+	#[inline]
+	unsafe fn move_init_to_empty_raw_ptr(src: *const Self, dst: *const Self) {
+		unsafe { (*src).move_init_to_empty(&*dst) }
+	}
+
 	/// The displaced-owner type returned when a value leaves the slot
 	/// (via [`swap_init`](Self::swap_init) or [`take_init`](Self::take_init)).
 	///
@@ -464,6 +490,34 @@ unsafe impl<T: AtomicLoadable + Default> OptimisticSlot for InlineSlot<T> {
 	}
 
 	#[inline]
+	unsafe fn store_into_empty_raw_ptr(this: *const Self, value: T) {
+		let atomic_ptr: *const T::Atomic = unsafe { ptr::addr_of!((*this).inner) };
+		T::store_release(unsafe { &*atomic_ptr }, value)
+	}
+
+	#[inline]
+	unsafe fn swap_init_raw_ptr(this: *const Self, value: T) -> T {
+		let atomic_ptr: *const T::Atomic = unsafe { ptr::addr_of!((*this).inner) };
+		T::swap_acqrel(unsafe { &*atomic_ptr }, value)
+	}
+
+	#[inline]
+	unsafe fn take_init_raw_ptr(this: *const Self) -> T {
+		let atomic_ptr: *const T::Atomic = unsafe { ptr::addr_of!((*this).inner) };
+		T::swap_acqrel(unsafe { &*atomic_ptr }, T::default())
+	}
+
+	#[inline]
+	unsafe fn move_init_to_empty_raw_ptr(src: *const Self, dst: *const Self) {
+		let src_atomic: *const T::Atomic = unsafe { ptr::addr_of!((*src).inner) };
+		let dst_atomic: *const T::Atomic = unsafe { ptr::addr_of!((*dst).inner) };
+		let bits = T::load_acquire(unsafe { &*src_atomic });
+		T::store_release(unsafe { &*dst_atomic }, bits);
+		// Clear src so the slot is logically empty.
+		T::store_release(unsafe { &*src_atomic }, T::default());
+	}
+
+	#[inline]
 	unsafe fn store_into_empty(&self, value: T) {
 		// For inline storage, empty / init are tracked by the leaf's
 		// `len`; the underlying atomic always holds a valid T bit-pattern
@@ -594,6 +648,46 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 	}
 
 	#[inline]
+	unsafe fn store_into_empty_raw_ptr(this: *const Self, value: T) {
+		let atomic_ptr: *const AtomicPtr<T> =
+			unsafe { ptr::addr_of!((*this).inner) };
+		let raw = Box::into_raw(Box::new(value));
+		debug_assert!(unsafe { (*atomic_ptr).load(Ordering::Relaxed).is_null() });
+		unsafe { (*atomic_ptr).store(raw, Ordering::Release) };
+	}
+
+	#[inline]
+	unsafe fn swap_init_raw_ptr(this: *const Self, value: T) -> Box<T> {
+		let atomic_ptr: *const AtomicPtr<T> =
+			unsafe { ptr::addr_of!((*this).inner) };
+		let raw_new = Box::into_raw(Box::new(value));
+		let raw_old = unsafe { (*atomic_ptr).swap(raw_new, Ordering::AcqRel) };
+		debug_assert!(!raw_old.is_null());
+		unsafe { Box::from_raw(raw_old) }
+	}
+
+	#[inline]
+	unsafe fn take_init_raw_ptr(this: *const Self) -> Box<T> {
+		let atomic_ptr: *const AtomicPtr<T> =
+			unsafe { ptr::addr_of!((*this).inner) };
+		let raw_old = unsafe { (*atomic_ptr).swap(ptr::null_mut(), Ordering::AcqRel) };
+		debug_assert!(!raw_old.is_null());
+		unsafe { Box::from_raw(raw_old) }
+	}
+
+	#[inline]
+	unsafe fn move_init_to_empty_raw_ptr(src: *const Self, dst: *const Self) {
+		let src_atomic: *const AtomicPtr<T> =
+			unsafe { ptr::addr_of!((*src).inner) };
+		let dst_atomic: *const AtomicPtr<T> =
+			unsafe { ptr::addr_of!((*dst).inner) };
+		let raw = unsafe { (*src_atomic).swap(ptr::null_mut(), Ordering::AcqRel) };
+		debug_assert!(!raw.is_null());
+		debug_assert!(unsafe { (*dst_atomic).load(Ordering::Relaxed).is_null() });
+		unsafe { (*dst_atomic).store(raw, Ordering::Release) };
+	}
+
+	#[inline]
 	unsafe fn store_into_empty(&self, value: T) {
 		let raw = Box::into_raw(Box::new(value));
 		// `Release` ordering pairs with `Acquire` loads on readers.
@@ -705,13 +799,17 @@ unsafe impl OptimisticSlot for UnitSlot {
 /// tracks how many slots at the front of the array are init via its
 /// `len` field.
 ///
-/// The inner array is wrapped in [`core::cell::UnsafeCell`] so that
-/// reborrowing `&SlotArray` from a thread that does not own the
-/// surrounding node's exclusive lock does not conflict, under Tree
-/// Borrows, with a concurrent writer holding `&mut LeafNode` on the
-/// surrounding node. All synchronisation happens at the inner atomic
-/// (`AtomicPtr` / `AtomicU{8,16,32,64}`) level.
-#[repr(C)]
+/// The inner array is wrapped in [`core::cell::UnsafeCell`] and the
+/// outer struct is `#[repr(transparent)]` so that — at the type level —
+/// `&SlotArray<S, N>` has the same layout and interior-mutability
+/// semantics as `&UnsafeCell<[S; N]>`. This means reborrows of
+/// `&SlotArray` from a thread that does not own the surrounding node's
+/// exclusive lock do not conflict, under Tree Borrows, with a concurrent
+/// writer holding `&mut LeafNode` on the surrounding node. All
+/// synchronisation happens at the inner atomic (`AtomicPtr` /
+/// `AtomicU{8,16,32,64}`) level via [`OptimisticSlot::try_load_raw_ptr`]
+/// and friends.
+#[repr(transparent)]
 pub struct SlotArray<S, const N: usize> {
 	slots: core::cell::UnsafeCell<[S; N]>,
 }
@@ -823,6 +921,101 @@ where
 		debug_assert!(pos < N);
 		let slot_ptr = unsafe { Self::slots_ptr(this).add(pos) };
 		unsafe { S::try_load_raw_ptr(slot_ptr) }
+	}
+
+	/// Raw-pointer variant of [`shift_insert`](Self::shift_insert).
+	/// Uses per-slot raw-pointer atomic ops to avoid materialising any
+	/// `&S` reborrow under the writer's `&mut LeafNode` tag tree.
+	///
+	/// # Safety
+	///
+	/// - `this` must be a valid pointer to a `SlotArray<S, N>`.
+	/// - `pos <= len < N`.
+	/// - Caller must hold the exclusive lock on the surrounding node.
+	#[inline]
+	pub unsafe fn shift_insert_raw(
+		this: *const Self,
+		len: usize,
+		pos: usize,
+		value: S::Value,
+	) {
+		debug_assert!(pos <= len);
+		debug_assert!(len < N);
+		let base = unsafe { Self::slots_ptr(this) };
+		for i in (pos..len).rev() {
+			let src_ptr = unsafe { base.add(i) };
+			let dst_ptr = unsafe { base.add(i + 1) };
+			unsafe { S::move_init_to_empty_raw_ptr(src_ptr, dst_ptr) };
+		}
+		let slot_ptr = unsafe { base.add(pos) };
+		unsafe { S::store_into_empty_raw_ptr(slot_ptr, value) };
+	}
+
+	/// Raw-pointer variant of [`shift_remove`](Self::shift_remove).
+	///
+	/// # Safety
+	///
+	/// - `this` must be a valid pointer to a `SlotArray<S, N>`.
+	/// - `pos < len <= N`.
+	/// - Caller must hold the exclusive lock on the surrounding node.
+	#[inline]
+	pub unsafe fn shift_remove_raw(
+		this: *const Self,
+		len: usize,
+		pos: usize,
+	) -> S::Displaced {
+		debug_assert!(pos < len);
+		debug_assert!(len <= N);
+		let base = unsafe { Self::slots_ptr(this) };
+		let removed = unsafe { S::take_init_raw_ptr(base.add(pos)) };
+		for i in pos..(len - 1) {
+			let src_ptr = unsafe { base.add(i + 1) };
+			let dst_ptr = unsafe { base.add(i) };
+			unsafe { S::move_init_to_empty_raw_ptr(src_ptr, dst_ptr) };
+		}
+		removed
+	}
+
+	/// Raw-pointer variant of [`swap_init`](Self::swap_init).
+	///
+	/// # Safety
+	///
+	/// - `this` must be a valid pointer to a `SlotArray<S, N>`.
+	/// - `pos < N`.
+	/// - Slot at `pos` must be currently init.
+	/// - Caller must hold the exclusive lock on the surrounding node.
+	#[inline]
+	pub unsafe fn swap_init_raw(
+		this: *const Self,
+		pos: usize,
+		value: S::Value,
+	) -> S::Displaced {
+		debug_assert!(pos < N);
+		let slot_ptr = unsafe { Self::slots_ptr(this).add(pos) };
+		unsafe { S::swap_init_raw_ptr(slot_ptr, value) }
+	}
+
+	/// Raw-pointer move between two SlotArrays. Used by `split` and
+	/// `merge` to migrate slots between leaves.
+	///
+	/// # Safety
+	///
+	/// - Both pointers must be valid.
+	/// - `src_pos < N_src` and `dst_pos < N_dst` (compile-time const).
+	/// - Source slot must be init; destination must be empty.
+	/// - Caller must hold exclusive locks on both surrounding nodes.
+	#[inline]
+	pub unsafe fn move_raw<const M: usize>(
+		src: *const Self,
+		src_pos: usize,
+		dst: *const SlotArray<S, M>,
+		dst_pos: usize,
+	) {
+		debug_assert!(src_pos < N);
+		debug_assert!(dst_pos < M);
+		let src_ptr = unsafe { Self::slots_ptr(src).add(src_pos) };
+		let dst_ptr = unsafe { SlotArray::<S, M>::slots_ptr(dst).add(dst_pos) };
+		unsafe { S::move_init_to_empty_raw_ptr(src_ptr, dst_ptr) };
 	}
 
 	/// Load the value at `pos` into a caller-provided buffer for
