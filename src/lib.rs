@@ -260,6 +260,7 @@ use std::fmt;
 use std::ops::Bound;
 
 pub mod alloc;
+pub mod atomic_slot;
 pub mod error;
 pub(crate) mod inline_vec;
 pub mod iter;
@@ -4918,6 +4919,7 @@ mod tests {
 	// writes) keeps the `Vec`'s buffer alive until the epoch tick.
 	unsafe impl OptimisticRead for RefcountedBlob {
 		const EPOCH_DEFERRED_DROP: bool = true;
+		type Slot = crate::atomic_slot::BoxedSlot<Self>;
 	}
 
 	#[test]

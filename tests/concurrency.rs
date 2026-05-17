@@ -697,6 +697,7 @@ struct RefcountedBlob(Arc<Vec<u8>>);
 // buffer alive across the reader's snapshot/use window.
 unsafe impl OptimisticRead for RefcountedBlob {
 	const EPOCH_DEFERRED_DROP: bool = true;
+	type Slot = ferntree::atomic_slot::BoxedSlot<Self>;
 }
 
 /// `RcKey` is a refcounted blob acting as `K`. Cheap clone, refcounted
@@ -708,6 +709,7 @@ struct RcKey(Arc<Vec<u8>>);
 // SAFETY: see `RefcountedBlob` above. The contract is symmetric.
 unsafe impl OptimisticRead for RcKey {
 	const EPOCH_DEFERRED_DROP: bool = true;
+	type Slot = ferntree::atomic_slot::BoxedSlot<Self>;
 }
 
 #[test]
