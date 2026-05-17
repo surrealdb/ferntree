@@ -704,15 +704,28 @@ unsafe impl OptimisticSlot for UnitSlot {
 /// value arrays in an optimistically-readable form. The surrounding node
 /// tracks how many slots at the front of the array are init via its
 /// `len` field.
+///
+/// The inner array is wrapped in [`core::cell::UnsafeCell`] so that
+/// reborrowing `&SlotArray` from a thread that does not own the
+/// surrounding node's exclusive lock does not conflict, under Tree
+/// Borrows, with a concurrent writer holding `&mut LeafNode` on the
+/// surrounding node. All synchronisation happens at the inner atomic
+/// (`AtomicPtr` / `AtomicU{8,16,32,64}`) level.
 #[repr(C)]
 pub struct SlotArray<S, const N: usize> {
-	slots: [S; N],
+	slots: core::cell::UnsafeCell<[S; N]>,
 }
+
+// SAFETY: SlotArray's inner array is accessed through the slot trait's
+// atomic ops which provide the synchronisation. Send / Sync flow from
+// the slot type's own Send / Sync.
+unsafe impl<S: Send, const N: usize> Send for SlotArray<S, N> {}
+unsafe impl<S: Sync, const N: usize> Sync for SlotArray<S, N> {}
 
 impl<S: Default, const N: usize> Default for SlotArray<S, N> {
 	fn default() -> Self {
 		Self {
-			slots: core::array::from_fn(|_| S::default()),
+			slots: core::cell::UnsafeCell::new(core::array::from_fn(|_| S::default())),
 		}
 	}
 }
@@ -730,7 +743,11 @@ impl<S, const N: usize> SlotArray<S, N> {
 	/// Returns a reference to the slot at `pos`.
 	#[inline]
 	pub fn slot(&self, pos: usize) -> &S {
-		&self.slots[pos]
+		// SAFETY: the inner array is wrapped in UnsafeCell purely to
+		// opt out of Tree-Borrows protection. Slot access itself goes
+		// through interior-mutable atomics, so producing an `&S`
+		// reference is sound.
+		unsafe { &(*self.slots.get())[pos] }
 	}
 }
 
@@ -743,7 +760,12 @@ impl<S, const N: usize> SlotArray<S, N> {
 	/// `this` must be a valid pointer to a `SlotArray<S, N>`.
 	#[inline]
 	pub unsafe fn slots_ptr(this: *const Self) -> *const S {
-		unsafe { ptr::addr_of!((*this).slots) as *const S }
+		// `UnsafeCell::get` returns `*mut T` from `&UnsafeCell<T>`;
+		// here we go through the raw pointer projection to avoid
+		// creating any `&SlotArray` reborrow.
+		let cell_ptr: *const core::cell::UnsafeCell<[S; N]> =
+			unsafe { ptr::addr_of!((*this).slots) };
+		unsafe { core::cell::UnsafeCell::raw_get(cell_ptr) as *const S }
 	}
 }
 
@@ -762,7 +784,7 @@ where
 	pub unsafe fn load(&self, pos: usize) -> S::Value {
 		debug_assert!(pos < N);
 		// SAFETY: bounds asserted by caller.
-		unsafe { self.slots.get_unchecked(pos).load() }
+		unsafe { (*self.slots.get()).get_unchecked(pos).load() }
 	}
 
 	/// Atomic-load the value at `pos` through a raw pointer, without
@@ -820,7 +842,7 @@ where
 	) -> &'a S::Value {
 		debug_assert!(pos < N);
 		// SAFETY: bounds asserted by caller.
-		unsafe { self.slots.get_unchecked(pos).load_into(buf) }
+		unsafe { (*self.slots.get()).get_unchecked(pos).load_into(buf) }
 	}
 
 	/// Store `value` into the slot at `pos`, which must currently be empty.
@@ -834,7 +856,7 @@ where
 	pub unsafe fn store_into_empty(&self, pos: usize, value: S::Value) {
 		debug_assert!(pos < N);
 		unsafe {
-			self.slots.get_unchecked(pos).store_into_empty(value);
+			(*self.slots.get()).get_unchecked(pos).store_into_empty(value);
 		}
 	}
 
@@ -853,7 +875,7 @@ where
 	#[inline]
 	pub unsafe fn swap_init(&self, pos: usize, value: S::Value) -> S::Displaced {
 		debug_assert!(pos < N);
-		unsafe { self.slots.get_unchecked(pos).swap_init(value) }
+		unsafe { (*self.slots.get()).get_unchecked(pos).swap_init(value) }
 	}
 
 	/// Take the value out of the slot at `pos`, leaving it empty,
@@ -869,7 +891,7 @@ where
 	#[inline]
 	pub unsafe fn take_init(&self, pos: usize) -> S::Displaced {
 		debug_assert!(pos < N);
-		unsafe { self.slots.get_unchecked(pos).take_init() }
+		unsafe { (*self.slots.get()).get_unchecked(pos).take_init() }
 	}
 
 	/// Insert `value` at position `pos`, shifting init slots in
@@ -896,13 +918,13 @@ where
 			// SAFETY: `i < len < N`; src is init, dst (i+1) was empty
 			// before this iteration (and the right-to-left walk keeps it
 			// empty just before we store).
-			let src = unsafe { self.slots.get_unchecked(i) };
-			let dst = unsafe { self.slots.get_unchecked(i + 1) };
+			let src = unsafe { (*self.slots.get()).get_unchecked(i) };
+			let dst = unsafe { (*self.slots.get()).get_unchecked(i + 1) };
 			unsafe { src.move_init_to_empty(dst) };
 		}
 		// SAFETY: slot at `pos` is now empty.
 		unsafe {
-			self.slots.get_unchecked(pos).store_into_empty(value);
+			(*self.slots.get()).get_unchecked(pos).store_into_empty(value);
 		}
 	}
 
@@ -923,11 +945,11 @@ where
 		debug_assert!(len <= N);
 		// Pull out the value at `pos`, leaving it empty.
 		// SAFETY: bounds checked above.
-		let removed = unsafe { self.slots.get_unchecked(pos).take_init() };
+		let removed = unsafe { (*self.slots.get()).get_unchecked(pos).take_init() };
 		// Walk left-to-right, moving each init slot one slot to the left.
 		for i in pos..(len - 1) {
-			let src = unsafe { self.slots.get_unchecked(i + 1) };
-			let dst = unsafe { self.slots.get_unchecked(i) };
+			let src = unsafe { (*self.slots.get()).get_unchecked(i + 1) };
+			let dst = unsafe { (*self.slots.get()).get_unchecked(i) };
 			unsafe { src.move_init_to_empty(dst) };
 		}
 		removed
@@ -946,11 +968,11 @@ where
 		debug_assert!(len <= N);
 		for i in 0..len {
 			// SAFETY: bounds checked; was_init=true asserted by caller.
-			unsafe { self.slots[i].drop_in_place(true) };
+			unsafe { (*self.slots.get())[i].drop_in_place(true) };
 		}
 		for i in len..N {
 			// SAFETY: was_init=false asserted by caller.
-			unsafe { self.slots[i].drop_in_place(false) };
+			unsafe { (*self.slots.get())[i].drop_in_place(false) };
 		}
 	}
 }
