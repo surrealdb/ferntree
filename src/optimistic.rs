@@ -149,9 +149,10 @@
 //! so that even shared-lock readers descending through optimistically-held
 //! internal nodes never reborrow). That is **out of scope** for this PR.
 //!
-//! ## Blanket implementations
+//! ## Built-in implementations
 //!
-//! Every [`Copy`] type is automatically [`OptimisticRead`]:
+//! Primitive integer types implement [`OptimisticRead`] with inline
+//! atomic storage:
 //!
 //! ```
 //! use ferntree::OptimisticRead;
@@ -160,14 +161,18 @@
 //!
 //! assert_optimistic_read::<u64>();
 //! assert_optimistic_read::<i32>();
-//! assert_optimistic_read::<(u32, u32)>();
-//! assert_optimistic_read::<[u8; 16]>();
+//! assert_optimistic_read::<u8>();
+//! assert_optimistic_read::<()>();
+//! assert_optimistic_read::<String>();
 //! ```
 //!
-//! Types that are not `Copy` (e.g. `String`, `Vec<u8>`) are
-//! deliberately *not* `OptimisticRead` by default: their `Drop` frees heap
-//! memory, and a torn snapshot of their layout has a pointer/length pair
-//! that does not describe any real allocation. Use
+//! Each impl picks a storage strategy via the
+//! [`Slot`](OptimisticRead::Slot) associated type — primitive integers
+//! use [`InlineSlot`](crate::atomic_slot::InlineSlot); non-`Copy` heap
+//! types like `String` and `Vec<u8>` use
+//! [`BoxedSlot`](crate::atomic_slot::BoxedSlot).
+//!
+//! For user-defined non-`Copy` types (e.g. refcounted blobs), use
 //! [`Tree::lookup`](crate::Tree::lookup) / [`Tree::contains_key`](crate::Tree::contains_key)
 //! for such values — they acquire a shared lock and are always sound.
 //!
@@ -205,32 +210,105 @@
 /// the buffer behind a validated snapshot may be freed before the user
 /// closure has finished with it.
 ///
-/// All [`Copy`] types satisfy the contract trivially and have a blanket impl.
-pub unsafe trait OptimisticRead: Sized {
+/// Implementors choose an atomic storage strategy via the
+/// [`Slot`](OptimisticRead::Slot) associated type. Built-in impls are
+/// provided for stdlib primitives ([`InlineSlot`](crate::atomic_slot::InlineSlot)
+/// for `Copy` integers, [`BoxedSlot`](crate::atomic_slot::BoxedSlot) for
+/// non-`Copy` types). User types add an `unsafe impl OptimisticRead` block
+/// or use the `impl_optimistic_read_boxed!` / `impl_optimistic_read_inline!`
+/// macros.
+pub unsafe trait OptimisticRead: Sized + Send + 'static {
 	/// Whether the tree should defer drops of values of this type via the
 	/// epoch GC.
 	///
-	/// For [`Copy`] types the default of `false` is correct: their `Drop`
-	/// is a no-op, so deferring would only add allocation overhead.
+	/// For [`Copy`] types with inline atomic storage, the default of
+	/// `false` is correct: their `Drop` is a no-op, and the underlying
+	/// `AtomicLoadable` storage is overwritten by atomic ops, not freed.
 	///
-	/// For refcounted "cheaply-cloneable" types whose `Drop` may free a
-	/// shared heap buffer (e.g. `bytes::Bytes`, `Arc<T>`), implementors
-	/// MUST set this to `true`. Combined with using the tree's epoch-aware
-	/// write methods, this guarantees that the shared buffer behind a
-	/// validated optimistic snapshot remains live until the epoch GC
-	/// reclaims it — by which point no concurrent reader could still be
-	/// using a snapshot from before the write.
-	///
-	/// This is a `const` so the branch is resolved at monomorphisation
-	/// time: for `EPOCH_DEFERRED_DROP = false` types the defer path is
-	/// eliminated entirely by the optimiser.
+	/// For boxed storage (`Slot = BoxedSlot<Self>`), implementors MUST
+	/// set this to `true`. The displaced `Box<T>` returned from
+	/// `swap_init` / `take_init` must be routed through the epoch GC so
+	/// a concurrent optimistic reader's `&T` borrow remains valid until
+	/// no reader could still hold it.
 	const EPOCH_DEFERRED_DROP: bool = false;
+
+	/// The atomic storage strategy for this type. Determines how leaves
+	/// and internal nodes store arrays of `Self`.
+	type Slot: crate::atomic_slot::OptimisticSlot<Value = Self>;
 }
 
-// SAFETY: `Copy` types have no `Drop`, so a torn snapshot is discarded
-// safely with no side effect. They contain no heap-owned interior pointers
-// whose target memory can be freed by a concurrent writer.
-unsafe impl<T: Copy> OptimisticRead for T {}
+// -----------------------------------------------------------------------
+// Built-in impls
+// -----------------------------------------------------------------------
+
+macro_rules! impl_optimistic_read_inline {
+	($($t:ty),* $(,)?) => {
+		$(
+			// SAFETY: `$t` is an `AtomicLoadable` integer/float. Every
+			// bit pattern of the matching stdlib atomic is a valid
+			// `$t`; bitwise atomic load/store is sound.
+			unsafe impl OptimisticRead for $t {
+				type Slot = crate::atomic_slot::InlineSlot<Self>;
+			}
+		)*
+	};
+}
+
+impl_optimistic_read_inline!(u8, i8, u16, i16, u32, i32, u64, i64, usize, isize);
+
+#[macro_export]
+/// Implement [`OptimisticRead`] for a non-`Copy` type via
+/// [`BoxedSlot`](crate::atomic_slot::BoxedSlot) indirection.
+///
+/// Requires the type to be `Clone + Send + Sync + 'static`. The tree
+/// stores each value via `AtomicPtr<Box<T>>`; writes allocate a fresh
+/// `Box` and route the displaced one through the epoch GC.
+macro_rules! impl_optimistic_read_boxed {
+	($($t:ty),* $(,)?) => {
+		$(
+			// SAFETY: `BoxedSlot` synchronises all access via
+			// `AtomicPtr` Acquire/Release; the displaced Box is
+			// returned to the caller for epoch-defer drop.
+			unsafe impl $crate::OptimisticRead for $t {
+				const EPOCH_DEFERRED_DROP: bool = true;
+				type Slot = $crate::atomic_slot::BoxedSlot<Self>;
+			}
+		)*
+	};
+}
+
+// Stdlib types that need boxed storage.
+// SAFETY: see `impl_optimistic_read_boxed!`.
+unsafe impl OptimisticRead for String {
+	const EPOCH_DEFERRED_DROP: bool = true;
+	type Slot = crate::atomic_slot::BoxedSlot<Self>;
+}
+// SAFETY: see `impl_optimistic_read_boxed!`.
+unsafe impl<T: Send + Sync + Clone + 'static> OptimisticRead for Vec<T> {
+	const EPOCH_DEFERRED_DROP: bool = true;
+	type Slot = crate::atomic_slot::BoxedSlot<Self>;
+}
+// SAFETY: see `impl_optimistic_read_boxed!`.
+unsafe impl<T: Send + Sync + 'static + ?Sized> OptimisticRead for std::sync::Arc<T> {
+	const EPOCH_DEFERRED_DROP: bool = true;
+	type Slot = crate::atomic_slot::BoxedSlot<Self>;
+}
+
+// `&'static str` is `Copy` but doesn't fit a stdlib atomic. Use the
+// boxed path; since its `Drop` is a no-op, EPOCH_DEFERRED_DROP can stay
+// `false`, but the BoxedSlot still routes the displaced Box through the
+// caller's epoch defer for the heap allocation itself.
+// SAFETY: see `impl_optimistic_read_boxed!`.
+unsafe impl OptimisticRead for &'static str {
+	const EPOCH_DEFERRED_DROP: bool = true;
+	type Slot = crate::atomic_slot::BoxedSlot<Self>;
+}
+
+// Unit type uses a no-op slot.
+// SAFETY: `()` is a ZST; loads and stores are trivial and require no synchronisation.
+unsafe impl OptimisticRead for () {
+	type Slot = crate::atomic_slot::UnitSlot;
+}
 
 /// Drop the value either immediately or via the epoch GC, according to
 /// [`OptimisticRead::EPOCH_DEFERRED_DROP`].

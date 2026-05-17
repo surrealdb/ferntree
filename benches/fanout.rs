@@ -113,6 +113,17 @@ mod large_value {
 	#[allow(dead_code)]
 	struct Big([u64; 32]); // 256 bytes
 
+	// SAFETY: `Big` is `Copy + Clone + Send + Sync + 'static`. It does
+	// not fit a stdlib atomic (256 bytes); use `BoxedSlot` so every
+	// slot lives in a `Box<Big>` reached via `AtomicPtr`. `Drop` is a
+	// no-op (Copy), but the Box allocation itself still wants
+	// epoch-deferred deallocation to keep optimistic readers' pointers
+	// valid across writer swaps.
+	unsafe impl ferntree::OptimisticRead for Big {
+		const EPOCH_DEFERRED_DROP: bool = true;
+		type Slot = ferntree::atomic_slot::BoxedSlot<Self>;
+	}
+
 	fn fill<const IC: usize, const LC: usize>(keys: &[i64]) -> GenericTree<i64, Big, IC, LC> {
 		let tree: GenericTree<i64, Big, IC, LC> = GenericTree::new();
 		for &k in keys {

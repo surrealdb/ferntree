@@ -464,6 +464,12 @@ impl Drop for DropCounter {
 	}
 }
 
+// SAFETY: see the matching impl in tests/functional_coverage.rs.
+unsafe impl ferntree::OptimisticRead for DropCounter {
+	const EPOCH_DEFERRED_DROP: bool = true;
+	type Slot = ferntree::atomic_slot::BoxedSlot<Self>;
+}
+
 #[test]
 fn defer_destroy_drops_exactly_once_per_removed_value() {
 	let drops = Arc::new(AtomicUsize::new(0));

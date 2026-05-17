@@ -1156,6 +1156,7 @@ struct ArcBlob(#[allow(dead_code)] Arc<[u8; 32]>);
 // across the reader's snapshot/use window.
 unsafe impl ferntree::OptimisticRead for ArcBlob {
 	const EPOCH_DEFERRED_DROP: bool = true;
+	type Slot = ferntree::atomic_slot::BoxedSlot<Self>;
 }
 
 fn bench_refcounted_lookup(c: &mut Criterion) {

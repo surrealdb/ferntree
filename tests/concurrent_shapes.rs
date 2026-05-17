@@ -346,6 +346,12 @@ fn concurrent_churn_drops_values_exactly() {
 		}
 	}
 
+	// SAFETY: see the matching impl in tests/functional_coverage.rs.
+	unsafe impl ferntree::OptimisticRead for Counted {
+		const EPOCH_DEFERRED_DROP: bool = true;
+		type Slot = ferntree::atomic_slot::BoxedSlot<Self>;
+	}
+
 	let inserts = 200usize;
 	let threads = 4usize;
 
@@ -385,12 +391,17 @@ fn concurrent_churn_drops_values_exactly() {
 	}
 
 	let observed = drop_count.load(Ordering::SeqCst);
-	let expected = inserts * threads;
+	// The leaf stores two clones per entry: one in the canonical
+	// `entries` field used by shared-lock paths, one in the atomic
+	// mirror used by the optimistic-read fast path. Each insert
+	// produces 2 storage clones; each remove drops both (the entries
+	// one inline, the mirror one through epoch GC).
+	let expected = 2 * inserts * threads;
 	// Allow a small slack because epoch reclamation can defer drops beyond
 	// our forcing window, but never *over*-drop: that's a double-free.
 	assert!(observed <= expected, "observed {observed} drops > {expected} inserts (double-drop?)");
 	assert!(
-		observed >= expected.saturating_sub(threads),
+		observed >= expected.saturating_sub(2 * threads),
 		"observed {observed} drops < expected {expected} (likely leak)"
 	);
 }

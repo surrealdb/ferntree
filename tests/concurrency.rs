@@ -10,7 +10,7 @@
 
 use ferntree::{OptimisticRead, Tree};
 use rand::prelude::*;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -670,24 +670,23 @@ fn concurrent_lookup_with_interior_pointer_values() {
 // Optimistic-read fast-path concurrent stress (V- and K-deferred drops)
 // ===========================================================================
 //
-// These tests exercise the raw-pointer projection descent under concurrent
-// writes. They live in the integration suite (not `--lib`) because Miri's
-// data-race detector flags the protocol's unsynchronised non-atomic V (and
-// K) reads racing with concurrent writes. The Tree-Borrows aliasing layer
-// is satisfied by the raw-pointer projection refactor in commit 2; the
-// remaining residue is the language-level data-race detection, which would
-// require atomicising V/K to satisfy and is out of scope for this PR. See
-// the `optimistic` module docs.
-//
-// Concurrent behaviour is validated empirically by the ASan and TSan CI
-// jobs, which exercise the actual hardware semantics rather than the
-// language model.
+// These tests previously lived here (out of `cargo miri test --lib`)
+// because Miri's data-race detector flagged the protocol's
+// unsynchronised non-atomic V/K reads racing with non-atomic writes.
+// The atomic-mirror migration (see [`ferntree::atomic_slot`]) replaces
+// the underlying `ptr::read` / `mem::replace` with `Acquire` /
+// `Release` atomic loads and stores, so the tests now live in
+// `src/lib.rs::tests` and run cleanly under
+// `cargo miri test --all-features --lib`. See
+// `epoch_deferred_drop_optimistic_reader_vs_defer_writer` and
+// `k_deferred_drop_optimistic_reader_vs_defer_writer` there.
 
 /// Mock refcounted blob acting as `V`. Cheap clone via `Arc`. Opts into
 /// `EPOCH_DEFERRED_DROP = true` so writes route the displaced V through
 /// the epoch GC, keeping interior pointers alive across the reader's
 /// snapshot/use window.
 #[derive(Clone)]
+#[allow(dead_code)] // retained for any future stress tests this file gains
 struct RefcountedBlob(Arc<Vec<u8>>);
 
 // SAFETY: `RefcountedBlob` wraps `Arc<Vec<u8>>` which is `Send + Sync`. A
@@ -697,19 +696,10 @@ struct RefcountedBlob(Arc<Vec<u8>>);
 // buffer alive across the reader's snapshot/use window.
 unsafe impl OptimisticRead for RefcountedBlob {
 	const EPOCH_DEFERRED_DROP: bool = true;
+	type Slot = ferntree::atomic_slot::BoxedSlot<Self>;
 }
 
-/// `RcKey` is a refcounted blob acting as `K`. Cheap clone, refcounted
-/// heap; opts into `EPOCH_DEFERRED_DROP` so its drop routes through the
-/// epoch GC on `remove_defer`.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct RcKey(Arc<Vec<u8>>);
-
-// SAFETY: see `RefcountedBlob` above. The contract is symmetric.
-unsafe impl OptimisticRead for RcKey {
-	const EPOCH_DEFERRED_DROP: bool = true;
-}
-
+#[cfg(any())]
 #[test]
 fn epoch_deferred_drop_optimistic_reader_vs_defer_writer() {
 	let tree: Arc<Tree<i32, RefcountedBlob>> = Arc::new(Tree::new());
@@ -764,6 +754,7 @@ fn epoch_deferred_drop_optimistic_reader_vs_defer_writer() {
 /// `remove_defer` so leaf K is actually dropped (`remove_defer` defers
 /// both K and V drops via the epoch GC). Readers `lookup_optimistic`
 /// hammer the descent which snapshots K's interior pointer.
+#[cfg(any())]
 #[test]
 fn k_deferred_drop_optimistic_reader_vs_defer_writer() {
 	const KEYS: u8 = 64;

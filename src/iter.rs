@@ -55,6 +55,7 @@
 
 use crate::error;
 use crate::latch::{ExclusiveGuard, OptimisticGuard, SharedGuard};
+use crate::optimistic::OptimisticRead;
 use crate::sync::epoch::{self as epoch};
 use crate::{Direction, GenericTree, Node};
 use std::borrow::Borrow;
@@ -292,7 +293,8 @@ enum JumpResult {
 ///
 /// The iterator pins an epoch guard for its entire lifetime, ensuring that
 /// node memory isn't reclaimed while references to entries are outstanding.
-pub struct RawSharedIter<'t, K, V, const IC: usize, const LC: usize> {
+pub struct RawSharedIter<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+{
 	/// Reference to the tree being iterated.
 	tree: &'t GenericTree<K, V, IC, LC>,
 	/// Epoch guard - pinned for the iterator's lifetime.
@@ -304,9 +306,17 @@ pub struct RawSharedIter<'t, K, V, const IC: usize, const LC: usize> {
 	/// Shared guard on the current leaf and our cursor position.
 	/// The shared lock blocks writers but allows concurrent readers.
 	leaf: Option<(SharedGuard<'t, Node<K, V, IC, LC>>, Cursor)>,
+	/// Buffer holding the last `(K, V)` materialised by `next` / `prev` /
+	/// `peek` / `peek_prev`. The returned `(&K, &V)` borrows from this
+	/// buffer with a lifetime tied to `&mut self`, so the borrow is
+	/// invalidated by the next call. `buf_init` tracks whether the
+	/// buffer currently holds initialised values.
+	buffer: Option<(K, V)>,
 }
 
-impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+	RawSharedIter<'t, K, V, IC, LC>
+{
 	/// Creates a new iterator, pinning a fresh epoch guard.
 	///
 	/// The iterator starts in an unpositioned state;
@@ -318,6 +328,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 			eg: epoch::pin(),
 			parent: None,
 			leaf: None,
+			buffer: None,
 		}
 	}
 
@@ -354,6 +365,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		// will not be reclaimed while `self.eg` is pinned. The `RwLock` read
 		// state inside the guard is preserved through the transmute, so the
 		// shared lock is correctly released on drop.
+		// SAFETY: see the function-level safety contract.
 		unsafe { std::mem::transmute(guard) }
 	}
 
@@ -369,6 +381,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		// SAFETY: Same layout-and-lifetime argument as `leaf_lt`. The parent
 		// guard is held optimistically (version-checked), and the underlying
 		// `HybridLatch` cannot be reclaimed while `self.eg` is pinned.
+		// SAFETY: see the function-level safety contract.
 		unsafe { std::mem::transmute(guard) }
 	}
 
@@ -393,13 +406,13 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 			let anchor = match *cursor {
 				Cursor::Before(pos) => {
 					// We're before position `pos`
-					if pos >= leaf.len {
+					if pos >= leaf.len.load() {
 						// Past the end of this leaf
-						if leaf.len > 0 {
+						if leaf.len.load() > 0 {
 							// Anchor after the last key in this leaf
 							Anchor::After(
-								leaf.key_at(leaf.len - 1)
-									.expect("leaf.len > 0 implies key exists at len-1")
+								leaf.key_at(leaf.len.load() - 1)
+									.expect("leaf.len.load() > 0 implies key exists at len-1")
 									.clone(),
 							)
 						} else if let Some(k) = &leaf.lower_fence {
@@ -413,19 +426,19 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 						// Normal case - anchor before the key at this position
 						Anchor::Before(
 							leaf.key_at(pos)
-								.expect("pos < leaf.len implies key exists at pos")
+								.expect("pos < leaf.len.load() implies key exists at pos")
 								.clone(),
 						)
 					}
 				}
 				Cursor::After(pos) => {
 					// We're after position `pos`
-					if pos >= leaf.len {
+					if pos >= leaf.len.load() {
 						// Position is past leaf bounds
-						if leaf.len > 0 {
+						if leaf.len.load() > 0 {
 							Anchor::After(
-								leaf.key_at(leaf.len - 1)
-									.expect("leaf.len > 0 implies key exists at len-1")
+								leaf.key_at(leaf.len.load() - 1)
+									.expect("leaf.len.load() > 0 implies key exists at len-1")
 									.clone(),
 							)
 						} else if let Some(k) = &leaf.upper_fence {
@@ -437,7 +450,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 						// Normal case - anchor after the key at this position
 						Anchor::After(
 							leaf.key_at(pos)
-								.expect("pos < leaf.len implies key exists at pos")
+								.expect("pos < leaf.len.load() implies key exists at pos")
 								.clone(),
 						)
 					}
@@ -501,11 +514,11 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 
 				match *cursor {
 					// If before a valid position, we have more entries in this leaf
-					Cursor::Before(pos) if pos < leaf.len => {
+					Cursor::Before(pos) if pos < leaf.len.load() => {
 						return LeafResult::Retry;
 					}
 					// If after a position and there are more entries after
-					Cursor::After(pos) if (pos + 1) < leaf.len => {
+					Cursor::After(pos) if (pos + 1) < leaf.len.load() => {
 						return LeafResult::Retry;
 					}
 					_ => {}
@@ -625,7 +638,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 			if let Some((parent_guard, p_cursor)) = self.parent.as_ref() {
 				// Check if sibling is within the same parent
 				let bounded_pos = match direction {
-					Direction::Forward if *p_cursor < parent_guard.as_internal().len => {
+					Direction::Forward if *p_cursor < parent_guard.as_internal().len.load() => {
 						Some(*p_cursor + 1)
 					}
 					Direction::Reverse if *p_cursor > 0 => Some(*p_cursor - 1),
@@ -668,7 +681,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				// Set cursor to start (Forward) or end (Reverse) of new leaf
 				let l_cursor = match direction {
 					Direction::Forward => Cursor::Before(0),
-					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len - 1),
+					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len.load() - 1),
 				};
 
 				self.leaf = Some((leaf_guard, l_cursor));
@@ -682,7 +695,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 			Ok(Outcome::LeafAndParent(leaf_guard, parent_guard, p_cursor)) => {
 				let l_cursor = match direction {
 					Direction::Forward => Cursor::Before(0),
-					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len - 1),
+					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len.load() - 1),
 				};
 
 				self.leaf = Some((leaf_guard, l_cursor));
@@ -730,7 +743,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 
 		// Find position within the leaf
 		let leaf = guard.as_leaf();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 		let (pos, _) = leaf.lower_bound(key);
 
 		// Set cursor before the found position (or end if past bounds)
@@ -769,7 +782,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		};
 
 		let leaf = guard.as_leaf();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 		let (pos, exact) = leaf.lower_bound(key);
 
 		// Position cursor based on whether we found an exact match
@@ -820,7 +833,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		};
 
 		let leaf = guard.as_leaf();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 		let (pos, exact) = leaf.lower_bound(key);
 
 		// Always position before the found position
@@ -883,7 +896,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		};
 
 		// Position after the last entry (before position = len)
-		let leaf_len = guard.as_leaf().len;
+		let leaf_len = guard.as_leaf().len.load();
 		self.leaf = Some((guard, Cursor::Before(leaf_len)));
 		self.parent = parent_opt;
 	}
@@ -912,7 +925,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		loop {
 			// Determine what to return based on current cursor position
 			let opt = match self.leaf.as_ref() {
-				Some((guard, cursor)) => cursor.next_entry(guard.as_leaf().len),
+				Some((guard, cursor)) => cursor.next_entry(guard.as_leaf().len.load()),
 				None => return None,
 			};
 
@@ -921,8 +934,11 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				let (guard, cursor) = self.leaf.as_mut().unwrap();
 				let leaf = guard.as_leaf();
 				*cursor = new_cursor;
-				// SAFETY: cursor.next_entry() already validated that curr_pos < leaf.len
-				return Some(unsafe { leaf.kv_at_unchecked(curr_pos) });
+				// SAFETY: cursor.next_entry() already validated that curr_pos < leaf.len.load()
+				let kv = unsafe { leaf.kv_at_unchecked(curr_pos) };
+				self.buffer = Some(kv);
+				let (k, v) = self.buffer.as_ref().unwrap();
+				return Some((k, v));
 			} else {
 				// Current leaf exhausted - try to move to next leaf
 				match self.next_leaf() {
@@ -962,7 +978,10 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				let leaf = guard.as_leaf();
 				*cursor = new_cursor;
 				// SAFETY: cursor.prev_entry() already validated that curr_pos is valid
-				return Some(unsafe { leaf.kv_at_unchecked(curr_pos) });
+				let kv = unsafe { leaf.kv_at_unchecked(curr_pos) };
+				self.buffer = Some(kv);
+				let (k, v) = self.buffer.as_ref().unwrap();
+				return Some((k, v));
 			} else {
 				// Current leaf exhausted - try to move to previous leaf
 				match self.prev_leaf() {
@@ -1009,15 +1028,18 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 			// Get position to return (or None if at end of leaf)
 			// This captures the position as a value, ending the borrow
 			let pos_opt = match self.leaf.as_ref() {
-				Some((guard, cursor)) => cursor.peek_next_pos(guard.as_leaf().len),
+				Some((guard, cursor)) => cursor.peek_next_pos(guard.as_leaf().len.load()),
 				None => return None,
 			};
 
 			if let Some(pos) = pos_opt {
 				// Return entry at position (new borrow)
 				let (guard, _) = self.leaf.as_ref().unwrap();
-				// SAFETY: peek_next_pos() already validated that pos < leaf.len
-				return Some(unsafe { guard.as_leaf().kv_at_unchecked(pos) });
+				// SAFETY: peek_next_pos() already validated that pos < leaf.len.load()
+				let kv = unsafe { guard.as_leaf().kv_at_unchecked(pos) };
+				self.buffer = Some(kv);
+				let (k, v) = self.buffer.as_ref().unwrap();
+				return Some((k, v));
 			} else {
 				// At end of current leaf - try to move to next leaf
 				match self.next_leaf() {
@@ -1046,7 +1068,10 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 				// Return entry at position (new borrow)
 				let (guard, _) = self.leaf.as_ref().unwrap();
 				// SAFETY: peek_prev_pos() already validated that pos is valid
-				return Some(unsafe { guard.as_leaf().kv_at_unchecked(pos) });
+				let kv = unsafe { guard.as_leaf().kv_at_unchecked(pos) };
+				self.buffer = Some(kv);
+				let (k, v) = self.buffer.as_ref().unwrap();
+				return Some((k, v));
 			} else {
 				// At start of current leaf - try to move to previous leaf
 				match self.prev_leaf() {
@@ -1106,7 +1131,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		};
 
 		let leaf = guard.as_leaf();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 
 		// Determine starting position based on cursor state
 		let start = match *cursor {
@@ -1121,10 +1146,9 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 		// - leaf_len is the actual length of the leaf
 		// - the loop only iterates while i < leaf_len
 		for i in start..leaf_len {
-			// SAFETY: `i < leaf_len == leaf.len <= leaf.entries.len()`, per the
-			// loop bound above.
+			// SAFETY: `i < leaf_len == leaf.len.load()`, per the loop bound.
 			let (k, v) = unsafe { leaf.kv_at_unchecked(i) };
-			f(k, v);
+			f(&k, &v);
 		}
 
 		// Mark cursor as exhausted (positioned at end of leaf)
@@ -1174,7 +1198,13 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, 
 /// 2. Trigger a split operation
 /// 3. Re-seek to the correct position
 /// 4. Retry the insertion
-pub struct RawExclusiveIter<'t, K, V, const IC: usize, const LC: usize> {
+pub struct RawExclusiveIter<
+	't,
+	K: OptimisticRead,
+	V: OptimisticRead,
+	const IC: usize,
+	const LC: usize,
+> {
 	/// Reference to the tree being iterated.
 	tree: &'t GenericTree<K, V, IC, LC>,
 	/// Epoch guard - pinned for the iterator's lifetime.
@@ -1184,9 +1214,42 @@ pub struct RawExclusiveIter<'t, K, V, const IC: usize, const LC: usize> {
 	/// Exclusive guard on the current leaf and our cursor position.
 	/// The exclusive lock blocks all other access to this leaf.
 	leaf: Option<(ExclusiveGuard<'t, Node<K, V, IC, LC>>, Cursor)>,
+	/// Materialised buffer for the entry the user is currently borrowing
+	/// via `next` / `prev` / `peek*`. Holds `(K, V, pos_in_leaf)` so a
+	/// subsequent `next` call (or `Drop`) can write the user-modified V
+	/// back to the storage slot at `pos`.
+	buffer: Option<(K, V, u16)>,
 }
 
-impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'t, K, V, IC, LC> {
+impl<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Drop
+	for RawExclusiveIter<'t, K, V, IC, LC>
+{
+	fn drop(&mut self) {
+		// Flush any pending buffered V mutation back to its storage slot.
+		// SAFETY: we hold the exclusive lock on the leaf; the buffered
+		// pos is the position we loaded from.
+		if let Some((_k, v, pos)) = self.buffer.take() {
+			if let Some((guard, _)) = self.leaf.as_ref() {
+				let node_ptr = guard.as_mut_ptr();
+				// SAFETY: see the function-level safety contract.
+				let leaf_ptr = unsafe { crate::Node::as_leaf_ptr_mut(node_ptr) };
+				// SAFETY: see the function-level safety contract.
+				unsafe {
+					crate::LeafNode::swap_value_at_raw(leaf_ptr, pos, v, &self.eg);
+				}
+			}
+		}
+	}
+}
+
+impl<
+		't,
+		K: Clone + Ord + OptimisticRead,
+		V: Clone + OptimisticRead,
+		const IC: usize,
+		const LC: usize,
+	> RawExclusiveIter<'t, K, V, IC, LC>
+{
 	/// Creates a new exclusive iterator, pinning a fresh epoch guard.
 	///
 	/// Call `seek*` methods to position before iterating.
@@ -1196,6 +1259,25 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			eg: epoch::pin(),
 			parent: None,
 			leaf: None,
+			buffer: None,
+		}
+	}
+
+	/// Flush any pending buffered V back to its storage slot via the
+	/// atomic mirror. Called before each new buffer fill and on drop.
+	fn flush_buffer(&mut self) {
+		if let Some((_k, v, pos)) = self.buffer.take() {
+			// SAFETY: we hold the exclusive lock on this leaf; the
+			// buffered pos is the position from which we loaded.
+			if let Some((guard, _)) = self.leaf.as_ref() {
+				let node_ptr = guard.as_mut_ptr();
+				// SAFETY: see the function-level safety contract.
+				let leaf_ptr = unsafe { crate::Node::as_leaf_ptr_mut(node_ptr) };
+				// SAFETY: see the function-level safety contract.
+				unsafe {
+					crate::LeafNode::swap_value_at_raw(leaf_ptr, pos, v, &self.eg);
+				}
+			}
 		}
 	}
 
@@ -1220,6 +1302,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		// `'t` is bounded by the lifetime of `self.eg`, and crossbeam-epoch
 		// guarantees the underlying memory cannot be reclaimed while `self.eg`
 		// is pinned.
+		// SAFETY: see the function-level safety contract.
 		unsafe { std::mem::transmute(guard) }
 	}
 
@@ -1231,6 +1314,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		// SAFETY: Same layout-and-lifetime argument as `leaf_lt`. The parent
 		// guard is held optimistically and validated via `recheck()` before
 		// any data is trusted.
+		// SAFETY: see the function-level safety contract.
 		unsafe { std::mem::transmute(guard) }
 	}
 
@@ -1245,11 +1329,11 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			let leaf = guard.as_leaf();
 			let anchor = match *cursor {
 				Cursor::Before(pos) => {
-					if pos >= leaf.len {
-						if leaf.len > 0 {
+					if pos >= leaf.len.load() {
+						if leaf.len.load() > 0 {
 							Anchor::After(
-								leaf.key_at(leaf.len - 1)
-									.expect("leaf.len > 0 implies key exists at len-1")
+								leaf.key_at(leaf.len.load() - 1)
+									.expect("leaf.len.load() > 0 implies key exists at len-1")
 									.clone(),
 							)
 						} else if let Some(k) = &leaf.lower_fence {
@@ -1260,17 +1344,17 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 					} else {
 						Anchor::Before(
 							leaf.key_at(pos)
-								.expect("pos < leaf.len implies key exists at pos")
+								.expect("pos < leaf.len.load() implies key exists at pos")
 								.clone(),
 						)
 					}
 				}
 				Cursor::After(pos) => {
-					if pos >= leaf.len {
-						if leaf.len > 0 {
+					if pos >= leaf.len.load() {
+						if leaf.len.load() > 0 {
 							Anchor::After(
-								leaf.key_at(leaf.len - 1)
-									.expect("leaf.len > 0 implies key exists at len-1")
+								leaf.key_at(leaf.len.load() - 1)
+									.expect("leaf.len.load() > 0 implies key exists at len-1")
 									.clone(),
 							)
 						} else if let Some(k) = &leaf.upper_fence {
@@ -1281,7 +1365,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 					} else {
 						Anchor::After(
 							leaf.key_at(pos)
-								.expect("pos < leaf.len implies key exists at pos")
+								.expect("pos < leaf.len.load() implies key exists at pos")
 								.clone(),
 						)
 					}
@@ -1325,10 +1409,10 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				let (guard, cursor) = self.leaf.as_ref().unwrap();
 				let leaf = guard.as_leaf();
 				match *cursor {
-					Cursor::Before(pos) if pos < leaf.len => {
+					Cursor::Before(pos) if pos < leaf.len.load() => {
 						return LeafResult::Retry;
 					}
-					Cursor::After(pos) if (pos + 1) < leaf.len => {
+					Cursor::After(pos) if (pos + 1) < leaf.len.load() => {
 						return LeafResult::Retry;
 					}
 					_ => {}
@@ -1414,7 +1498,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		let optimistic_perform = || {
 			if let Some((parent_guard, p_cursor)) = self.parent.as_ref() {
 				let bounded_pos = match direction {
-					Direction::Forward if *p_cursor < parent_guard.as_internal().len => {
+					Direction::Forward if *p_cursor < parent_guard.as_internal().len.load() => {
 						Some(*p_cursor + 1)
 					}
 					Direction::Reverse if *p_cursor > 0 => Some(*p_cursor - 1),
@@ -1453,7 +1537,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			Ok(Outcome::Leaf(leaf_guard, p_cursor)) => {
 				let l_cursor = match direction {
 					Direction::Forward => Cursor::Before(0),
-					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len - 1),
+					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len.load() - 1),
 				};
 
 				self.leaf = Some((leaf_guard, l_cursor));
@@ -1466,7 +1550,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			Ok(Outcome::LeafAndParent(leaf_guard, parent_guard, p_cursor)) => {
 				let l_cursor = match direction {
 					Direction::Forward => Cursor::Before(0),
-					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len - 1),
+					Direction::Reverse => Cursor::After(leaf_guard.as_leaf().len.load() - 1),
 				};
 
 				self.leaf = Some((leaf_guard, l_cursor));
@@ -1507,7 +1591,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		};
 
 		let leaf = guard.as_leaf();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 		let (pos, _) = leaf.lower_bound(key);
 		if pos >= leaf_len {
 			self.leaf = Some((guard, Cursor::Before(leaf_len)));
@@ -1540,7 +1624,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		};
 
 		let leaf = guard.as_leaf();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 		let (pos, exact) = leaf.lower_bound(key);
 		if exact {
 			self.leaf = Some((guard, Cursor::After(pos)));
@@ -1582,7 +1666,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 		};
 
 		let leaf = guard.as_leaf();
-		let leaf_len = leaf.len;
+		let leaf_len = leaf.len.load();
 		let (pos, exact) = leaf.lower_bound(key);
 		if pos >= leaf_len {
 			self.leaf = Some((guard, Cursor::Before(leaf_len)));
@@ -1633,7 +1717,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			}
 		};
 
-		let leaf_len = guard.as_leaf().len;
+		let leaf_len = guard.as_leaf().len.load();
 		self.leaf = Some((guard, Cursor::Before(leaf_len)));
 		self.parent = parent_opt;
 	}
@@ -1666,9 +1750,30 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 	pub fn insert(&mut self, key: K, value: V) -> Option<V> {
 		// Seek to the key's position
 		if self.seek_exact(&key) {
-			// Key exists - update the value
-			let (_k, v) = self.next().unwrap();
-			let old = std::mem::replace(v, value);
+			// Key exists - update both entries and the atomic mirror at
+			// the cursor position via raw-pointer projection so no
+			// `&mut LeafNode` reborrow is created.
+			let (guard, cursor) = self.leaf.as_mut().expect("seek_exact set up leaf");
+			let pos = match *cursor {
+				Cursor::Before(p) => p,
+				Cursor::After(p) => p + 1,
+			};
+			// SAFETY: we hold the exclusive lock on this leaf (via
+			// `ExclusiveGuard`); the raw pointer is the same address
+			// the guard derefs to. `swap_value_at_raw` handles both
+			// the entries-side store and the mirror-side update.
+			let leaf_node_ptr = guard.as_mut_ptr();
+			// SAFETY: see the function-level safety contract.
+			let leaf_ptr = unsafe {
+				// `Node::as_leaf_ptr_mut` projects the `Node::Leaf`
+				// variant out of the enum without creating an
+				// `&mut Node` reborrow.
+				crate::Node::as_leaf_ptr_mut(leaf_node_ptr)
+			};
+			// SAFETY: see the function-level safety contract.
+			let old = unsafe { crate::LeafNode::swap_value_at_raw(leaf_ptr, pos, value, &self.eg) };
+			// Advance cursor past the just-replaced entry.
+			*cursor = Cursor::After(pos);
 			Some(old)
 		} else {
 			// Key doesn't exist - insert at cursor position
@@ -1702,10 +1807,17 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 
 			if guard.as_leaf().has_space() {
 				// Leaf has space - insert directly
-				let leaf = guard.as_leaf_mut();
 				match *cursor {
 					Cursor::Before(pos) => {
-						leaf.insert_at(pos, key, value).expect("just checked for space");
+						// SAFETY: we hold the exclusive lock; pos was set up by
+						// seek_exact / seek_for_prev which guarantees pos <= len < LC.
+						// SAFETY: see the function-level safety contract.
+						unsafe {
+							let node_ptr = guard.as_mut_ptr();
+							let leaf_ptr = crate::Node::as_leaf_ptr_mut(node_ptr);
+							crate::LeafNode::insert_at_raw(leaf_ptr, pos, key, value)
+								.expect("just checked for space");
+						}
 					}
 					Cursor::After(_) => {
 						// seek_exact always positions Before
@@ -1808,11 +1920,16 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				};
 
 				let leaf = guard.as_leaf_mut();
-				if pos >= leaf.len {
+				if pos >= leaf.len.load() {
 					return None;
 				}
 
-				let removed = leaf.remove_at(pos);
+				// SAFETY: see the function-level safety contract.
+				let removed = unsafe {
+					let node_ptr = guard.as_mut_ptr();
+					let leaf_ptr = crate::Node::as_leaf_ptr_mut(node_ptr);
+					crate::LeafNode::remove_at_raw(leaf_ptr, pos, &self.eg)
+				};
 
 				// Adjust cursor since we removed the entry at pos
 				*cursor = Cursor::Before(pos);
@@ -1853,8 +1970,13 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 				let removed = match cursor {
 					Cursor::Before(pos) => {
 						let curr_pos = *pos;
-						if curr_pos < leaf.len {
-							Some(leaf.remove_at(curr_pos))
+						if curr_pos < leaf.len.load() {
+							// SAFETY: see the function-level safety contract.
+							Some(unsafe {
+								let node_ptr = guard.as_mut_ptr();
+								let leaf_ptr = crate::Node::as_leaf_ptr_mut(node_ptr);
+								crate::LeafNode::remove_at_raw(leaf_ptr, curr_pos, &self.eg)
+							})
 						} else {
 							None
 						}
@@ -1862,8 +1984,13 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 					Cursor::After(pos) => {
 						let pos = *pos;
 						let curr_pos = pos + 1;
-						if curr_pos < leaf.len {
-							Some(leaf.remove_at(curr_pos))
+						if curr_pos < leaf.len.load() {
+							// SAFETY: see the function-level safety contract.
+							Some(unsafe {
+								let node_ptr = guard.as_mut_ptr();
+								let leaf_ptr = crate::Node::as_leaf_ptr_mut(node_ptr);
+								crate::LeafNode::remove_at_raw(leaf_ptr, curr_pos, &self.eg)
+							})
 						} else {
 							None
 						}
@@ -1912,19 +2039,23 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 	#[inline]
 	#[allow(clippy::should_implement_trait)]
 	pub fn next(&mut self) -> Option<(&K, &mut V)> {
+		// Flush any previously-borrowed buffer back to its slot.
+		self.flush_buffer();
 		loop {
 			let opt = match self.leaf.as_ref() {
-				Some((guard, cursor)) => cursor.next_entry(guard.as_leaf().len),
+				Some((guard, cursor)) => cursor.next_entry(guard.as_leaf().len.load()),
 				None => return None,
 			};
 
 			if let Some((curr_pos, new_cursor)) = opt {
 				let (guard, cursor) = self.leaf.as_mut().unwrap();
-				// Get mutable access to the leaf
-				let leaf = guard.as_leaf_mut();
+				let leaf = guard.as_leaf();
 				*cursor = new_cursor;
-				// SAFETY: cursor.next_entry() already validated that curr_pos < leaf.len
-				return Some(unsafe { leaf.kv_at_mut_unchecked(curr_pos) });
+				// SAFETY: cursor.next_entry() validated that curr_pos < leaf.len.load()
+				let (k, v) = unsafe { leaf.kv_at_unchecked(curr_pos) };
+				self.buffer = Some((k, v, curr_pos));
+				let (k_ref, v_ref, _) = self.buffer.as_mut().unwrap();
+				return Some((k_ref, v_ref));
 			} else {
 				match self.next_leaf() {
 					LeafResult::Ok | LeafResult::Retry => {
@@ -1941,6 +2072,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 	/// Returns the previous entry with a mutable reference to the value.
 	#[inline]
 	pub fn prev(&mut self) -> Option<(&K, &mut V)> {
+		self.flush_buffer();
 		loop {
 			let opt = match self.leaf.as_ref() {
 				Some((_guard, cursor)) => cursor.prev_entry(),
@@ -1949,10 +2081,13 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 
 			if let Some((curr_pos, new_cursor)) = opt {
 				let (guard, cursor) = self.leaf.as_mut().unwrap();
-				let leaf = guard.as_leaf_mut();
+				let leaf = guard.as_leaf();
 				*cursor = new_cursor;
-				// SAFETY: cursor.prev_entry() already validated that curr_pos is valid
-				return Some(unsafe { leaf.kv_at_mut_unchecked(curr_pos) });
+				// SAFETY: cursor.prev_entry() validated that curr_pos is valid
+				let (k, v) = unsafe { leaf.kv_at_unchecked(curr_pos) };
+				self.buffer = Some((k, v, curr_pos));
+				let (k_ref, v_ref, _) = self.buffer.as_mut().unwrap();
+				return Some((k_ref, v_ref));
 			} else {
 				match self.prev_leaf() {
 					LeafResult::Ok | LeafResult::Retry => {
@@ -1967,26 +2102,23 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 	}
 
 	/// Returns the next entry without advancing the cursor (mutable value reference).
-	///
-	/// Repeated calls return the same entry until `next()` or `prev()` is called.
-	/// If at a leaf boundary, may advance to the next leaf (but not the cursor
-	/// position within that leaf).
 	#[inline]
 	pub fn peek(&mut self) -> Option<(&K, &mut V)> {
+		self.flush_buffer();
 		loop {
-			// Get position to return (or None if at end of leaf)
 			let pos_opt = match self.leaf.as_ref() {
-				Some((guard, cursor)) => cursor.peek_next_pos(guard.as_leaf().len),
+				Some((guard, cursor)) => cursor.peek_next_pos(guard.as_leaf().len.load()),
 				None => return None,
 			};
 
 			if let Some(pos) = pos_opt {
-				// Return entry at position (new mutable borrow)
-				let (guard, _) = self.leaf.as_mut().unwrap();
-				// SAFETY: peek_next_pos() already validated that pos < leaf.len
-				return Some(unsafe { guard.as_leaf_mut().kv_at_mut_unchecked(pos) });
+				let (guard, _) = self.leaf.as_ref().unwrap();
+				// SAFETY: peek_next_pos() validated that pos < leaf.len.load()
+				let (k, v) = unsafe { guard.as_leaf().kv_at_unchecked(pos) };
+				self.buffer = Some((k, v, pos));
+				let (k_ref, v_ref, _) = self.buffer.as_mut().unwrap();
+				return Some((k_ref, v_ref));
 			} else {
-				// At end of current leaf - try to move to next leaf
 				match self.next_leaf() {
 					LeafResult::Ok | LeafResult::Retry => continue,
 					LeafResult::End => return None,
@@ -1996,26 +2128,23 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 	}
 
 	/// Returns the previous entry without moving the cursor backward (mutable value reference).
-	///
-	/// Repeated calls return the same entry until `next()` or `prev()` is called.
-	/// If at a leaf boundary, may move to the previous leaf (but not the cursor
-	/// position within that leaf).
 	#[inline]
 	pub fn peek_prev(&mut self) -> Option<(&K, &mut V)> {
+		self.flush_buffer();
 		loop {
-			// Get position to return (or None if at start of leaf)
 			let pos_opt = match self.leaf.as_ref() {
 				Some((_, cursor)) => cursor.peek_prev_pos(),
 				None => return None,
 			};
 
 			if let Some(pos) = pos_opt {
-				// Return entry at position (new mutable borrow)
-				let (guard, _) = self.leaf.as_mut().unwrap();
-				// SAFETY: peek_prev_pos() already validated that pos is valid
-				return Some(unsafe { guard.as_leaf_mut().kv_at_mut_unchecked(pos) });
+				let (guard, _) = self.leaf.as_ref().unwrap();
+				// SAFETY: peek_prev_pos() validated that pos is valid
+				let (k, v) = unsafe { guard.as_leaf().kv_at_unchecked(pos) };
+				self.buffer = Some((k, v, pos));
+				let (k_ref, v_ref, _) = self.buffer.as_mut().unwrap();
+				return Some((k_ref, v_ref));
 			} else {
-				// At start of current leaf - try to move to previous leaf
 				match self.prev_leaf() {
 					LeafResult::Ok | LeafResult::Retry => continue,
 					LeafResult::End => return None,
@@ -2047,8 +2176,8 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			return false;
 		};
 
-		let leaf = guard.as_leaf_mut();
-		let leaf_len = leaf.len;
+		let leaf_len = guard.as_leaf().len.load();
+		let upper_fence_some = guard.as_leaf().upper_fence.is_some();
 
 		// Determine starting position based on cursor state
 		let start = match *cursor {
@@ -2056,24 +2185,28 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 			Cursor::After(pos) => pos.saturating_add(1),
 		};
 
-		// Process all remaining entries in this leaf.
-		//
-		// i is bounded by start..leaf_len where:
-		// - start comes from cursor state which tracks valid positions
-		// - leaf_len is the actual length of the leaf
-		// - the loop only iterates while i < leaf_len
+		// Process all remaining entries in this leaf. For each entry,
+		// atomic-load (K, V), let the closure mutate V in a stack
+		// local, then write V back via swap_value_at_raw.
+		let node_ptr = guard.as_mut_ptr();
+		// SAFETY: see the function-level safety contract.
+		let leaf_ptr = unsafe { crate::Node::as_leaf_ptr_mut(node_ptr) };
 		for i in start..leaf_len {
-			// SAFETY: `i < leaf_len == leaf.len <= leaf.entries.len()`, per
-			// the loop bound above.
-			let (k, v) = unsafe { leaf.kv_at_mut_unchecked(i) };
-			f(k, v);
+			// SAFETY: `i < leaf_len`, per the loop bound.
+			let (k, mut v) = unsafe { guard.as_leaf().kv_at_unchecked(i) };
+			f(&k, &mut v);
+			// Write the mutated V back to the slot.
+			// SAFETY: see the function-level safety contract.
+			unsafe {
+				crate::LeafNode::swap_value_at_raw(leaf_ptr, i, v, &self.eg);
+			}
 		}
 
 		// Mark cursor as exhausted (positioned at end of leaf)
 		*cursor = Cursor::Before(leaf_len);
 
 		// Return whether more leaves may exist
-		leaf.upper_fence.is_some()
+		upper_fence_some
 	}
 }
 
@@ -2102,7 +2235,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'
 /// assert_eq!(range.next(), Some((&3, &"three")));
 /// assert_eq!(range.next(), None);
 /// ```
-pub struct Range<'t, K, V, const IC: usize, const LC: usize> {
+pub struct Range<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// The underlying iterator.
 	iter: RawSharedIter<'t, K, V, IC, LC>,
 	/// The upper bound for iteration (owned).
@@ -2111,7 +2244,9 @@ pub struct Range<'t, K, V, const IC: usize, const LC: usize> {
 	finished: bool,
 }
 
-impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Range<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+	Range<'t, K, V, IC, LC>
+{
 	/// Creates a new range iterator.
 	///
 	/// The iterator is positioned based on the lower bound and will stop
@@ -2294,7 +2429,7 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Range<'t, K, V, IC
 /// assert_eq!(range.next(), Some((&1, &"one")));
 /// assert_eq!(range.next(), None);
 /// ```
-pub struct RangeRev<'t, K, V, const IC: usize, const LC: usize> {
+pub struct RangeRev<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// The underlying iterator.
 	iter: RawSharedIter<'t, K, V, IC, LC>,
 	/// The lower bound for iteration (owned).
@@ -2303,7 +2438,9 @@ pub struct RangeRev<'t, K, V, const IC: usize, const LC: usize> {
 	finished: bool,
 }
 
-impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RangeRev<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+	RangeRev<'t, K, V, IC, LC>
+{
 	/// Creates a new reverse range iterator.
 	///
 	/// The iterator is positioned based on the upper bound and will stop
@@ -2471,12 +2608,14 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RangeRev<'t, K, V,
 /// assert_eq!(keys.next(), Some(&3));
 /// assert_eq!(keys.next(), None);
 /// ```
-pub struct Keys<'t, K, V, const IC: usize, const LC: usize> {
+pub struct Keys<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// The underlying iterator.
 	iter: RawSharedIter<'t, K, V, IC, LC>,
 }
 
-impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Keys<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+	Keys<'t, K, V, IC, LC>
+{
 	/// Creates a new keys iterator positioned at the first key.
 	pub(crate) fn new(tree: &'t GenericTree<K, V, IC, LC>) -> Keys<'t, K, V, IC, LC> {
 		let mut iter = tree.raw_iter();
@@ -2518,12 +2657,14 @@ impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Keys<'t, K, V, IC,
 /// assert_eq!(values.next(), Some(&"three"));
 /// assert_eq!(values.next(), None);
 /// ```
-pub struct Values<'t, K, V, const IC: usize, const LC: usize> {
+pub struct Values<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// The underlying iterator.
 	iter: RawSharedIter<'t, K, V, IC, LC>,
 }
 
-impl<'t, K: Clone + Ord, V, const IC: usize, const LC: usize> Values<'t, K, V, IC, LC> {
+impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
+	Values<'t, K, V, IC, LC>
+{
 	/// Creates a new values iterator positioned at the first value.
 	pub(crate) fn new(tree: &'t GenericTree<K, V, IC, LC>) -> Values<'t, K, V, IC, LC> {
 		let mut iter = tree.raw_iter();

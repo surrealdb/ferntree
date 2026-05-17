@@ -642,6 +642,14 @@ fn complex_value_type() {
 		name: String,
 	}
 
+	// SAFETY: BoxedSlot synchronises all access via AtomicPtr; the
+	// displaced Box is returned for epoch-defer drop. ComplexValue is
+	// Send + Sync + Clone + 'static.
+	unsafe impl ferntree::OptimisticRead for ComplexValue {
+		const EPOCH_DEFERRED_DROP: bool = true;
+		type Slot = ferntree::atomic_slot::BoxedSlot<Self>;
+	}
+
 	let tree: Tree<i32, ComplexValue> = Tree::new();
 
 	for i in 0..100 {

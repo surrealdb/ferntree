@@ -719,6 +719,26 @@ impl<'a, T> std::ops::Deref for ExclusiveGuard<'a, T> {
 	}
 }
 
+impl<'a, T> ExclusiveGuard<'a, T> {
+	/// Returns a raw `*mut` to the protected data, without creating an
+	/// `&mut T` reborrow.
+	///
+	/// Useful when the caller wants to mutate `T` via atomic ops on
+	/// interior-mutable fields and needs to avoid the Tree-Borrows
+	/// protected tag that `&mut T` would create — concurrent optimistic
+	/// readers (whose atomic reborrows descend from a sibling
+	/// `*const T` from an `OptimisticGuard`) would otherwise be flagged
+	/// foreign.
+	///
+	/// The exclusive lock guarantees no concurrent writer, so the
+	/// returned pointer is the only writable handle to the data for
+	/// the guard's lifetime.
+	#[inline]
+	pub fn as_mut_ptr(&self) -> *mut T {
+		self.data
+	}
+}
+
 impl<'a, T> std::ops::DerefMut for ExclusiveGuard<'a, T> {
 	/// Returns a mutable reference to the data.
 	#[inline]
