@@ -592,16 +592,13 @@ fn stress_producer_consumer() {
 // Regression for https://github.com/surrealdb/ferntree/issues/4
 //
 // Before the fix, `Tree::lookup` ran the user closure under a purely
-// optimistic guard. For value types with interior pointers (SmallVec, Vec,
-// String, etc.) a torn read of the value's length/tag bytes during a
-// concurrent mutation triggers UB inside the value type's own methods — for
-// SmallVec this surfaces as `entered unreachable code`. The fix is to hold
-// a shared lock on the leaf for the duration of the closure.
+// optimistic guard. For value types with interior pointers (Vec, String,
+// `bytes::Bytes`, etc.) a torn read of the value's length/tag bytes during a
+// concurrent mutation triggers UB inside the value type's own methods. The
+// fix is to hold a shared lock on the leaf for the duration of the closure.
 
 #[test]
 fn concurrent_lookup_with_interior_pointer_values() {
-	use smallvec::SmallVec;
-
 	// Tiny key space so almost every commit lands on the same leaf as a
 	// concurrent one — this is what the original repro relies on.
 	const NUM_KEYS: u32 = 16;
@@ -609,15 +606,18 @@ fn concurrent_lookup_with_interior_pointer_values() {
 	const READERS: usize = 12;
 	const OPS_PER_THREAD: usize = 2_000;
 
-	type Versions = SmallVec<[u64; 4]>;
+	// `Vec<u64>` has the same "interior pointer" hazard the original
+	// reproducer targeted: a torn read of len/ptr/cap during concurrent
+	// `push` / `truncate` triggers UB inside `Vec`'s own methods. The fix
+	// is to hold a shared lock on the leaf across the lookup closure.
+	type Versions = Vec<u64>;
 
 	let tree: Arc<Tree<u32, Versions>> = Arc::new(Tree::new());
 
 	// Pre-populate every key so writers exercise the same leaf-edit path as
-	// the original consumer (seek_exact -> mutate the SmallVec in place).
+	// the original consumer (seek_exact -> mutate the Vec in place).
 	for k in 0..NUM_KEYS {
-		let mut sv: Versions = SmallVec::new();
-		sv.push(0);
+		let sv: Versions = vec![0];
 		tree.insert(k, sv);
 	}
 
@@ -632,8 +632,8 @@ fn concurrent_lookup_with_interior_pointer_values() {
 				let mut iter = tree.raw_iter_mut();
 				if iter.seek_exact(&key) {
 					let (_, versions) = iter.next().expect("seek_exact returned true");
-					// Mix of grow and shrink so the SmallVec crosses the
-					// inline/heap boundary repeatedly.
+					// Mix of grow and shrink so the Vec triggers
+					// reallocations repeatedly.
 					if versions.len() > 4 && (i & 1) == 0 {
 						versions.truncate(2);
 					} else {
@@ -650,10 +650,10 @@ fn concurrent_lookup_with_interior_pointer_values() {
 			let mut rng = StdRng::seed_from_u64(0xBEE5 + r as u64);
 			for _ in 0..OPS_PER_THREAD {
 				let key = rng.random_range(0..NUM_KEYS);
-				// Touch the SmallVec in a way that forces method dispatch
+				// Touch the Vec in a way that forces method dispatch
 				// (sums the slice). Before the fix, a torn read of the
-				// tag/len during a concurrent push/truncate would panic
-				// inside smallvec or read freed heap memory.
+				// ptr/len during a concurrent push/truncate would read
+				// freed heap memory.
 				let _ = tree.lookup(&key, |v| v.iter().copied().sum::<u64>());
 			}
 		}));

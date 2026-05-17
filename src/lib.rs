@@ -254,14 +254,13 @@
 // the crate has a documented justification.
 #![warn(clippy::undocumented_unsafe_blocks)]
 
-use smallvec::{smallvec, SmallVec};
-
 use std::borrow::Borrow;
 use std::fmt;
 use std::ops::Bound;
 
 pub mod alloc;
 pub mod error;
+pub(crate) mod inline_vec;
 pub mod iter;
 pub mod latch;
 pub mod optimistic;
@@ -270,6 +269,7 @@ pub(crate) mod sync;
 use sync::epoch::{self as epoch, Atomic, Owned};
 use sync::{AtomicUsize, Ordering};
 
+use inline_vec::InlineVec;
 use latch::{ExclusiveGuard, HybridGuard, HybridLatch, OptimisticGuard, SharedGuard};
 pub use optimistic::OptimisticRead;
 
@@ -417,7 +417,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		GenericTree {
 			root: HybridLatch::new(Atomic::new(HybridLatch::new(Node::Leaf(LeafNode {
 				len: 0,
-				entries: smallvec![],
+				entries: InlineVec::new(),
 				// No fences for the root leaf - it covers the entire key space
 				lower_fence: None,
 				upper_fence: None,
@@ -3325,7 +3325,7 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 	/// Returns the keys stored in this node (for testing).
 	#[cfg(test)]
 	#[inline]
-	pub(crate) fn keys(&self) -> SmallVec<[&K; 64]> {
+	pub(crate) fn keys(&self) -> Vec<&K> {
 		match self {
 			Node::Internal(ref internal) => internal.keys.iter().collect(),
 			Node::Leaf(ref leaf) => leaf.entries.iter().map(|(k, _)| k).collect(),
@@ -3418,7 +3418,12 @@ pub(crate) struct LeafNode<K, V, const LC: usize> {
 	/// Number of key-value pairs in this leaf.
 	pub(crate) len: u16,
 	/// Sorted array of key-value pairs (interleaved for cache locality).
-	pub(crate) entries: SmallVec<[(K, V); LC]>,
+	///
+	/// Backed by [`InlineVec`] rather than `SmallVec` so the optimistic
+	/// read fast path can project to `len` / data via raw pointers without
+	/// creating an `&` reborrow (which would race under Tree Borrows with
+	/// concurrent writer mutations under the leaf's exclusive lock).
+	pub(crate) entries: InlineVec<(K, V), LC>,
 	/// Exclusive lower bound - keys in this leaf are > lower_fence.
 	/// None means this is the leftmost leaf (no lower bound).
 	pub(crate) lower_fence: Option<K>,
@@ -3446,7 +3451,7 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 	pub fn new() -> LeafNode<K, V, LC> {
 		LeafNode {
 			len: 0,
-			entries: smallvec![],
+			entries: InlineVec::new(),
 			lower_fence: None,
 			upper_fence: None,
 			sample_key: None,
@@ -3778,10 +3783,12 @@ pub(crate) struct InternalNode<K, V, const IC: usize, const LC: usize> {
 	/// Number of keys (and regular edges) in this node.
 	pub(crate) len: u16,
 	/// Separator keys, sorted in ascending order.
-	pub(crate) keys: SmallVec<[K; IC]>,
+	///
+	/// Backed by [`InlineVec`] — see the comment on `LeafNode::entries`.
+	pub(crate) keys: InlineVec<K, IC>,
 	/// Child pointers corresponding to keys.
 	/// `edges[i]` points to subtree with keys < `keys[i]`.
-	pub(crate) edges: SmallVec<[Atomic<HybridLatch<Node<K, V, IC, LC>>>; IC]>,
+	pub(crate) edges: InlineVec<Atomic<HybridLatch<Node<K, V, IC, LC>>>, IC>,
 	/// Rightmost child pointer, for keys >= last key.
 	/// This is separate because we have N+1 children for N keys.
 	pub(crate) upper_edge: Option<Atomic<HybridLatch<Node<K, V, IC, LC>>>>,
@@ -3812,8 +3819,8 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 	pub(crate) fn new() -> InternalNode<K, V, IC, LC> {
 		InternalNode {
 			len: 0,
-			keys: smallvec![],
-			edges: smallvec![],
+			keys: InlineVec::new(),
+			edges: InlineVec::new(),
 			upper_edge: None,
 			lower_fence: None,
 			upper_fence: None,
