@@ -218,13 +218,63 @@ This is the test the issue's first acceptance criterion calls for.
 
 ## Phased commit plan
 
-1. **Storage trait scaffolding** — DONE (src/atomic_slot.rs, 15 Miri-clean tests).
-2. **OptimisticRead trait change + built-in impls.** Just change the trait and add built-ins. Build will break at all use sites in tests + lib.rs. Fix test fixtures by adding impls. Adjust `drop_or_defer` to handle new trait shape. Build green again. No leaf/internal storage changes yet; the trait is just enriched.
-3. **LeafNode storage + methods migration.** Single large commit; touches ~30 methods. Build must remain green per commit.
-4. **InternalNode storage + methods.** Same.
-5. **find_shared_leaf_and_optimistic_parent raw-projection migration.** Iter.rs adjustments.
-6. **Move quarantined tests into `--lib`. Add new concurrent splits test.** Miri job validates everything.
-7. **Update src/optimistic.rs module docs.** Remove "out of scope" carve-outs; document the fix.
+1. **Storage trait scaffolding** — DONE (commit c6d97b7, src/atomic_slot.rs,
+   15 Miri-clean tests including 6 concurrent ones).
+2. **OptimisticRead trait change + built-in impls** — DONE (commit c6d97b7).
+   `type Slot` associated type added; Copy blanket dropped; stdlib impls
+   provided for integers, String, Vec<u8>, Arc<T>, &'static str, ();
+   user test fixtures (RefcountedBlob, RcKey, ComplexValue, DropCounter×2,
+   Counted) updated.
+3. **AtomicLen for node `len` fields** — DONE (commit 2f79c3a). Both
+   LeafNode and InternalNode `len` are now `AtomicLen`; ~40 access sites
+   migrated. `len_raw` uses `AtomicLen::load_raw` (Acquire-load via raw
+   projection).
+4. **Add atomic mirror fields to LeafNode + propagate K/V OptimisticRead
+   bounds** — DONE (commit 1b0c873 + 8c68aaa). `LeafNode` has
+   `atomic_keys: SlotArray<K::Slot, LC>` and
+   `atomic_values: SlotArray<V::Slot, LC>` fields, allocated empty.
+   `GenericTree<K, V, IC, LC>` now bounds K, V on `OptimisticRead`.
+5. **Write-path mirror maintenance** — ATTEMPTED, NOT VIABLE (stashed).
+   Tried updating `insert_at`, `remove_at`, `split`, `merge` to maintain
+   both `entries` and the mirror. Three blockers surfaced:
+   - `Arc::strong_count` test assertions break because the mirror's
+     clone doubles the held refcount per entry.
+   - The overwrite path in `iter::insert` does `std::mem::replace` on
+     `entries` without touching the mirror — mirror entries become
+     stale after overwrite.
+   - The displaced mirror entries from `remove_at` require
+     `eg: &epoch::Guard` plumbing through 20+ call sites; tractable
+     but doubles write cost for no semantic gain.
+
+   **Conclusion:** the dual-storage approach is unworkable. The right
+   path is **full migration**: drop `entries` and use `atomic_keys` +
+   `atomic_values` as the sole storage.
+
+6. **Full LeafNode storage migration** — TODO. The substantive remaining
+   work. Drop the `entries` field. Rewrite every method on LeafNode to
+   use the atomic storage. For closure-based reads (`Tree::lookup`),
+   load V atomically into a stack-local and pass `&V` to the closure
+   (one extra clone per lookup for boxed V; zero overhead for Copy V).
+   For iterators (`RawSharedIter::next`, `Range::next`, etc.), add an
+   internal buffer field; return `&'_ K, &'_ V` borrows from the buffer
+   with lifetime tied to `&mut self`. For mut iterators, write back via
+   `swap_init` on the slot, route the displaced through `eg.defer`.
+
+7. **InternalNode K migration** — TODO. Replace
+   `keys: InlineVec<K, IC>` with `keys: SlotArray<K::Slot, IC>`.
+   `lower_bound_raw` switches from `ptr::read(K)` to atomic load via
+   `SlotArray::load_raw`.
+
+8. **`find_shared_leaf_and_optimistic_parent` raw-projection migration**
+   — TODO. Replace the `match *target_guard` (which reborrows
+   `&Node` / `&InternalNode`) with `Node::variant_raw` +
+   `InternalNode::lower_bound_raw` + `InternalNode::edge_at_raw`.
+
+9. **Move quarantined tests into `--lib`. Add new concurrent splits test.**
+   TODO. Validates the fix under Miri.
+
+10. **Update src/optimistic.rs module docs.** TODO. Remove "out of scope"
+    carve-outs; document the fix.
 
 ## Estimated effort
 
