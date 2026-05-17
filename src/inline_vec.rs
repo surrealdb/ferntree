@@ -101,6 +101,7 @@ impl<T, const N: usize> InlineVec<T, N> {
 
 	/// Returns the compile-time capacity.
 	#[inline]
+	#[allow(dead_code)] // surfaced for parity with SmallVec; reserved for future callers
 	pub(crate) fn capacity(&self) -> usize {
 		N
 	}
@@ -122,6 +123,7 @@ impl<T, const N: usize> InlineVec<T, N> {
 
 	/// Returns a raw pointer to the first element.
 	#[inline]
+	#[allow(dead_code)] // surfaced for parity with SmallVec; reserved for future callers
 	pub(crate) fn as_ptr(&self) -> *const T {
 		self.data.as_ptr() as *const T
 	}

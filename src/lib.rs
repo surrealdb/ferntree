@@ -254,6 +254,7 @@
 // the crate has a documented justification.
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+use core::ptr;
 use std::borrow::Borrow;
 use std::fmt;
 use std::ops::Bound;
@@ -1166,7 +1167,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		eg: &'e epoch::Guard,
 	) -> error::Result<OptimisticGuard<'e, Node<K, V, IC, LC>>>
 	where
-		K: Borrow<Q> + Ord,
+		K: Borrow<Q> + Ord + OptimisticRead,
 		Q: ?Sized + Ord,
 	{
 		// Start traversal from root
@@ -1180,27 +1181,53 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		let mut t_guard = Some(tree_guard);
 		let mut target_guard = root_guard;
 
-		// Descend until we land on a leaf. We do not need to track the
-		// transition to the leaf level because we never upgrade the leaf to
-		// a shared lock — the entire descent stays optimistic.
+		// Descend until we land on a leaf. We use raw-pointer projection
+		// throughout — never `*target_guard` — so we never create an
+		// `&Node` reborrow that would race (under Tree Borrows) with a
+		// concurrent writer mutating the node under exclusive lock. The
+		// version `recheck()` at every level validates the snapshot.
 		loop {
-			let c_swip = match *target_guard {
-				Node::Internal(ref internal) => {
-					let (pos, _) = internal.lower_bound(key);
-					internal.edge_at(pos)?
+			let target_ptr = target_guard.as_ptr();
+			// SAFETY: target_ptr is owned by a HybridLatch we hold an
+			// optimistic guard on; the read of the discriminant is
+			// validated by `recheck()` on the next iteration's
+			// `lock_coupling`.
+			let kind = unsafe { Node::variant_raw(target_ptr) };
+			let c_swip_ptr = match kind {
+				NodeKindRaw::Internal(internal_ptr) => {
+					// SAFETY: pointer to InternalNode obtained via
+					// raw projection; OptimisticRead bound on K
+					// certifies the binary-search snapshot
+					// discipline.
+					let (pos, _) = unsafe { InternalNode::lower_bound_raw(internal_ptr, key) };
+					// SAFETY: same conditions as lower_bound_raw above.
+					unsafe { InternalNode::edge_at_raw(internal_ptr, pos)? }
 				}
-				Node::Leaf(_) => {
+				NodeKindRaw::Leaf(_) => {
 					// Root is a leaf (single-node tree) or we've reached a
-					// leaf via lock coupling. Either way, we're done.
+					// leaf via lock coupling. Either way, we're done —
+					// after one final recheck of the tree guard if it's
+					// still live.
 					if let Some(tree_guard) = t_guard.take() {
 						tree_guard.recheck()?;
 					}
+					// Final recheck of the leaf guard itself so callers
+					// observe a consistent state before reading.
+					target_guard.recheck()?;
 					return Ok(target_guard);
 				}
 			};
 
 			// Optimistic lock coupling: acquire child optimistically and
-			// validate parent.
+			// validate parent. `lock_coupling` reborrows the swip via
+			// `&Atomic<...>`; that's sound because `Atomic` is its own
+			// interior-mutable type whose load is an atomic operation
+			// rather than a non-atomic read.
+			//
+			// SAFETY: c_swip_ptr is valid for the lifetime of the parent
+			// guard; the `&` reborrow only lives for the lock_coupling
+			// call which performs an atomic load and parent recheck.
+			let c_swip = unsafe { &*c_swip_ptr };
 			let guard = GenericTree::lock_coupling(&target_guard, c_swip, eg)?;
 			target_guard = guard;
 
@@ -1567,6 +1594,28 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		K: Borrow<Q> + Ord,
 		Q: ?Sized + Ord,
 	{
+		// Uses the safe shared-lock path so it works for any `K`,
+		// including non-`OptimisticRead` types like `String` /
+		// `Vec<u8>`. Users who want the optimistic fast path with
+		// `K: OptimisticRead` (typically `K: Copy` or `K: Bytes`) can
+		// call [`contains_key_optimistic`](Self::contains_key_optimistic).
+		self.lookup(key, |_| ()).is_some()
+	}
+
+	/// Same as [`contains_key`](Self::contains_key) but uses the optimistic
+	/// read fast path — skips the leaf's shared lock entirely.
+	///
+	/// Requires [`K: OptimisticRead`](crate::OptimisticRead). All [`Copy`]
+	/// key types satisfy this automatically. For refcounted key types
+	/// like `bytes::Bytes`, opt in by implementing `OptimisticRead` with
+	/// `EPOCH_DEFERRED_DROP = true` and using
+	/// [`insert_defer`](Self::insert_defer) / [`remove_defer`](Self::remove_defer)
+	/// for all writes.
+	pub fn contains_key_optimistic<Q>(&self, key: &Q) -> bool
+	where
+		K: Borrow<Q> + Ord + OptimisticRead,
+		Q: ?Sized + Ord,
+	{
 		let eg = &epoch::pin();
 
 		// Retry loop for optimistic validation failures
@@ -1574,15 +1623,29 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 			let perform = || -> error::Result<bool> {
 				let leaf_guard = self.find_optimistic_leaf(key, eg)?;
 
-				let Node::Leaf(ref leaf) = *leaf_guard else {
-					unreachable!(
-						"find_optimistic_leaf returned non-leaf node - tree traversal invariant violated"
-					)
+				// Raw-pointer projection: no `&Node` / `&LeafNode`
+				// reborrow on the optimistic descent path. See
+				// `Node::variant_raw` + `LeafNode::lower_bound_raw`.
+				let node_ptr = leaf_guard.as_ptr();
+				// SAFETY: `leaf_guard` is an OptimisticGuard on the
+				// HybridLatch holding this Node; the raw discriminant
+				// read is validated by `recheck()` below.
+				let leaf_ptr = match unsafe { Node::variant_raw(node_ptr) } {
+					NodeKindRaw::Leaf(l) => l,
+					NodeKindRaw::Internal(_) => {
+						// Possible under a torn discriminant; recheck
+						// will fail and we'll retry.
+						std::hint::cold_path();
+						return Err(error::Error::Unwind);
+					}
 				};
 
-				let (_, exact) = leaf.lower_bound(key);
+				// SAFETY: leaf_ptr is a valid pointer for the lifetime
+				// of the optimistic guard. K: OptimisticRead certifies
+				// the comparison snapshot discipline.
+				let (_, exact) = unsafe { LeafNode::lower_bound_raw(leaf_ptr, key) };
 
-				// Validate the descent and the position we observed
+				// Validate the descent and the position we observed.
 				leaf_guard.recheck()?;
 				Ok(exact)
 			};
@@ -1638,7 +1701,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// ```
 	pub fn lookup_optimistic<Q, R, F>(&self, key: &Q, f: F) -> Option<R>
 	where
-		K: Borrow<Q> + Ord,
+		K: Borrow<Q> + Ord + OptimisticRead,
 		Q: ?Sized + Ord,
 		V: OptimisticRead,
 		F: Fn(&V) -> R,
@@ -1650,13 +1713,23 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 			let perform = || -> error::Result<Option<R>> {
 				let leaf_guard = self.find_optimistic_leaf(key, eg)?;
 
-				let Node::Leaf(ref leaf) = *leaf_guard else {
-					unreachable!(
-						"find_optimistic_leaf returned non-leaf node - tree traversal invariant violated"
-					)
+				// Raw-pointer projection — never `*leaf_guard` to `&Node`
+				// or `&LeafNode`, so no retag races with a concurrent
+				// writer.
+				let node_ptr = leaf_guard.as_ptr();
+				// SAFETY: leaf_guard is an OptimisticGuard on the
+				// HybridLatch holding this Node.
+				let leaf_ptr = match unsafe { Node::variant_raw(node_ptr) } {
+					NodeKindRaw::Leaf(l) => l,
+					NodeKindRaw::Internal(_) => {
+						std::hint::cold_path();
+						return Err(error::Error::Unwind);
+					}
 				};
 
-				let (pos, exact) = leaf.lower_bound(key);
+				// SAFETY: see `LeafNode::lower_bound_raw`. K: OptimisticRead
+				// certifies the binary-search snapshot discipline.
+				let (pos, exact) = unsafe { LeafNode::lower_bound_raw(leaf_ptr, key) };
 
 				if !exact {
 					// Validate that the negative result is real.
@@ -1664,35 +1737,27 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 					return Ok(None);
 				}
 
-				// Bitwise-snapshot the value into a stack local. The
-				// snapshot may be torn at this point; the version recheck
-				// below confirms whether it is.
-				//
-				// SAFETY: `entries` is a `SmallVec<[(K, V); LC]>`. We use
-				// `as_ptr()` plus an index rather than `entries[pos]` so
-				// that we never invoke the user's `Index` panic path with
-				// a potentially-torn `len`. The pointer arithmetic is
-				// bounded by a `Result` check below.
-				let snapshot = {
-					let entries_ptr = leaf.entries.as_ptr();
-					let entries_cap = leaf.entries.capacity();
-					if (pos as usize) >= entries_cap {
-						// Length / position is inconsistent with the
-						// backing storage; retry.
-						return Err(error::Error::Unwind);
-					}
-					// SAFETY: `pos` is in-bounds of the SmallVec's
-					// allocation (which has at least `entries_cap`
-					// addressable slots). The read is bitwise; the
-					// snapshot's drop is suppressed below if used, or
-					// after the recheck-fail unwind.
-					unsafe { core::ptr::read(&(*entries_ptr.add(pos as usize)).1) }
-				};
+				// Bitwise-snapshot the V via raw projection. The snapshot
+				// may be torn at this point; the version recheck below
+				// confirms it.
+				// SAFETY: leaf_ptr is a valid pointer for the lifetime
+				// of the optimistic guard.
+				let entries_ptr = unsafe { LeafNode::entries_ptr_raw(leaf_ptr) };
+				// Bound by the compile-time capacity LC since `len` may be
+				// inconsistent under concurrent mutation. We have
+				// `pos <= LC` because `lower_bound_raw`'s `upper` is
+				// bounded by `len.min(LC)`.
+				if (pos as usize) >= LC {
+					return Err(error::Error::Unwind);
+				}
+				// SAFETY: `pos < LC`, entries_ptr is valid for at least
+				// LC elements. The read is bitwise; if recheck below
+				// fails we forget the snapshot without running `Drop`.
+				// V: OptimisticRead certifies this discipline.
+				let snapshot =
+					unsafe { ptr::read(ptr::addr_of!((*entries_ptr.add(pos as usize)).1)) };
 
 				// Validate that the snapshot is internally consistent.
-				// If recheck fails, the snapshot may be torn; we forget
-				// it without running `Drop`. `V: OptimisticRead` makes
-				// `mem::forget` on a torn snapshot sound.
 				if let Err(err) = leaf_guard.recheck() {
 					core::mem::forget(snapshot);
 					return Err(err);
@@ -1761,7 +1826,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// ```
 	pub fn get_optimistic<Q>(&self, key: &Q) -> Option<V>
 	where
-		K: Borrow<Q> + Ord,
+		K: Borrow<Q> + Ord + OptimisticRead,
 		Q: ?Sized + Ord,
 		V: OptimisticRead + Clone,
 	{
@@ -1940,7 +2005,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	/// optimistic read first to obtain a clone, then call this method.
 	pub fn remove_defer<Q>(&self, key: &Q) -> bool
 	where
-		K: Borrow<Q> + Ord,
+		K: Borrow<Q> + Ord + OptimisticRead + Send + 'static,
 		Q: ?Sized + Ord,
 		V: OptimisticRead + Send + 'static,
 	{
@@ -1949,7 +2014,15 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 		// epoch the reader could currently be in.
 		let eg = epoch::pin();
 		let removed = self.remove_entry(key);
-		if let Some((_k, v)) = removed {
+		if let Some((k, v)) = removed {
+			// Symmetric K and V defer: leaf K is dropped on remove, so
+			// for K: EPOCH_DEFERRED_DROP = true (e.g. `bytes::Bytes`)
+			// the K's interior pointer must outlive any in-flight
+			// optimistic reader's snapshot. `drop_or_defer` routes
+			// through epoch when the const says so; otherwise it's an
+			// immediate drop (the dead branch is elided at
+			// monomorphisation).
+			optimistic::drop_or_defer(k, &eg);
 			optimistic::drop_or_defer(v, &eg);
 			drop(eg);
 			true
@@ -2059,9 +2132,16 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 	///   monomorphised defer branch is dead code and elided).
 	pub fn insert_defer(&self, key: K, value: V) -> bool
 	where
-		K: Ord,
+		K: Ord + OptimisticRead,
 		V: OptimisticRead + Send + 'static,
 	{
+		// Note: K is not displaced on overwrite (only V is) and is not
+		// dropped from the leaf on a fresh insert, so we don't need a
+		// K: Send + 'static defer path here. The `K: OptimisticRead`
+		// bound is there for API symmetry — callers using the
+		// optimistic-read fast path must satisfy it on K anyway, and
+		// requiring it here gives an earlier compile error if the
+		// caller's K type doesn't opt in.
 		let eg = epoch::pin();
 		let displaced = {
 			let mut iter = self.raw_iter_mut();
@@ -2315,7 +2395,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 						{
 							let new_root = new_root_owned.as_mut().as_mut().as_internal_mut();
 							new_root.insert(split_key, old_root_edge);
-							new_root.upper_edge = Some(new_right_node_edge);
+							new_root.upper_edge = new_right_node_edge;
 						}
 					}
 					Node::Leaf(root_leaf_node) => {
@@ -2353,7 +2433,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 						{
 							let new_root = new_root_owned.as_mut().as_mut().as_internal_mut();
 							new_root.insert(split_key, old_root_edge);
-							new_root.upper_edge = Some(new_right_node_edge);
+							new_root.upper_edge = new_right_node_edge;
 						}
 					}
 				}
@@ -2436,10 +2516,10 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 							if pos == parent_internal.len {
 								// Node was at upper_edge - it becomes the left.
 								// Insert split key and make right the new upper_edge.
-								let left_edge = parent_internal
-									.upper_edge
-									.replace(new_right_node_edge)
-									.expect("internal node upper_edge must be set before split");
+								let left_edge = std::mem::replace(
+									&mut parent_internal.upper_edge,
+									new_right_node_edge,
+								);
 								parent_internal.insert(split_key, left_edge);
 							} else {
 								// Node was at edges[pos] - keep it there (it's now the left).
@@ -2487,10 +2567,10 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 							if pos == parent_internal.len {
 								// Node was at upper_edge - it becomes the left.
 								// Insert split key and make right the new upper_edge.
-								let left_edge = parent_internal
-									.upper_edge
-									.replace(new_right_node_edge)
-									.expect("internal node upper_edge must be set before split");
+								let left_edge = std::mem::replace(
+									&mut parent_internal.upper_edge,
+									new_right_node_edge,
+								);
 								parent_internal.insert(split_key, left_edge);
 							} else {
 								// Node was at edges[pos] - keep it there (it's now the left).
@@ -2637,10 +2717,10 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 										// Target was at upper_edge
 										// Remove separator, left becomes the new upper_edge
 										let (_, left_edge) = parent_internal.remove_at(pos - 1);
-										let dropped_edge = parent_internal
-											.upper_edge
-											.replace(left_edge)
-											.expect("parent upper_edge must exist during merge");
+										let dropped_edge = std::mem::replace(
+											&mut parent_internal.upper_edge,
+											left_edge,
+										);
 
 										// Schedule the old target for deferred destruction
 										let shared = dropped_edge.load(Ordering::Relaxed, eg);
@@ -2697,10 +2777,10 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 
 									if pos == parent_len {
 										let (_, left_edge) = parent_internal.remove_at(pos - 1);
-										let dropped_edge = parent_internal
-											.upper_edge
-											.replace(left_edge)
-											.expect("parent upper_edge must exist during merge");
+										let dropped_edge = std::mem::replace(
+											&mut parent_internal.upper_edge,
+											left_edge,
+										);
 
 										let shared = dropped_edge.load(Ordering::Relaxed, eg);
 										if !shared.is_null() {
@@ -2750,145 +2830,143 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 				// ===============================================================
 				// Try 2: Merge with RIGHT sibling (if left merge failed)
 				// ===============================================================
-				let merge_succeeded = if !merge_succeeded
-					&& parent_len > 0
-					&& (pos + 1) <= parent_len
-				{
-					// Right sibling exists - try to merge
+				let merge_succeeded =
+					if !merge_succeeded && parent_len > 0 && (pos + 1) <= parent_len {
+						// Right sibling exists - try to merge
 
-					let r_swip = parent_guard.as_internal().edge_at(pos + 1)?;
-					let right_guard = GenericTree::lock_coupling(&parent_guard, r_swip, eg)?;
+						let r_swip = parent_guard.as_internal().edge_at(pos + 1)?;
+						let right_guard = GenericTree::lock_coupling(&parent_guard, r_swip, eg)?;
 
-					if !right_guard.can_merge_with(&target_guard) {
-						// Can't merge with right sibling either
-						right_guard.recheck()?;
-						target_guard.recheck()?;
-						false
-					} else {
-						// Upgrade to exclusive
-						let mut parent_guard_x = parent_guard.to_exclusive()?;
-						let mut target_guard_x = target_guard.to_exclusive()?;
-						let mut right_guard_x = right_guard.to_exclusive()?;
+						if !right_guard.can_merge_with(&target_guard) {
+							// Can't merge with right sibling either
+							right_guard.recheck()?;
+							target_guard.recheck()?;
+							false
+						} else {
+							// Upgrade to exclusive
+							let mut parent_guard_x = parent_guard.to_exclusive()?;
+							let mut target_guard_x = target_guard.to_exclusive()?;
+							let mut right_guard_x = right_guard.to_exclusive()?;
 
-						match target_guard_x.as_mut() {
-							Node::Leaf(ref mut target_leaf) => {
-								// Merging leaf nodes (target absorbs right)
-								assert!(right_guard_x.is_leaf());
+							match target_guard_x.as_mut() {
+								Node::Leaf(ref mut target_leaf) => {
+									// Merging leaf nodes (target absorbs right)
+									assert!(right_guard_x.is_leaf());
 
-								if !target_leaf.merge(right_guard_x.as_leaf_mut()) {
-									parent_guard = parent_guard_x.unlock();
-									let _ = target_guard_x.unlock();
-									false
-								} else {
-									let parent_internal = parent_guard_x.as_internal_mut();
-
-									// Remove separator and schedule right node for destruction
-									if pos + 1 == parent_len {
-										let (_, left_edge) = parent_internal.remove_at(pos);
-										let dropped_edge = parent_internal
-											.upper_edge
-											.replace(left_edge)
-											.expect("parent upper_edge must exist during merge");
-
-										let shared = dropped_edge.load(Ordering::Relaxed, eg);
-										if !shared.is_null() {
-											// SAFETY: `dropped_edge` was unlinked from the
-											// parent under an exclusive latch above, so no new
-											// traversal can reach it. Optimistic readers still
-											// holding the stale pointer will fail validation on
-											// `recheck()` because the parent's version is
-											// bumped on unlock. Crossbeam-epoch defers `Drop`
-											// until every currently pinned epoch guard has
-											// been released.
-											unsafe { eg.defer_destroy(shared) };
-										}
+									if !target_leaf.merge(right_guard_x.as_leaf_mut()) {
+										parent_guard = parent_guard_x.unlock();
+										let _ = target_guard_x.unlock();
+										false
 									} else {
-										let (_, left_edge) = parent_internal.remove_at(pos);
-										let dropped_edge = std::mem::replace(
-											&mut parent_internal.edges[pos as usize],
-											left_edge,
-										);
+										let parent_internal = parent_guard_x.as_internal_mut();
 
-										let shared = dropped_edge.load(Ordering::Relaxed, eg);
-										if !shared.is_null() {
-											// SAFETY: `dropped_edge` was unlinked from the
-											// parent under an exclusive latch above, so no new
-											// traversal can reach it. Optimistic readers still
-											// holding the stale pointer will fail validation on
-											// `recheck()` because the parent's version is
-											// bumped on unlock. Crossbeam-epoch defers `Drop`
-											// until every currently pinned epoch guard has
-											// been released.
-											unsafe { eg.defer_destroy(shared) };
+										// Remove separator and schedule right node for destruction
+										if pos + 1 == parent_len {
+											let (_, left_edge) = parent_internal.remove_at(pos);
+											let dropped_edge = std::mem::replace(
+												&mut parent_internal.upper_edge,
+												left_edge,
+											);
+
+											let shared = dropped_edge.load(Ordering::Relaxed, eg);
+											if !shared.is_null() {
+												// SAFETY: `dropped_edge` was unlinked from the
+												// parent under an exclusive latch above, so no new
+												// traversal can reach it. Optimistic readers still
+												// holding the stale pointer will fail validation on
+												// `recheck()` because the parent's version is
+												// bumped on unlock. Crossbeam-epoch defers `Drop`
+												// until every currently pinned epoch guard has
+												// been released.
+												unsafe { eg.defer_destroy(shared) };
+											}
+										} else {
+											let (_, left_edge) = parent_internal.remove_at(pos);
+											let dropped_edge = std::mem::replace(
+												&mut parent_internal.edges[pos as usize],
+												left_edge,
+											);
+
+											let shared = dropped_edge.load(Ordering::Relaxed, eg);
+											if !shared.is_null() {
+												// SAFETY: `dropped_edge` was unlinked from the
+												// parent under an exclusive latch above, so no new
+												// traversal can reach it. Optimistic readers still
+												// holding the stale pointer will fail validation on
+												// `recheck()` because the parent's version is
+												// bumped on unlock. Crossbeam-epoch defers `Drop`
+												// until every currently pinned epoch guard has
+												// been released.
+												unsafe { eg.defer_destroy(shared) };
+											}
 										}
-									}
 
-									parent_guard = parent_guard_x.unlock();
-									let _ = target_guard_x.unlock();
-									true
+										parent_guard = parent_guard_x.unlock();
+										let _ = target_guard_x.unlock();
+										true
+									}
 								}
-							}
-							Node::Internal(target_internal) => {
-								// Merging internal nodes
-								assert!(!right_guard_x.is_leaf());
+								Node::Internal(target_internal) => {
+									// Merging internal nodes
+									assert!(!right_guard_x.is_leaf());
 
-								if !target_internal.merge(right_guard_x.as_internal_mut()) {
-									parent_guard = parent_guard_x.unlock();
-									let _ = target_guard_x.unlock();
-									false
-								} else {
-									let parent_internal = parent_guard_x.as_internal_mut();
-
-									if pos + 1 == parent_len {
-										let (_, left_edge) = parent_internal.remove_at(pos);
-										let dropped_edge = parent_internal
-											.upper_edge
-											.replace(left_edge)
-											.expect("parent upper_edge must exist during merge");
-
-										let shared = dropped_edge.load(Ordering::Relaxed, eg);
-										if !shared.is_null() {
-											// SAFETY: `dropped_edge` was unlinked from the
-											// parent under an exclusive latch above, so no new
-											// traversal can reach it. Optimistic readers still
-											// holding the stale pointer will fail validation on
-											// `recheck()` because the parent's version is
-											// bumped on unlock. Crossbeam-epoch defers `Drop`
-											// until every currently pinned epoch guard has
-											// been released.
-											unsafe { eg.defer_destroy(shared) };
-										}
+									if !target_internal.merge(right_guard_x.as_internal_mut()) {
+										parent_guard = parent_guard_x.unlock();
+										let _ = target_guard_x.unlock();
+										false
 									} else {
-										let (_, left_edge) = parent_internal.remove_at(pos);
-										let dropped_edge = std::mem::replace(
-											&mut parent_internal.edges[pos as usize],
-											left_edge,
-										);
+										let parent_internal = parent_guard_x.as_internal_mut();
 
-										let shared = dropped_edge.load(Ordering::Relaxed, eg);
-										if !shared.is_null() {
-											// SAFETY: `dropped_edge` was unlinked from the
-											// parent under an exclusive latch above, so no new
-											// traversal can reach it. Optimistic readers still
-											// holding the stale pointer will fail validation on
-											// `recheck()` because the parent's version is
-											// bumped on unlock. Crossbeam-epoch defers `Drop`
-											// until every currently pinned epoch guard has
-											// been released.
-											unsafe { eg.defer_destroy(shared) };
+										if pos + 1 == parent_len {
+											let (_, left_edge) = parent_internal.remove_at(pos);
+											let dropped_edge = std::mem::replace(
+												&mut parent_internal.upper_edge,
+												left_edge,
+											);
+
+											let shared = dropped_edge.load(Ordering::Relaxed, eg);
+											if !shared.is_null() {
+												// SAFETY: `dropped_edge` was unlinked from the
+												// parent under an exclusive latch above, so no new
+												// traversal can reach it. Optimistic readers still
+												// holding the stale pointer will fail validation on
+												// `recheck()` because the parent's version is
+												// bumped on unlock. Crossbeam-epoch defers `Drop`
+												// until every currently pinned epoch guard has
+												// been released.
+												unsafe { eg.defer_destroy(shared) };
+											}
+										} else {
+											let (_, left_edge) = parent_internal.remove_at(pos);
+											let dropped_edge = std::mem::replace(
+												&mut parent_internal.edges[pos as usize],
+												left_edge,
+											);
+
+											let shared = dropped_edge.load(Ordering::Relaxed, eg);
+											if !shared.is_null() {
+												// SAFETY: `dropped_edge` was unlinked from the
+												// parent under an exclusive latch above, so no new
+												// traversal can reach it. Optimistic readers still
+												// holding the stale pointer will fail validation on
+												// `recheck()` because the parent's version is
+												// bumped on unlock. Crossbeam-epoch defers `Drop`
+												// until every currently pinned epoch guard has
+												// been released.
+												unsafe { eg.defer_destroy(shared) };
+											}
 										}
-									}
 
-									parent_guard = parent_guard_x.unlock();
-									let _ = target_guard_x.unlock();
-									true
+										parent_guard = parent_guard_x.unlock();
+										let _ = target_guard_x.unlock();
+										true
+									}
 								}
 							}
 						}
-					}
-				} else {
-					merge_succeeded
-				};
+					} else {
+						merge_succeeded
+					};
 
 				// ===============================================================
 				// Recursive: Check if parent also needs merging
@@ -3177,11 +3255,30 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericTree<K, V, IC, 
 ///
 /// All leaves are at the same depth, and internal nodes contain only routing
 /// information (no values).
+///
+/// # Layout
+///
+/// `#[repr(C, u8)]` gives this enum a stable layout: a `u8` discriminant
+/// at offset 0, followed by the variant data (with padding for alignment).
+/// This lets the optimistic read fast path read the discriminant via a
+/// raw pointer projection without creating an `&Node` reborrow that would
+/// race (under Tree Borrows) with a concurrent writer's mutation. See
+/// [`Node::variant_raw`].
+#[repr(C, u8)]
 pub(crate) enum Node<K, V, const IC: usize, const LC: usize> {
 	/// An internal (index) node containing keys and child pointers.
-	Internal(InternalNode<K, V, IC, LC>),
+	Internal(InternalNode<K, V, IC, LC>) = 0,
 	/// A leaf node containing key-value pairs.
-	Leaf(LeafNode<K, V, LC>),
+	Leaf(LeafNode<K, V, LC>) = 1,
+}
+
+/// Raw-pointer view of a [`Node`] variant, used by the optimistic read
+/// fast path. Each variant carries a `*const` to the variant's inner type
+/// — never an `&` reborrow — so the caller can project further to leaf /
+/// internal fields without retags.
+pub(crate) enum NodeKindRaw<K, V, const IC: usize, const LC: usize> {
+	Internal(*const InternalNode<K, V, IC, LC>),
+	Leaf(*const LeafNode<K, V, LC>),
 }
 
 impl<K: fmt::Debug, V: fmt::Debug, const IC: usize, const LC: usize> fmt::Debug
@@ -3200,6 +3297,55 @@ impl<K, V, const IC: usize, const LC: usize> Node<K, V, IC, LC> {
 	#[inline]
 	pub(crate) fn is_leaf(&self) -> bool {
 		matches!(self, Node::Leaf(_))
+	}
+
+	/// Reads the variant discriminant via raw pointer projection and
+	/// returns a [`NodeKindRaw`] carrying a `*const` to the variant's
+	/// inner type — without creating an `&Node` reborrow.
+	///
+	/// Used by the optimistic read fast path; see [`OptimisticGuard::as_ptr`]
+	/// and the safety contract on [`crate::optimistic::OptimisticRead`].
+	///
+	/// # Safety
+	///
+	/// `this` must be a valid pointer to a `Node` owned by a
+	/// [`HybridLatch`] the caller holds an [`OptimisticGuard`] on. The
+	/// returned variant data pointers are only valid for the lifetime of
+	/// that guard.
+	///
+	/// The discriminant read is bitwise; if a concurrent writer is
+	/// mid-replacement the value may be torn, but the caller's
+	/// `recheck()` validates this. The cast from the variant pointer to
+	/// the inner type's pointer relies on `#[repr(C, u8)]` placing the
+	/// payload at a known offset.
+	#[inline]
+	pub(crate) unsafe fn variant_raw(this: *const Self) -> NodeKindRaw<K, V, IC, LC> {
+		// `#[repr(C, u8)]` lays the discriminant first, padded to the
+		// alignment of the variant data. The payload starts at offset
+		// equal to the alignment of the largest variant.
+		//
+		// SAFETY: `this` is a valid pointer per the caller; the u8
+		// discriminant is at the very start.
+		let tag = unsafe { ptr::read(this as *const u8) };
+		// Compute the payload offset: it sits at `align_of::<Self>()`
+		// from the start (the discriminant is in the same bucket but
+		// padded out).
+		let payload_offset = core::mem::align_of::<Self>();
+		// SAFETY: see `tag` above; `payload_offset` is the documented
+		// `#[repr(C, u8)]` layout offset.
+		let payload = unsafe { (this as *const u8).add(payload_offset) };
+		match tag {
+			0 => NodeKindRaw::Internal(payload.cast::<InternalNode<K, V, IC, LC>>()),
+			1 => NodeKindRaw::Leaf(payload.cast::<LeafNode<K, V, LC>>()),
+			// SAFETY: only two variants exist; under a torn read the
+			// caller's recheck will fail. We treat any unknown tag as
+			// the leaf variant so the caller observes a consistent
+			// (but invalid) state until recheck triggers a retry.
+			_ => {
+				std::hint::cold_path();
+				NodeKindRaw::Leaf(payload.cast::<LeafNode<K, V, LC>>())
+			}
+		}
 	}
 
 	/// Returns a reference to the inner leaf node, if this is a leaf.
@@ -3537,6 +3683,129 @@ impl<K, V, const LC: usize> LeafNode<K, V, LC> {
 		self.upper_fence.as_ref()
 	}
 
+	// =====================================================================
+	// Raw-pointer projection (optimistic-read fast path)
+	// =====================================================================
+
+	/// Reads `len` via raw pointer projection (no `&self` reborrow).
+	///
+	/// # Safety
+	///
+	/// `this` must be a valid pointer to a `LeafNode` held under an
+	/// [`OptimisticGuard`]. Caller must `recheck()` before acting on the
+	/// result.
+	#[inline]
+	pub(crate) unsafe fn len_raw(this: *const Self) -> u16 {
+		// SAFETY: `len` is a u16 at a known field offset; the read is an
+		// unsynchronised aligned load with no retag.
+		unsafe { ptr::read(ptr::addr_of!((*this).len)) }
+	}
+
+	/// Returns a raw pointer to the entries array via projection.
+	///
+	/// # Safety
+	///
+	/// See [`Self::len_raw`].
+	#[inline]
+	pub(crate) unsafe fn entries_ptr_raw(this: *const Self) -> *const (K, V) {
+		// SAFETY: `entries` is an `InlineVec` at a known field offset.
+		// `InlineVec::raw_data_ptr` returns a `*const (K, V)` without
+		// reborrowing.
+		unsafe { InlineVec::raw_data_ptr(ptr::addr_of!((*this).entries)) }
+	}
+
+	/// Binary search for `key` via raw pointer projection, without
+	/// creating an `&LeafNode` or `&InlineVec` reborrow.
+	///
+	/// Caller MUST `recheck()` after this call to validate the result.
+	///
+	/// # Safety
+	///
+	/// `this` must point to a valid `LeafNode` held under an
+	/// [`OptimisticGuard`].
+	///
+	/// `K: OptimisticRead` certifies that a bitwise snapshot of K is
+	/// sound to use across the brief stack-local comparison window: if
+	/// `K::EPOCH_DEFERRED_DROP` is true (e.g. `bytes::Bytes`) the
+	/// caller must additionally have ensured all leaf-K drops are
+	/// routed through the epoch GC via `insert_defer` / `remove_defer`.
+	#[inline]
+	pub(crate) unsafe fn lower_bound_raw<Q>(this: *const Self, key: &Q) -> (u16, bool)
+	where
+		K: Borrow<Q> + Ord + OptimisticRead,
+		Q: ?Sized + Ord,
+	{
+		// Fence checks via raw projection.
+		// SAFETY: `lower_fence` is `Option<K>` at a known field offset;
+		// `addr_of!` does not reborrow.
+		let lower_fence: *const Option<K> = unsafe { ptr::addr_of!((*this).lower_fence) };
+		// SAFETY: see `lower_fence` above.
+		let upper_fence: *const Option<K> = unsafe { ptr::addr_of!((*this).upper_fence) };
+
+		// We bitwise-read the Option<K> into a ManuallyDrop on the stack so
+		// the inner K's `Drop` is suppressed if recheck fails / on early
+		// return. `&` borrows from here on are to stack memory, not the
+		// shared node — no retag race.
+		// SAFETY: `lower_fence` is a valid pointer to `Option<K>`. The
+		// bitwise read is sound for `K: OptimisticRead` (permits torn
+		// snapshot, validated by recheck-or-discard via ManuallyDrop).
+		let lf_snapshot: core::mem::ManuallyDrop<Option<K>> =
+			unsafe { core::mem::ManuallyDrop::new(ptr::read(lower_fence)) };
+		if let Some(fk) = lf_snapshot.as_ref() {
+			if key < fk.borrow() {
+				return (0, false);
+			}
+		}
+
+		// SAFETY: see `Self::len_raw`.
+		let len = unsafe { Self::len_raw(this) };
+		// SAFETY: see `lf_snapshot` above.
+		let uf_snapshot: core::mem::ManuallyDrop<Option<K>> =
+			unsafe { core::mem::ManuallyDrop::new(ptr::read(upper_fence)) };
+		if let Some(fk) = uf_snapshot.as_ref() {
+			if key > fk.borrow() {
+				return (len, false);
+			}
+		}
+
+		// Binary search over the entries array via raw pointer arithmetic.
+		// Bound `upper` by the InlineVec's compile-time capacity LC since
+		// `len` may be inconsistent under concurrent mutation (recheck
+		// will catch).
+		// SAFETY: see `Self::entries_ptr_raw`.
+		let entries_ptr = unsafe { Self::entries_ptr_raw(this) };
+		let mut lower: u16 = 0;
+		let mut upper: u16 = len.min(LC as u16);
+
+		while lower < upper {
+			let mid = ((upper - lower) / 2) + lower;
+
+			// Snapshot the K at position mid bitwise into a stack
+			// ManuallyDrop. The retag created by `&*mid_key_snapshot`
+			// below is on stack memory, not on the shared node.
+			//
+			// SAFETY: `mid` < `upper` <= LC; entries_ptr is valid for
+			// at least LC elements. The K read is bitwise; we rely on
+			// `K: OptimisticRead` for soundness.
+			let mid_key_snapshot: core::mem::ManuallyDrop<K> = unsafe {
+				core::mem::ManuallyDrop::new(ptr::read(ptr::addr_of!(
+					(*entries_ptr.add(mid as usize)).0
+				)))
+			};
+			let mid_key: &K = &mid_key_snapshot;
+
+			if key < mid_key.borrow() {
+				upper = mid;
+			} else if key > mid_key.borrow() {
+				lower = mid + 1;
+			} else {
+				return (mid, true);
+			}
+		}
+
+		(lower, false)
+	}
+
 	/// Returns a reference to the value at the given position.
 	///
 	/// # Concurrency Safety
@@ -3791,7 +4060,12 @@ pub(crate) struct InternalNode<K, V, const IC: usize, const LC: usize> {
 	pub(crate) edges: InlineVec<Atomic<HybridLatch<Node<K, V, IC, LC>>>, IC>,
 	/// Rightmost child pointer, for keys >= last key.
 	/// This is separate because we have N+1 children for N keys.
-	pub(crate) upper_edge: Option<Atomic<HybridLatch<Node<K, V, IC, LC>>>>,
+	///
+	/// Uses a null-pointer sentinel rather than `Option<Atomic<…>>` so the
+	/// optimistic-read fast path can project to it via raw pointer
+	/// arithmetic without the indeterminate-offset issue of the Option's
+	/// tagged discriminant. A null load means "no upper edge".
+	pub(crate) upper_edge: Atomic<HybridLatch<Node<K, V, IC, LC>>>,
 	/// Exclusive lower bound for keys routed through this node.
 	pub(crate) lower_fence: Option<K>,
 	/// Inclusive upper bound for keys routed through this node.
@@ -3821,7 +4095,7 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 			len: 0,
 			keys: InlineVec::new(),
 			edges: InlineVec::new(),
-			upper_edge: None,
+			upper_edge: Atomic::null(),
 			lower_fence: None,
 			upper_fence: None,
 			sample_key: None,
@@ -3902,6 +4176,139 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 		self.upper_fence.as_ref()
 	}
 
+	// =====================================================================
+	// Raw-pointer projection (optimistic-read fast path)
+	// =====================================================================
+
+	/// Reads `len` via raw pointer projection (no `&self` reborrow).
+	///
+	/// # Safety
+	///
+	/// `this` must be a valid pointer to an `InternalNode` held under an
+	/// [`OptimisticGuard`]. Caller must `recheck()` before acting on it.
+	#[inline]
+	pub(crate) unsafe fn len_raw(this: *const Self) -> u16 {
+		// SAFETY: `len` is a u16 at a known field offset.
+		unsafe { ptr::read(ptr::addr_of!((*this).len)) }
+	}
+
+	/// Returns a raw pointer to the keys array via projection.
+	#[inline]
+	#[allow(dead_code)]
+	pub(crate) unsafe fn keys_ptr_raw(this: *const Self) -> *const K {
+		// SAFETY: see Self::len_raw.
+		unsafe { InlineVec::raw_data_ptr(ptr::addr_of!((*this).keys)) }
+	}
+
+	/// Returns a raw pointer to the edges array via projection.
+	#[inline]
+	pub(crate) unsafe fn edges_ptr_raw(
+		this: *const Self,
+	) -> *const Atomic<HybridLatch<Node<K, V, IC, LC>>> {
+		// SAFETY: see Self::len_raw.
+		unsafe { InlineVec::raw_data_ptr(ptr::addr_of!((*this).edges)) }
+	}
+
+	/// Returns a raw pointer to the `Atomic` swip at position `pos`,
+	/// or `Err(Unwind)` if `pos == len` and `upper_edge` is None / out
+	/// of bounds.
+	///
+	/// # Safety
+	///
+	/// `this` must be a valid pointer to an `InternalNode` held under an
+	/// [`OptimisticGuard`]. Caller must `recheck()` before dereferencing
+	/// the returned pointer through epoch::Atomic load.
+	#[inline]
+	pub(crate) unsafe fn edge_at_raw(
+		this: *const Self,
+		pos: u16,
+	) -> error::Result<*const Atomic<HybridLatch<Node<K, V, IC, LC>>>> {
+		// SAFETY: same source pointer as len_raw / edges_ptr_raw.
+		let len = unsafe { Self::len_raw(this) };
+		if pos == len {
+			// Rightmost child → upper_edge. `upper_edge` is a plain
+			// `Atomic<...>` (with null sentinel for "no upper edge"),
+			// so we can return a pointer to it directly via addr_of!.
+			// The caller's subsequent `Atomic::load` checks for null.
+			//
+			// SAFETY: `upper_edge` is at a known field offset; addr_of!
+			// does not reborrow.
+			let upper_edge_ptr: *const Atomic<HybridLatch<Node<K, V, IC, LC>>> =
+				unsafe { ptr::addr_of!((*this).upper_edge) };
+			Ok(upper_edge_ptr)
+		} else if pos < IC as u16 {
+			// SAFETY: same source pointer as len_raw.
+			let edges_ptr = unsafe { Self::edges_ptr_raw(this) };
+			// SAFETY: pos < IC, edges_ptr valid for at least IC.
+			Ok(unsafe { edges_ptr.add(pos as usize) })
+		} else {
+			Err(error::Error::Unwind)
+		}
+	}
+
+	/// Binary search for the child edge to follow for `key`, via raw
+	/// pointer projection. Caller MUST `recheck()` after this call.
+	///
+	/// # Safety
+	///
+	/// See [`Self::edge_at_raw`]. `K: OptimisticRead` certifies the
+	/// bitwise-snapshot-and-compare discipline (see `LeafNode::lower_bound_raw`).
+	#[inline]
+	pub(crate) unsafe fn lower_bound_raw<Q>(this: *const Self, key: &Q) -> (u16, bool)
+	where
+		K: Borrow<Q> + Ord + OptimisticRead,
+		Q: ?Sized + Ord,
+	{
+		// SAFETY: fence reads via projection — addr_of! does not reborrow.
+		let lower_fence: *const Option<K> = unsafe { ptr::addr_of!((*this).lower_fence) };
+		// SAFETY: see `lower_fence` above.
+		let upper_fence: *const Option<K> = unsafe { ptr::addr_of!((*this).upper_fence) };
+
+		// SAFETY: bitwise read of Option<K>; `K: OptimisticRead`
+		// permits torn snapshot, ManuallyDrop suppresses Drop until
+		// caller validates via recheck.
+		let lf_snapshot: core::mem::ManuallyDrop<Option<K>> =
+			unsafe { core::mem::ManuallyDrop::new(ptr::read(lower_fence)) };
+		if let Some(fk) = lf_snapshot.as_ref() {
+			if key < fk.borrow() {
+				return (0, false);
+			}
+		}
+
+		// SAFETY: see `Self::len_raw`.
+		let len = unsafe { Self::len_raw(this) };
+		// SAFETY: see `lf_snapshot` above.
+		let uf_snapshot: core::mem::ManuallyDrop<Option<K>> =
+			unsafe { core::mem::ManuallyDrop::new(ptr::read(upper_fence)) };
+		if let Some(fk) = uf_snapshot.as_ref() {
+			if key > fk.borrow() {
+				return (len, false);
+			}
+		}
+
+		// SAFETY: see `Self::keys_ptr_raw`.
+		let keys_ptr = unsafe { Self::keys_ptr_raw(this) };
+		let mut lower: u16 = 0;
+		let mut upper: u16 = len.min(IC as u16);
+
+		while lower < upper {
+			let mid = ((upper - lower) / 2) + lower;
+			// SAFETY: see LeafNode::lower_bound_raw.
+			let mid_key_snapshot: core::mem::ManuallyDrop<K> =
+				unsafe { core::mem::ManuallyDrop::new(ptr::read(keys_ptr.add(mid as usize))) };
+			let mid_key: &K = &mid_key_snapshot;
+			if key < mid_key.borrow() {
+				upper = mid;
+			} else if key > mid_key.borrow() {
+				lower = mid + 1;
+			} else {
+				return (mid, true);
+			}
+		}
+
+		(lower, false)
+	}
+
 	/// Returns the child pointer at the given position.
 	///
 	/// - Positions `0..len` return `edges[pos]`
@@ -3921,11 +4328,21 @@ impl<K, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 		pos: u16,
 	) -> error::Result<&Atomic<HybridLatch<Node<K, V, IC, LC>>>> {
 		if pos == self.len {
-			// Rightmost child - use upper_edge
-			if let Some(upper_edge) = self.upper_edge.as_ref() {
-				Ok(upper_edge)
-			} else {
+			// Rightmost child - use upper_edge. We detect "no upper
+			// edge" via a null-pointer sentinel (rather than Option's
+			// None) because the optimistic fast path projects through
+			// this field via raw pointers.
+			//
+			// SAFETY: `self.upper_edge` is the live Atomic in the node;
+			// loading it under the caller's epoch guard is sound. A
+			// shared / unpinned epoch guard is acceptable here because
+			// we only inspect the pointer value, not the pointee.
+			let eg = epoch::pin();
+			let shared = self.upper_edge.load(Ordering::Relaxed, &eg);
+			if shared.is_null() {
 				Err(error::Error::Unwind)
+			} else {
+				Ok(&self.upper_edge)
 			}
 		} else {
 			// Regular child - use edges array with safe bounds check
@@ -4077,13 +4494,15 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 		right.keys.extend(self.keys.drain((split_pos + 1) as usize..));
 		right.edges.extend(self.edges.drain((split_pos + 1) as usize..));
 
-		// Right gets our upper_edge (it's now the rightmost in its range)
-		right.upper_edge = self.upper_edge.take();
+		// Right gets our upper_edge (it's now the rightmost in its range).
+		// We use mem::replace with Atomic::null() since upper_edge no
+		// longer uses Option's None.
+		right.upper_edge = std::mem::replace(&mut self.upper_edge, Atomic::null());
 
 		// The edge at split_pos becomes our new upper_edge
 		// (it was pointing to children between K(split_pos-1) and K(split_pos))
 		self.upper_edge =
-			Some(self.edges.pop().expect("edges non-empty: split requires at least one edge"));
+			self.edges.pop().expect("edges non-empty: split requires at least one edge");
 		// Remove the key at split_pos (it's being pushed to parent)
 		self.keys.pop().expect("keys non-empty: split requires at least one key");
 
@@ -4129,8 +4548,13 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 		// Inherit right's upper_fence (we now cover its range too)
 		let _left_upper_fence = std::mem::replace(&mut self.upper_fence, right.upper_fence.take());
 
-		// Our upper_edge will be used as a regular edge
-		let left_upper_edge = std::mem::replace(&mut self.upper_edge, right.upper_edge.take());
+		// Our upper_edge will be used as a regular edge. Swap right's
+		// upper_edge into ours; right is consumed so it doesn't matter
+		// what we leave there.
+		let left_upper_edge = std::mem::replace(
+			&mut self.upper_edge,
+			std::mem::replace(&mut right.upper_edge, Atomic::null()),
+		);
 
 		// Re-insert the separator key (was in parent, stored as right's lower_fence)
 		// This key goes between our old content and right's content
@@ -4141,8 +4565,10 @@ impl<K: Clone, V, const IC: usize, const LC: usize> InternalNode<K, V, IC, LC> {
 				.expect("merge requires right node to have lower_fence (separator key)"),
 		);
 
-		// Our old upper_edge becomes a regular edge (points to children < separator)
-		self.edges.push(left_upper_edge.expect("merge requires left node to have upper_edge"));
+		// Our old upper_edge becomes a regular edge (points to children < separator).
+		// The node's upper_edge field is now a plain Atomic; it must not
+		// be null at this point (merge contract).
+		self.edges.push(left_upper_edge);
 
 		// Append all of right's content
 		self.keys.extend(right.keys.drain(..));
@@ -4308,9 +4734,10 @@ impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
 					level, height
 				);
 
-				// Invariant 5: Upper edge presence
+				// Invariant 5: Upper edge presence (null = "no upper edge")
+				let eg_local = epoch::pin();
 				assert!(
-					internal.upper_edge.is_some(),
+					!internal.upper_edge.load(Ordering::Relaxed, &eg_local).is_null(),
 					"Internal node at level {} has no upper_edge",
 					level
 				);
@@ -4390,25 +4817,23 @@ impl<K: Clone + Ord + std::fmt::Debug, V, const IC: usize, const LC: usize>
 					}
 				}
 
-				// Validate upper_edge child
-				if let Some(upper_edge) = &internal.upper_edge {
-					let child_ptr = upper_edge.load(Ordering::Acquire, eg);
-					if !child_ptr.is_null() {
-						// SAFETY: `eg` is pinned and is held for the duration of this
-						// validation pass; the non-null `child_ptr` is therefore safe
-						// to dereference.
-						let child_latch = unsafe { child_ptr.deref() };
-						let child_guard = child_latch.optimistic_or_spin();
+				// Validate upper_edge child (null = "no upper edge")
+				let child_ptr = internal.upper_edge.load(Ordering::Acquire, eg);
+				if !child_ptr.is_null() {
+					// SAFETY: `eg` is pinned and is held for the duration of this
+					// validation pass; the non-null `child_ptr` is therefore safe
+					// to dereference.
+					let child_latch = unsafe { child_ptr.deref() };
+					let child_guard = child_latch.optimistic_or_spin();
 
-						self.validate_node_recursive(
-							&child_guard,
-							level + 1,
-							height,
-							prev_upper,
-							expected_upper,
-							eg,
-						);
-					}
+					self.validate_node_recursive(
+						&child_guard,
+						level + 1,
+						height,
+						prev_upper,
+						expected_upper,
+						eg,
+					);
 				}
 			}
 		}
