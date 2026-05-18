@@ -23,6 +23,7 @@
 //! Single-threaded benchmarks test raw performance without synchronization overhead.
 //! Concurrent benchmarks wrap BTreeMap/HashMap in `parking_lot::RwLock`.
 
+use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use crossbeam_skiplist::SkipMap;
 use ferntree::Tree;
@@ -33,6 +34,35 @@ use std::hint::black_box;
 use std::ops::Bound;
 use std::sync::Arc;
 use std::thread;
+
+// `bytes::Bytes` is foreign, so we wrap it in a local newtype (orphan
+// rules). `BytesBlob` is a zero-cost wrapper: same size, same Clone cost
+// (Arc-bump), same Ord (lex byte order). `EPOCH_DEFERRED_DROP = true`
+// keeps the inner buffer alive across a reader's borrow window.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+#[repr(transparent)]
+struct BytesBlob(Bytes);
+
+impl Ord for BytesBlob {
+	#[inline]
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		self.0.as_ref().cmp(other.0.as_ref())
+	}
+}
+impl PartialOrd for BytesBlob {
+	#[inline]
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+// SAFETY: `BytesBlob` is `Send + Sync + Clone + 'static`. Wrapped
+// `bytes::Bytes` is itself refcounted with atomic Clone semantics, so
+// the boxed-slot atomic-load + Clone pair is sound.
+unsafe impl ferntree::OptimisticRead for BytesBlob {
+	const EPOCH_DEFERRED_DROP: bool = true;
+	type Slot = ferntree::atomic_slot::BoxedSlot<Self>;
+}
 
 const SEED: u64 = 42;
 
@@ -577,6 +607,133 @@ fn bench_lookup_hit_bytes(c: &mut Criterion) {
 				}
 			})
 		});
+	}
+	group.finish();
+}
+
+// ============================================================================
+// Vec<u8> vs bytes::Bytes (side-by-side)
+// ============================================================================
+//
+// Compares the boxed-K/V storage cost for two refcount profiles:
+//   - `Vec<u8>`  — Clone allocates + memcpy of the inner buffer
+//   - `Bytes`    — Clone bumps an Arc refcount (no buffer copy)
+// Same 10-byte payload in both cases; only the Clone shape differs.
+
+fn bench_vec_vs_bytes_lookup_hit(c: &mut Criterion) {
+	let mut group = c.benchmark_group("vec_vs_bytes_lookup_hit");
+
+	for count in [1_000, 10_000] {
+		let vec_keys = sequential_bytes_keys(count);
+		let bytes_keys: Vec<BytesBlob> =
+			vec_keys.iter().map(|v| BytesBlob(Bytes::copy_from_slice(v))).collect();
+		let lookup_count = 1000.min(count);
+
+		let tree_vec: Tree<Vec<u8>, Vec<u8>> = Tree::new();
+		let tree_bytes: Tree<BytesBlob, BytesBlob> = Tree::new();
+
+		for (vk, bk) in vec_keys.iter().zip(bytes_keys.iter()) {
+			tree_vec.insert(vk.clone(), vk.clone());
+			tree_bytes.insert(bk.clone(), bk.clone());
+		}
+
+		let vec_lookup: Vec<Vec<u8>> = vec_keys[..lookup_count].to_vec();
+		let bytes_lookup: Vec<BytesBlob> = bytes_keys[..lookup_count].to_vec();
+
+		group.throughput(Throughput::Elements(lookup_count as u64));
+
+		group.bench_with_input(BenchmarkId::new("vec_u8/ferntree", count), &vec_lookup, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(tree_vec.lookup(k.as_slice(), |v| v.len()));
+				}
+			})
+		});
+		group.bench_with_input(
+			BenchmarkId::new("vec_u8/ferntree_optimistic", count),
+			&vec_lookup,
+			|b, keys| {
+				b.iter(|| {
+					for k in keys {
+						black_box(tree_vec.lookup_optimistic(k.as_slice(), |v| v.len()));
+					}
+				})
+			},
+		);
+		group.bench_with_input(BenchmarkId::new("bytes/ferntree", count), &bytes_lookup, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(tree_bytes.lookup(k, |v| v.0.len()));
+				}
+			})
+		});
+		group.bench_with_input(
+			BenchmarkId::new("bytes/ferntree_optimistic", count),
+			&bytes_lookup,
+			|b, keys| {
+				b.iter(|| {
+					for k in keys {
+						black_box(tree_bytes.lookup_optimistic(k, |v| v.0.len()));
+					}
+				})
+			},
+		);
+	}
+	group.finish();
+}
+
+fn bench_vec_vs_bytes_insert_random(c: &mut Criterion) {
+	let mut group = c.benchmark_group("vec_vs_bytes_insert_random");
+
+	for count in [1_000, 10_000] {
+		// Random 10-byte payloads from the same seeded RNG.
+		let mut rng = StdRng::seed_from_u64(SEED);
+		let payloads: Vec<[u8; 10]> = (0..count)
+			.map(|_| {
+				let mut p = [0u8; 10];
+				rng.fill(&mut p);
+				p
+			})
+			.collect();
+		let vec_keys: Vec<Vec<u8>> = payloads.iter().map(|p| p.to_vec()).collect();
+		let bytes_keys: Vec<BytesBlob> =
+			payloads.iter().map(|p| BytesBlob(Bytes::copy_from_slice(p))).collect();
+
+		group.throughput(Throughput::Elements(count as u64));
+
+		group.bench_with_input(
+			BenchmarkId::new("vec_u8/ferntree", count),
+			&vec_keys,
+			|b, keys| {
+				b.iter_batched(
+					Tree::<Vec<u8>, Vec<u8>>::new,
+					|tree| {
+						for k in keys {
+							black_box(tree.insert(k.clone(), k.clone()));
+						}
+						tree
+					},
+					criterion::BatchSize::SmallInput,
+				)
+			},
+		);
+
+		group.bench_with_input(
+			BenchmarkId::new("bytes/ferntree", count),
+			&bytes_keys,
+			|b, keys| {
+				b.iter_batched(
+					Tree::<BytesBlob, BytesBlob>::new,
+					|tree| {
+						for k in keys {
+							black_box(tree.insert(k.clone(), k.clone()));
+						}
+						tree
+					},
+					criterion::BatchSize::SmallInput,
+				)
+			},
+		);
 	}
 	group.finish();
 }
@@ -1574,6 +1731,8 @@ criterion_group!(
 	bench_insert_random_string,
 	bench_lookup_hit_string,
 	bench_lookup_hit_bytes,
+	bench_vec_vs_bytes_lookup_hit,
+	bench_vec_vs_bytes_insert_random,
 );
 
 criterion_group!(
