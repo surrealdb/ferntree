@@ -277,6 +277,35 @@ use latch::{ExclusiveGuard, HybridGuard, HybridLatch, OptimisticGuard, SharedGua
 pub use optimistic::OptimisticRead;
 
 // ---------------------------------------------------------------------------
+// Prefetch hint
+// ---------------------------------------------------------------------------
+
+/// CPU read-prefetch hint. Issued on the optimistic descent to overlap
+/// the L3-miss latency of the child latch with the parent's binary-search
+/// + recheck work. `_mm_prefetch` is a non-faulting hint instruction — it
+/// is sound even if `ptr` is dangling, misaligned, or null.
+///
+/// x86_64 uses [`core::arch::x86_64::_mm_prefetch`]; other targets get a
+/// no-op fallback. aarch64 prefetch intrinsics remain nightly-only at
+/// time of writing, so darwin/aarch64 dev machines do not get the hint
+/// yet — the optimisation is opportunistic.
+mod prefetch {
+	#[inline(always)]
+	#[allow(unused_variables)]
+	pub fn read_data<T>(ptr: *const T) {
+		#[cfg(target_arch = "x86_64")]
+		// SAFETY: `_mm_prefetch` is a CPU hint; no memory access is performed
+		// at the architectural level, so dangling / null pointers are
+		// tolerated.
+		unsafe {
+			core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(
+				ptr as *const i8,
+			);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Configuration Constants
 // ---------------------------------------------------------------------------
 
@@ -1256,6 +1285,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			// call which performs an atomic load and parent recheck.
 			// SAFETY: see the function-level safety contract.
 			let c_swip = unsafe { &*c_swip_ptr };
+			// Issue a read-prefetch hint for the child latch while we are
+			// still in this iteration. By the time `lock_coupling` does
+			// its Acquire load + optimistic_or_spin on the child, the
+			// pointed-to HybridLatch should be in L1/L2. A Relaxed load
+			// is fine here — it's a hint, not a fence; if it tears we
+			// just prefetch the wrong address, which the CPU silently
+			// drops.
+			let prefetch_target = c_swip.load(Ordering::Relaxed, eg).as_raw();
+			prefetch::read_data(prefetch_target);
 			let guard = GenericTree::lock_coupling(&target_guard, c_swip, eg)?;
 			target_guard = guard;
 
