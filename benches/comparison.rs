@@ -57,6 +57,30 @@ fn missing_keys(count: usize) -> Vec<i64> {
 	(0..count as i64).map(|i| -(i + 1)).collect()
 }
 
+/// Sequential `String` keys, zero-padded so lex order == numeric order.
+fn sequential_string_keys(count: usize) -> Vec<String> {
+	(0..count).map(|i| format!("k{:010}", i)).collect()
+}
+
+/// Random `String` keys (seeded RNG → 10-digit zero-padded for stable width).
+fn random_string_keys(count: usize) -> Vec<String> {
+	let mut rng = StdRng::seed_from_u64(SEED);
+	(0..count).map(|_| format!("k{:010}", rng.random::<u64>())).collect()
+}
+
+/// Sequential `Vec<u8>` keys (10-byte big-endian-encoded u64 prefix).
+fn sequential_bytes_keys(count: usize) -> Vec<Vec<u8>> {
+	(0..count as u64)
+		.map(|i| {
+			let mut v = Vec::with_capacity(10);
+			v.extend_from_slice(b"k");
+			v.extend_from_slice(&i.to_be_bytes());
+			v.push(0);
+			v
+		})
+		.collect()
+}
+
 // ============================================================================
 // Single-Threaded Insert Benchmarks
 // ============================================================================
@@ -339,6 +363,217 @@ fn bench_lookup_miss(c: &mut Criterion) {
 			b.iter(|| {
 				for &k in keys {
 					black_box(hashmap.get(&k));
+				}
+			})
+		});
+	}
+	group.finish();
+}
+
+// ============================================================================
+// Single-Threaded String / Vec<u8> Benchmarks (BoxedSlot path)
+// ============================================================================
+//
+// These exercise the `BoxedSlot<T>` storage path that primitives like
+// `i64` never hit. They measure the cost of:
+//   - heap-allocated K/V load_into (boxed atomic pointer + clone)
+//   - String / Vec<u8> comparison during binary search
+// and are the baseline against which the relaxed-atomic and load_into
+// changes are measured.
+
+fn bench_insert_random_string(c: &mut Criterion) {
+	let mut group = c.benchmark_group("insert_random_string");
+
+	for count in [1_000, 10_000] {
+		let keys = random_string_keys(count);
+		group.throughput(Throughput::Elements(count as u64));
+
+		group.bench_with_input(BenchmarkId::new("ferntree", count), &keys, |b, keys| {
+			b.iter_batched(
+				Tree::<String, String>::new,
+				|tree| {
+					for k in keys {
+						black_box(tree.insert(k.clone(), k.clone()));
+					}
+					tree
+				},
+				criterion::BatchSize::SmallInput,
+			)
+		});
+
+		group.bench_with_input(BenchmarkId::new("skipmap", count), &keys, |b, keys| {
+			b.iter_batched(
+				SkipMap::<String, String>::new,
+				|map| {
+					for k in keys {
+						black_box(map.insert(k.clone(), k.clone()));
+					}
+					map
+				},
+				criterion::BatchSize::SmallInput,
+			)
+		});
+
+		group.bench_with_input(BenchmarkId::new("btreemap", count), &keys, |b, keys| {
+			b.iter_batched(
+				BTreeMap::<String, String>::new,
+				|mut map| {
+					for k in keys {
+						black_box(map.insert(k.clone(), k.clone()));
+					}
+					map
+				},
+				criterion::BatchSize::SmallInput,
+			)
+		});
+
+		group.bench_with_input(BenchmarkId::new("hashmap", count), &keys, |b, keys| {
+			b.iter_batched(
+				HashMap::<String, String>::new,
+				|mut map| {
+					for k in keys {
+						black_box(map.insert(k.clone(), k.clone()));
+					}
+					map
+				},
+				criterion::BatchSize::SmallInput,
+			)
+		});
+	}
+	group.finish();
+}
+
+fn bench_lookup_hit_string(c: &mut Criterion) {
+	let mut group = c.benchmark_group("lookup_hit_string");
+
+	for count in [1_000, 10_000, 100_000] {
+		let keys = sequential_string_keys(count);
+		let lookup_count = 1000.min(count);
+		let lookup_keys: Vec<String> = keys[..lookup_count].to_vec();
+
+		let ferntree: Tree<String, String> = Tree::new();
+		let skipmap: SkipMap<String, String> = SkipMap::new();
+		let mut btreemap: BTreeMap<String, String> = BTreeMap::new();
+		let mut hashmap: HashMap<String, String> = HashMap::new();
+
+		for k in &keys {
+			ferntree.insert(k.clone(), k.clone());
+			skipmap.insert(k.clone(), k.clone());
+			btreemap.insert(k.clone(), k.clone());
+			hashmap.insert(k.clone(), k.clone());
+		}
+
+		group.throughput(Throughput::Elements(lookup_count as u64));
+
+		group.bench_with_input(BenchmarkId::new("ferntree", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(ferntree.lookup(k, |v| v.len()));
+				}
+			})
+		});
+
+		group.bench_with_input(
+			BenchmarkId::new("ferntree_optimistic", count),
+			&lookup_keys,
+			|b, keys| {
+				b.iter(|| {
+					for k in keys {
+						black_box(ferntree.lookup_optimistic(k, |v| v.len()));
+					}
+				})
+			},
+		);
+
+		group.bench_with_input(BenchmarkId::new("skipmap", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(skipmap.get(k).map(|e| e.value().len()));
+				}
+			})
+		});
+
+		group.bench_with_input(BenchmarkId::new("btreemap", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(btreemap.get(k).map(|v| v.len()));
+				}
+			})
+		});
+
+		group.bench_with_input(BenchmarkId::new("hashmap", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(hashmap.get(k).map(|v| v.len()));
+				}
+			})
+		});
+	}
+	group.finish();
+}
+
+fn bench_lookup_hit_bytes(c: &mut Criterion) {
+	let mut group = c.benchmark_group("lookup_hit_bytes");
+
+	for count in [1_000, 10_000] {
+		let keys = sequential_bytes_keys(count);
+		let lookup_count = 1000.min(count);
+		let lookup_keys: Vec<Vec<u8>> = keys[..lookup_count].to_vec();
+
+		let ferntree: Tree<Vec<u8>, Vec<u8>> = Tree::new();
+		let skipmap: SkipMap<Vec<u8>, Vec<u8>> = SkipMap::new();
+		let mut btreemap: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+		let mut hashmap: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+
+		for k in &keys {
+			ferntree.insert(k.clone(), k.clone());
+			skipmap.insert(k.clone(), k.clone());
+			btreemap.insert(k.clone(), k.clone());
+			hashmap.insert(k.clone(), k.clone());
+		}
+
+		group.throughput(Throughput::Elements(lookup_count as u64));
+
+		group.bench_with_input(BenchmarkId::new("ferntree", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(ferntree.lookup(k.as_slice(), |v| v.len()));
+				}
+			})
+		});
+
+		group.bench_with_input(
+			BenchmarkId::new("ferntree_optimistic", count),
+			&lookup_keys,
+			|b, keys| {
+				b.iter(|| {
+					for k in keys {
+						black_box(ferntree.lookup_optimistic(k.as_slice(), |v| v.len()));
+					}
+				})
+			},
+		);
+
+		group.bench_with_input(BenchmarkId::new("skipmap", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(skipmap.get(k.as_slice()).map(|e| e.value().len()));
+				}
+			})
+		});
+
+		group.bench_with_input(BenchmarkId::new("btreemap", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(btreemap.get(k.as_slice()).map(|v| v.len()));
+				}
+			})
+		});
+
+		group.bench_with_input(BenchmarkId::new("hashmap", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(hashmap.get(k.as_slice()).map(|v| v.len()));
 				}
 			})
 		});
@@ -1143,6 +1378,82 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
 	group.finish();
 }
 
+fn bench_concurrent_mixed_string(c: &mut Criterion) {
+	let mut group = c.benchmark_group("concurrent_mixed_string");
+
+	let cpu_cores = thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+	let configs = [
+		("2r_2w", 2, 2),
+		("4r_4w", 4, 4),
+		(&format!("{}r_{}w", cpu_cores / 2, cpu_cores / 2), cpu_cores / 2, cpu_cores / 2),
+	];
+
+	for count in [10_000] {
+		let keys = sequential_string_keys(count);
+		let ops_per_thread = 500;
+
+		for (config_name, num_readers, num_writers) in &configs {
+			if *num_readers == 0 || *num_writers == 0 {
+				continue;
+			}
+
+			let total_ops = ops_per_thread * (num_readers + num_writers);
+			group.throughput(Throughput::Elements(total_ops as u64));
+
+			let read_keys: Vec<String> = keys[..ops_per_thread].to_vec();
+			let write_keys: Vec<Vec<String>> = (0..*num_writers)
+				.map(|w| {
+					(0..ops_per_thread)
+						.map(|i| format!("w{:010}", w * ops_per_thread + i + count))
+						.collect()
+				})
+				.collect();
+
+			group.bench_function(
+				BenchmarkId::new(format!("ferntree/{}", config_name), count),
+				|b| {
+					b.iter_batched(
+						|| {
+							let tree = Arc::new(Tree::<String, String>::new());
+							for k in &keys {
+								tree.insert(k.clone(), k.clone());
+							}
+							tree
+						},
+						|tree| {
+							let mut handles = Vec::new();
+							for _ in 0..*num_readers {
+								let tree = Arc::clone(&tree);
+								let keys = read_keys.clone();
+								handles.push(thread::spawn(move || {
+									for k in &keys {
+										black_box(tree.lookup(k, |v| v.len()));
+									}
+								}));
+							}
+							for keys in write_keys.iter().take(*num_writers) {
+								let tree = Arc::clone(&tree);
+								let keys = keys.clone();
+								handles.push(thread::spawn(move || {
+									for k in keys {
+										black_box(tree.insert(k.clone(), k));
+									}
+								}));
+							}
+							for h in handles {
+								h.join().unwrap();
+							}
+							tree
+						},
+						criterion::BatchSize::SmallInput,
+					)
+				},
+			);
+		}
+	}
+	group.finish();
+}
+
 // ============================================================================
 // Refcounted-value benchmarks (Phase 3: epoch-deferred drop path)
 // ============================================================================
@@ -1260,6 +1571,9 @@ criterion_group!(
 	bench_remove,
 	bench_range,
 	bench_raw_iter,
+	bench_insert_random_string,
+	bench_lookup_hit_string,
+	bench_lookup_hit_bytes,
 );
 
 criterion_group!(
@@ -1267,6 +1581,7 @@ criterion_group!(
 	bench_concurrent_readers,
 	bench_concurrent_writers,
 	bench_concurrent_mixed,
+	bench_concurrent_mixed_string,
 );
 
 criterion_group!(refcounted_benches, bench_refcounted_lookup, bench_refcounted_writes,);

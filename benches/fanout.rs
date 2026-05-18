@@ -153,5 +153,85 @@ mod large_value {
 	}
 }
 
-criterion_group!(fanout_benches, small_value::bench, large_value::bench);
+// String key/value workload — exercises the `BoxedSlot<String>` path.
+mod string_key {
+	use super::*;
+
+	fn string_keys(count: usize) -> Vec<String> {
+		let mut rng = StdRng::seed_from_u64(SEED);
+		(0..count).map(|_| format!("k{:010}", rng.random::<u64>())).collect()
+	}
+
+	fn sequential_string_keys(count: usize) -> Vec<String> {
+		(0..count).map(|i| format!("k{:010}", i)).collect()
+	}
+
+	fn fill<const IC: usize, const LC: usize>(keys: &[String]) -> GenericTree<String, String, IC, LC> {
+		let tree: GenericTree<String, String, IC, LC> = GenericTree::new();
+		for k in keys {
+			tree.insert(k.clone(), k.clone());
+		}
+		tree
+	}
+
+	pub fn bench(c: &mut Criterion) {
+		let mut insert = c.benchmark_group("fanout_string_insert_random");
+		insert.throughput(Throughput::Elements(5_000));
+		let keys = string_keys(5_000);
+
+		insert.bench_with_input(BenchmarkId::new("IC=LC=16", 5_000), &keys, |b, keys| {
+			b.iter(|| black_box(fill::<16, 16>(keys)))
+		});
+		insert.bench_with_input(BenchmarkId::new("IC=LC=32", 5_000), &keys, |b, keys| {
+			b.iter(|| black_box(fill::<32, 32>(keys)))
+		});
+		insert.bench_with_input(BenchmarkId::new("IC=LC=64", 5_000), &keys, |b, keys| {
+			b.iter(|| black_box(fill::<64, 64>(keys)))
+		});
+		insert.bench_with_input(BenchmarkId::new("IC=LC=128", 5_000), &keys, |b, keys| {
+			b.iter(|| black_box(fill::<128, 128>(keys)))
+		});
+		insert.finish();
+
+		let mut lookup = c.benchmark_group("fanout_string_lookup_random");
+		lookup.throughput(Throughput::Elements(5_000));
+		let keys = sequential_string_keys(5_000);
+
+		lookup.bench_with_input(BenchmarkId::new("IC=LC=16", 5_000), &keys, |b, keys| {
+			let tree = fill::<16, 16>(keys);
+			b.iter(|| {
+				for k in keys.iter() {
+					black_box(tree.lookup(k, |v| v.len()));
+				}
+			})
+		});
+		lookup.bench_with_input(BenchmarkId::new("IC=LC=32", 5_000), &keys, |b, keys| {
+			let tree = fill::<32, 32>(keys);
+			b.iter(|| {
+				for k in keys.iter() {
+					black_box(tree.lookup(k, |v| v.len()));
+				}
+			})
+		});
+		lookup.bench_with_input(BenchmarkId::new("IC=LC=64", 5_000), &keys, |b, keys| {
+			let tree = fill::<64, 64>(keys);
+			b.iter(|| {
+				for k in keys.iter() {
+					black_box(tree.lookup(k, |v| v.len()));
+				}
+			})
+		});
+		lookup.bench_with_input(BenchmarkId::new("IC=LC=128", 5_000), &keys, |b, keys| {
+			let tree = fill::<128, 128>(keys);
+			b.iter(|| {
+				for k in keys.iter() {
+					black_box(tree.lookup(k, |v| v.len()));
+				}
+			})
+		});
+		lookup.finish();
+	}
+}
+
+criterion_group!(fanout_benches, small_value::bench, large_value::bench, string_key::bench);
 criterion_main!(fanout_benches);
