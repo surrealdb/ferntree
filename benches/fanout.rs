@@ -166,7 +166,9 @@ mod string_key {
 		(0..count).map(|i| format!("k{:010}", i)).collect()
 	}
 
-	fn fill<const IC: usize, const LC: usize>(keys: &[String]) -> GenericTree<String, String, IC, LC> {
+	fn fill<const IC: usize, const LC: usize>(
+		keys: &[String],
+	) -> GenericTree<String, String, IC, LC> {
 		let tree: GenericTree<String, String, IC, LC> = GenericTree::new();
 		for k in keys {
 			tree.insert(k.clone(), k.clone());

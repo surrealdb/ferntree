@@ -311,10 +311,10 @@ pub unsafe trait OptimisticSlot: Default + Send + Sync + Sized {
 	///
 	/// - `this` must be a valid pointer to `Self`.
 	/// - Caller must validate via the surrounding latch's version recheck.
-	unsafe fn try_load_into_raw_ptr<'a>(
+	unsafe fn try_load_into_raw_ptr(
 		this: *const Self,
-		buf: &'a mut MaybeUninit<Self::Value>,
-	) -> Option<&'a Self::Value>;
+		buf: &mut MaybeUninit<Self::Value>,
+	) -> Option<&Self::Value>;
 
 	/// Raw-pointer variant of [`store_into_empty`](Self::store_into_empty).
 	/// Bypasses the `&Self` reborrow so writer-side updates do not
@@ -534,10 +534,7 @@ unsafe impl<T: AtomicLoadable + Default> OptimisticSlot for InlineSlot<T> {
 	}
 
 	#[inline]
-	unsafe fn try_load_into_raw_ptr<'a>(
-		this: *const Self,
-		buf: &'a mut MaybeUninit<T>,
-	) -> Option<&'a T> {
+	unsafe fn try_load_into_raw_ptr(this: *const Self, buf: &mut MaybeUninit<T>) -> Option<&T> {
 		// Project directly to the inner atomic and load the value's bits
 		// into the caller's buffer; return a borrow into the buffer.
 		// SAFETY: see the function-level safety contract.
@@ -723,10 +720,7 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 	}
 
 	#[inline]
-	unsafe fn try_load_into_raw_ptr<'a>(
-		this: *const Self,
-		_buf: &'a mut MaybeUninit<T>,
-	) -> Option<&'a T> {
+	unsafe fn try_load_into_raw_ptr(this: *const Self, _buf: &mut MaybeUninit<T>) -> Option<&T> {
 		// Same projection as `try_load_raw_ptr`, but the returned borrow
 		// points into the `Box<T>` rather than the buffer — zero clone.
 		// The borrow is valid for as long as the caller's lock / epoch
@@ -895,10 +889,7 @@ unsafe impl OptimisticSlot for UnitSlot {
 		Some(())
 	}
 	#[inline]
-	unsafe fn try_load_into_raw_ptr<'a>(
-		_this: *const Self,
-		buf: &'a mut MaybeUninit<()>,
-	) -> Option<&'a ()> {
+	unsafe fn try_load_into_raw_ptr(_this: *const Self, buf: &mut MaybeUninit<()>) -> Option<&()> {
 		Some(buf.write(()))
 	}
 }
@@ -1057,11 +1048,11 @@ where
 	/// Same contract as [`try_load_raw`](Self::try_load_raw); `buf` must
 	/// outlive the returned borrow.
 	#[inline]
-	pub unsafe fn try_load_into_raw<'a>(
+	pub unsafe fn try_load_into_raw(
 		this: *const Self,
 		pos: usize,
-		buf: &'a mut MaybeUninit<S::Value>,
-	) -> Option<&'a S::Value> {
+		buf: &mut MaybeUninit<S::Value>,
+	) -> Option<&S::Value> {
 		debug_assert!(pos < N);
 		// SAFETY: see the function-level safety contract.
 		let slot_ptr = unsafe { Self::slots_ptr(this).add(pos) };

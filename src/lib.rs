@@ -282,8 +282,8 @@ pub use optimistic::OptimisticRead;
 
 /// CPU read-prefetch hint. Issued on the optimistic descent to overlap
 /// the L3-miss latency of the child latch with the parent's binary-search
-/// + recheck work. `_mm_prefetch` is a non-faulting hint instruction — it
-/// is sound even if `ptr` is dangling, misaligned, or null.
+/// and recheck work. `_mm_prefetch` is a non-faulting hint instruction —
+/// it is sound even if `ptr` is dangling, misaligned, or null.
 ///
 /// x86_64 uses [`core::arch::x86_64::_mm_prefetch`]; other targets get a
 /// no-op fallback. aarch64 prefetch intrinsics remain nightly-only at
@@ -3962,7 +3962,8 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 			// snapshot.
 			let mut buf: core::mem::MaybeUninit<K> = core::mem::MaybeUninit::uninit();
 			// SAFETY: see the function-level safety contract.
-			let mid_key_opt = unsafe { SlotArray::try_load_into_raw(keys_ptr, mid as usize, &mut buf) };
+			let mid_key_opt =
+				unsafe { SlotArray::try_load_into_raw(keys_ptr, mid as usize, &mut buf) };
 			let mid_key = match mid_key_opt {
 				Some(k) => k,
 				None => {

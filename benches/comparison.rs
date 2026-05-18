@@ -642,13 +642,17 @@ fn bench_vec_vs_bytes_lookup_hit(c: &mut Criterion) {
 
 		group.throughput(Throughput::Elements(lookup_count as u64));
 
-		group.bench_with_input(BenchmarkId::new("vec_u8/ferntree", count), &vec_lookup, |b, keys| {
-			b.iter(|| {
-				for k in keys {
-					black_box(tree_vec.lookup(k.as_slice(), |v| v.len()));
-				}
-			})
-		});
+		group.bench_with_input(
+			BenchmarkId::new("vec_u8/ferntree", count),
+			&vec_lookup,
+			|b, keys| {
+				b.iter(|| {
+					for k in keys {
+						black_box(tree_vec.lookup(k.as_slice(), |v| v.len()));
+					}
+				})
+			},
+		);
 		group.bench_with_input(
 			BenchmarkId::new("vec_u8/ferntree_optimistic", count),
 			&vec_lookup,
@@ -660,13 +664,17 @@ fn bench_vec_vs_bytes_lookup_hit(c: &mut Criterion) {
 				})
 			},
 		);
-		group.bench_with_input(BenchmarkId::new("bytes/ferntree", count), &bytes_lookup, |b, keys| {
-			b.iter(|| {
-				for k in keys {
-					black_box(tree_bytes.lookup(k, |v| v.0.len()));
-				}
-			})
-		});
+		group.bench_with_input(
+			BenchmarkId::new("bytes/ferntree", count),
+			&bytes_lookup,
+			|b, keys| {
+				b.iter(|| {
+					for k in keys {
+						black_box(tree_bytes.lookup(k, |v| v.0.len()));
+					}
+				})
+			},
+		);
 		group.bench_with_input(
 			BenchmarkId::new("bytes/ferntree_optimistic", count),
 			&bytes_lookup,
@@ -701,22 +709,18 @@ fn bench_vec_vs_bytes_insert_random(c: &mut Criterion) {
 
 		group.throughput(Throughput::Elements(count as u64));
 
-		group.bench_with_input(
-			BenchmarkId::new("vec_u8/ferntree", count),
-			&vec_keys,
-			|b, keys| {
-				b.iter_batched(
-					Tree::<Vec<u8>, Vec<u8>>::new,
-					|tree| {
-						for k in keys {
-							black_box(tree.insert(k.clone(), k.clone()));
-						}
-						tree
-					},
-					criterion::BatchSize::SmallInput,
-				)
-			},
-		);
+		group.bench_with_input(BenchmarkId::new("vec_u8/ferntree", count), &vec_keys, |b, keys| {
+			b.iter_batched(
+				Tree::<Vec<u8>, Vec<u8>>::new,
+				|tree| {
+					for k in keys {
+						black_box(tree.insert(k.clone(), k.clone()));
+					}
+					tree
+				},
+				criterion::BatchSize::SmallInput,
+			)
+		});
 
 		group.bench_with_input(
 			BenchmarkId::new("bytes/ferntree", count),
