@@ -596,8 +596,7 @@ fn bench_vec_vs_bytes_lookup_hit(c: &mut Criterion) {
 
 	for count in [1_000, 10_000] {
 		let vec_keys = sequential_bytes_keys(count);
-		let bytes_keys: Vec<Bytes> =
-			vec_keys.iter().map(|v| Bytes::copy_from_slice(v)).collect();
+		let bytes_keys: Vec<Bytes> = vec_keys.iter().map(|v| Bytes::copy_from_slice(v)).collect();
 		let lookup_count = 1000.min(count);
 
 		let tree_vec: Tree<Vec<u8>, Vec<u8>> = Tree::new();
@@ -675,8 +674,7 @@ fn bench_vec_vs_bytes_insert_random(c: &mut Criterion) {
 			})
 			.collect();
 		let vec_keys: Vec<Vec<u8>> = payloads.iter().map(|p| p.to_vec()).collect();
-		let bytes_keys: Vec<Bytes> =
-			payloads.iter().map(|p| Bytes::copy_from_slice(p)).collect();
+		let bytes_keys: Vec<Bytes> = payloads.iter().map(|p| Bytes::copy_from_slice(p)).collect();
 
 		group.throughput(Throughput::Elements(count as u64));
 
