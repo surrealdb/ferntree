@@ -4042,8 +4042,10 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 	///   exclusive lock).
 	/// - `pos < len`.
 	pub(crate) unsafe fn remove_at_raw(this: *mut Self, pos: u16, eg: &epoch::Guard) -> (K, V) {
-		// SAFETY: see the function-level safety contract.
-		let len = unsafe { AtomicLen::load_raw(ptr::addr_of!((*this).len)) } as usize;
+		// SAFETY: caller holds the exclusive lock on this leaf — the lock
+		// release supplies the Release fence; a Relaxed load is sufficient
+		// while the writer is the sole observer.
+		let len = unsafe { AtomicLen::load_raw_relaxed(ptr::addr_of!((*this).len)) } as usize;
 		// SAFETY: caller holds exclusive lock; pos < len <= LC.
 		let keys_ptr = unsafe { ptr::addr_of!((*this).keys) };
 		// SAFETY: see the function-level safety contract.
@@ -4071,8 +4073,9 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		// Update len atomically.
 		// SAFETY: see the function-level safety contract.
 		let len_ptr: *const AtomicLen = unsafe { ptr::addr_of!((*this).len) };
-		// SAFETY: see the function-level safety contract.
-		unsafe { (*len_ptr).fetch_sub(1) };
+		// SAFETY: caller holds the exclusive lock; Relaxed is sufficient
+		// because the lock release supplies the Release fence.
+		unsafe { (*len_ptr).fetch_sub_relaxed(1) };
 
 		(removed_k, removed_v)
 	}
@@ -4097,8 +4100,8 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		value: V,
 		eg: &epoch::Guard,
 	) -> V {
-		// SAFETY: see the function-level safety contract.
-		let len = unsafe { AtomicLen::load_raw(ptr::addr_of!((*this).len)) } as usize;
+		// SAFETY: caller holds the exclusive lock — Relaxed load suffices.
+		let len = unsafe { AtomicLen::load_raw_relaxed(ptr::addr_of!((*this).len)) } as usize;
 		debug_assert!((pos as usize) < len);
 		// Atomic load + swap on the values slot. For inline storage the
 		// swap is one AcqRel atomic op; for boxed storage it allocates
@@ -4167,8 +4170,8 @@ impl<K: Clone + OptimisticRead, V: Clone + OptimisticRead, const LC: usize> Leaf
 	pub(crate) unsafe fn insert_at_raw(this: *mut Self, pos: u16, key: K, value: V) -> Option<u16> {
 		// SAFETY: see the function-level safety contract.
 		let len_ptr: *const AtomicLen = unsafe { ptr::addr_of!((*this).len) };
-		// SAFETY: see the function-level safety contract.
-		let len = unsafe { AtomicLen::load_raw(len_ptr) } as usize;
+		// SAFETY: caller holds the exclusive lock — Relaxed load suffices.
+		let len = unsafe { AtomicLen::load_raw_relaxed(len_ptr) } as usize;
 		if len >= LC {
 			return None;
 		}
@@ -4193,8 +4196,9 @@ impl<K: Clone + OptimisticRead, V: Clone + OptimisticRead, const LC: usize> Leaf
 		unsafe { SlotArray::shift_insert_raw(values_ptr, len, pos as usize, value) };
 
 		// Update len atomically.
-		// SAFETY: see the function-level safety contract.
-		unsafe { (*len_ptr).fetch_add(1) };
+		// SAFETY: caller holds the exclusive lock; Relaxed increment is
+		// sufficient — the lock release supplies the Release fence.
+		unsafe { (*len_ptr).fetch_add_relaxed(1) };
 
 		Some(pos)
 	}
@@ -4265,8 +4269,13 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 		right.sample_key = Some(right_first);
 
 		// Update lengths.
-		self.len.store(right_start as u16); // self retains [0..right_start)
-		right.len.store(right_count as u16);
+		// SAFETY: both leaves are held under their respective exclusive
+		// locks (taken by the caller via `&mut self` / `&mut right`); the
+		// lock releases supply the Release fences.
+		unsafe {
+			self.len.store_relaxed(right_start as u16); // self retains [0..right_start)
+			right.len.store_relaxed(right_count as u16);
+		}
 	}
 
 	/// Merges the `right` leaf into `self`.
@@ -4279,7 +4288,7 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 	/// - `false` if combined size would exceed capacity
 	pub(crate) fn merge(&mut self, right: &mut LeafNode<K, V, LC>) -> bool {
 		let self_len = self.len.load_relaxed() as usize;
-		let right_len = right.len.load() as usize;
+		let right_len = right.len.load_relaxed() as usize;
 		// Check if combined entries fit
 		if self_len + right_len > LC {
 			return false;
@@ -4308,7 +4317,9 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 		}
 
 		// Mark right as empty.
-		right.len.store(0);
+		// SAFETY: caller holds exclusive locks on both leaves; Relaxed
+		// stores are sufficient — the lock releases supply Release fences.
+		unsafe { right.len.store_relaxed(0) };
 
 		// Update sample_key: prefer right's sample_key if available,
 		// otherwise ensure we have one if we have entries (prevents find_parent failures)
@@ -4322,7 +4333,8 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 		}
 
 		// Update length to combined size.
-		self.len.store((self_len + right_len) as u16);
+		// SAFETY: see the store_relaxed comment above.
+		unsafe { self.len.store_relaxed((self_len + right_len) as u16) };
 		true
 	}
 }
@@ -4732,7 +4744,9 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
 			// Insert key and edge at the found position
 			self.keys.insert(pos as usize, key);
 			self.edges.insert(pos as usize, value);
-			self.len.fetch_add(1);
+			// SAFETY: writer holds `&mut self` ⇒ exclusive lock; Relaxed
+			// increment suffices, the lock release supplies the Release fence.
+			unsafe { self.len.fetch_add_relaxed(1) };
 		}
 		Some(pos)
 	}
@@ -4741,7 +4755,8 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
 	pub(crate) fn remove_at(&mut self, pos: u16) -> (K, Atomic<HybridLatch<Node<K, V, IC, LC>>>) {
 		let key = self.keys.remove(pos as usize);
 		let edge = self.edges.remove(pos as usize);
-		self.len.fetch_sub(1);
+		// SAFETY: see the fetch_add_relaxed in `insert`.
+		unsafe { self.len.fetch_sub_relaxed(1) };
 
 		(key, edge)
 	}
@@ -4775,7 +4790,8 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
 		self.keys.insert(pos as usize, key);
 		// Insert edge at position pos+1 (right child, after the left child at pos)
 		self.edges.insert((pos + 1) as usize, edge);
-		self.len.fetch_add(1);
+		// SAFETY: writer holds `&mut self` ⇒ exclusive lock.
+		unsafe { self.len.fetch_add_relaxed(1) };
 	}
 }
 
@@ -4843,8 +4859,12 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: us
 		right.sample_key = Some(right.keys[0].clone());
 
 		// Update lengths
-		right.len.store(right.keys.len() as u16);
-		self.len.store(self.keys.len() as u16);
+		// SAFETY: both nodes are held under their exclusive locks; Relaxed
+		// stores suffice — the lock releases supply Release fences.
+		unsafe {
+			right.len.store_relaxed(right.keys.len() as u16);
+			self.len.store_relaxed(self.keys.len() as u16);
+		}
 	}
 
 	/// Merges the `right` internal node into `self`.
@@ -4873,7 +4893,7 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: us
 	pub(crate) fn merge(&mut self, right: &mut InternalNode<K, V, IC, LC>) -> bool {
 		// Check if combined entries fit
 		// +1 for the separator key that gets added back
-		if (self.len.load_relaxed() + right.len.load() + 1) as usize > IC {
+		if (self.len.load_relaxed() + right.len.load_relaxed() + 1) as usize > IC {
 			return false;
 		}
 
@@ -4915,8 +4935,12 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: us
 		}
 
 		// Update lengths
-		self.len.store(self.keys.len() as u16);
-		right.len.store(0);
+		// SAFETY: both nodes are held under their exclusive locks; Relaxed
+		// stores suffice — the lock releases supply Release fences.
+		unsafe {
+			self.len.store_relaxed(self.keys.len() as u16);
+			right.len.store_relaxed(0);
+		}
 
 		true
 	}

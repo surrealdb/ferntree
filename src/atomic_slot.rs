@@ -1286,6 +1286,40 @@ impl AtomicLen {
 		self.0.fetch_sub(delta, Ordering::AcqRel)
 	}
 
+	/// `Relaxed` increment — for use under the node's exclusive lock,
+	/// where the lock release supplies the necessary Release fence and
+	/// the writer is the sole observer of the new value until release.
+	///
+	/// # Safety
+	///
+	/// Caller must hold the exclusive lock on the surrounding node.
+	#[inline]
+	pub unsafe fn fetch_add_relaxed(&self, delta: u16) -> u16 {
+		self.0.fetch_add(delta, Ordering::Relaxed)
+	}
+
+	/// `Relaxed` decrement. See [`Self::fetch_add_relaxed`] for the safety
+	/// contract.
+	///
+	/// # Safety
+	///
+	/// Caller must hold the exclusive lock on the surrounding node.
+	#[inline]
+	pub unsafe fn fetch_sub_relaxed(&self, delta: u16) -> u16 {
+		self.0.fetch_sub(delta, Ordering::Relaxed)
+	}
+
+	/// `Relaxed` store. See [`Self::fetch_add_relaxed`] for the safety
+	/// contract.
+	///
+	/// # Safety
+	///
+	/// Caller must hold the exclusive lock on the surrounding node.
+	#[inline]
+	pub unsafe fn store_relaxed(&self, value: u16) {
+		self.0.store(value, Ordering::Relaxed);
+	}
+
 	/// Raw-projection read of the length without an `&Self` reborrow.
 	/// Used by the optimistic-read raw-pointer descent.
 	///
@@ -1302,6 +1336,21 @@ impl AtomicLen {
 		// SAFETY: see the function-level safety contract.
 		let atomic = unsafe { &*(this as *const AtomicU16) };
 		atomic.load(Ordering::Acquire)
+	}
+
+	/// `Relaxed` variant of [`Self::load_raw`]. Used on writer paths that
+	/// already run under the exclusive lock (which provides the Release
+	/// fence on unlock).
+	///
+	/// # Safety
+	///
+	/// `this` must be a valid pointer to an `AtomicLen`. Caller must hold
+	/// the exclusive lock on the surrounding node.
+	#[inline]
+	pub unsafe fn load_raw_relaxed(this: *const Self) -> u16 {
+		// SAFETY: see `Self::load_raw` for the layout justification.
+		let atomic = unsafe { &*(this as *const AtomicU16) };
+		atomic.load(Ordering::Relaxed)
 	}
 }
 
