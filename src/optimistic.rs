@@ -183,6 +183,12 @@
 //! [`Tree::remove_defer`](crate::Tree::remove_defer) for all writes. See
 //! `tests/concurrency.rs` and the `epoch_deferred_drop_concurrent` test
 //! in `src/lib.rs`'s `mod tests` for working examples.
+//!
+//! `bytes::Bytes` ships with a built-in impl behind the off-by-default
+//! `bytes` cargo feature; enable it to use `Bytes` directly as `K` or `V`
+//! without writing your own `unsafe impl`. The same `EPOCH_DEFERRED_DROP =
+//! true` discipline applies — all writes must go through `insert_defer` /
+//! `remove_defer`.
 
 /// Marker trait for value types that may be read under optimistic concurrency
 /// control, allowing the tree's read fast paths to skip the leaf's shared lock.
@@ -290,6 +296,16 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticRead for Vec<T> {
 }
 // SAFETY: see `impl_optimistic_read_boxed!`.
 unsafe impl<T: Send + Sync + 'static + ?Sized> OptimisticRead for std::sync::Arc<T> {
+	const EPOCH_DEFERRED_DROP: bool = true;
+	type Slot = crate::atomic_slot::BoxedSlot<Self>;
+}
+
+// SAFETY: `bytes::Bytes` is `Send + Sync + Clone + 'static`, refcounted via
+// atomic ops with the same cheap-clone discipline as `Arc<[u8]>`. The
+// boxed-slot atomic-load + Clone pair is sound, and EPOCH_DEFERRED_DROP keeps
+// the underlying buffer alive across a reader's borrow window.
+#[cfg(feature = "bytes")]
+unsafe impl OptimisticRead for bytes::Bytes {
 	const EPOCH_DEFERRED_DROP: bool = true;
 	type Slot = crate::atomic_slot::BoxedSlot<Self>;
 }
