@@ -5249,6 +5249,46 @@ mod node_layout {
 }
 
 #[cfg(test)]
+mod raw_shared_iter_load_into {
+	use super::*;
+
+	#[test]
+	fn raw_shared_iter_string_kv_no_clone() {
+		// Builds a tree with 1000 String K/V (BoxedSlot path) and walks
+		// the full range via raw_iter().next(). The iterator's
+		// MaybeUninit buffers borrow into the slot's Box<String> — no
+		// clone per step. We assert the keys come back in sorted order
+		// and that the borrowed (&k, &v) compare equal to the inserted
+		// data.
+		let tree: Tree<String, String> = Tree::new();
+		for i in 0..1000 {
+			let k = format!("k{:06}", i);
+			tree.insert(k.clone(), k);
+		}
+
+		let mut iter = tree.raw_iter();
+		iter.seek_to_first();
+		let mut seen = 0;
+		while let Some((k, v)) = iter.next() {
+			assert_eq!(k, v);
+			assert_eq!(*k, format!("k{:06}", seen));
+			seen += 1;
+		}
+		assert_eq!(seen, 1000);
+
+		// Reverse iteration via prev() reads the same buffers.
+		let mut iter = tree.raw_iter();
+		iter.seek_to_last();
+		let mut seen = 1000usize;
+		while let Some((k, _v)) = iter.prev() {
+			seen -= 1;
+			assert_eq!(*k, format!("k{:06}", seen));
+		}
+		assert_eq!(seen, 0);
+	}
+}
+
+#[cfg(test)]
 mod leaf_binary_search_load_into {
 	use super::*;
 
