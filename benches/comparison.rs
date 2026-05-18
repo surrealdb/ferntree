@@ -23,6 +23,7 @@
 //! Single-threaded benchmarks test raw performance without synchronization overhead.
 //! Concurrent benchmarks wrap BTreeMap/HashMap in `parking_lot::RwLock`.
 
+use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use crossbeam_skiplist::SkipMap;
 use ferntree::Tree;
@@ -33,6 +34,35 @@ use std::hint::black_box;
 use std::ops::Bound;
 use std::sync::Arc;
 use std::thread;
+
+// `bytes::Bytes` is foreign, so we wrap it in a local newtype (orphan
+// rules). `BytesBlob` is a zero-cost wrapper: same size, same Clone cost
+// (Arc-bump), same Ord (lex byte order). `EPOCH_DEFERRED_DROP = true`
+// keeps the inner buffer alive across a reader's borrow window.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+#[repr(transparent)]
+struct BytesBlob(Bytes);
+
+impl Ord for BytesBlob {
+	#[inline]
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		self.0.as_ref().cmp(other.0.as_ref())
+	}
+}
+impl PartialOrd for BytesBlob {
+	#[inline]
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+// SAFETY: `BytesBlob` is `Send + Sync + Clone + 'static`. Wrapped
+// `bytes::Bytes` is itself refcounted with atomic Clone semantics, so
+// the boxed-slot atomic-load + Clone pair is sound.
+unsafe impl ferntree::OptimisticRead for BytesBlob {
+	const EPOCH_DEFERRED_DROP: bool = true;
+	type Slot = ferntree::atomic_slot::BoxedSlot<Self>;
+}
 
 const SEED: u64 = 42;
 
@@ -55,6 +85,30 @@ fn random_keys(count: usize) -> Vec<i64> {
 fn missing_keys(count: usize) -> Vec<i64> {
 	// Use negative numbers which won't be in sequential 0..N set
 	(0..count as i64).map(|i| -(i + 1)).collect()
+}
+
+/// Sequential `String` keys, zero-padded so lex order == numeric order.
+fn sequential_string_keys(count: usize) -> Vec<String> {
+	(0..count).map(|i| format!("k{:010}", i)).collect()
+}
+
+/// Random `String` keys (seeded RNG → 10-digit zero-padded for stable width).
+fn random_string_keys(count: usize) -> Vec<String> {
+	let mut rng = StdRng::seed_from_u64(SEED);
+	(0..count).map(|_| format!("k{:010}", rng.random::<u64>())).collect()
+}
+
+/// Sequential `Vec<u8>` keys (10-byte big-endian-encoded u64 prefix).
+fn sequential_bytes_keys(count: usize) -> Vec<Vec<u8>> {
+	(0..count as u64)
+		.map(|i| {
+			let mut v = Vec::with_capacity(10);
+			v.extend_from_slice(b"k");
+			v.extend_from_slice(&i.to_be_bytes());
+			v.push(0);
+			v
+		})
+		.collect()
 }
 
 // ============================================================================
@@ -342,6 +396,348 @@ fn bench_lookup_miss(c: &mut Criterion) {
 				}
 			})
 		});
+	}
+	group.finish();
+}
+
+// ============================================================================
+// Single-Threaded String / Vec<u8> Benchmarks (BoxedSlot path)
+// ============================================================================
+//
+// These exercise the `BoxedSlot<T>` storage path that primitives like
+// `i64` never hit. They measure the cost of:
+//   - heap-allocated K/V load_into (boxed atomic pointer + clone)
+//   - String / Vec<u8> comparison during binary search
+// and are the baseline against which the relaxed-atomic and load_into
+// changes are measured.
+
+fn bench_insert_random_string(c: &mut Criterion) {
+	let mut group = c.benchmark_group("insert_random_string");
+
+	for count in [1_000, 10_000] {
+		let keys = random_string_keys(count);
+		group.throughput(Throughput::Elements(count as u64));
+
+		group.bench_with_input(BenchmarkId::new("ferntree", count), &keys, |b, keys| {
+			b.iter_batched(
+				Tree::<String, String>::new,
+				|tree| {
+					for k in keys {
+						black_box(tree.insert(k.clone(), k.clone()));
+					}
+					tree
+				},
+				criterion::BatchSize::SmallInput,
+			)
+		});
+
+		group.bench_with_input(BenchmarkId::new("skipmap", count), &keys, |b, keys| {
+			b.iter_batched(
+				SkipMap::<String, String>::new,
+				|map| {
+					for k in keys {
+						black_box(map.insert(k.clone(), k.clone()));
+					}
+					map
+				},
+				criterion::BatchSize::SmallInput,
+			)
+		});
+
+		group.bench_with_input(BenchmarkId::new("btreemap", count), &keys, |b, keys| {
+			b.iter_batched(
+				BTreeMap::<String, String>::new,
+				|mut map| {
+					for k in keys {
+						black_box(map.insert(k.clone(), k.clone()));
+					}
+					map
+				},
+				criterion::BatchSize::SmallInput,
+			)
+		});
+
+		group.bench_with_input(BenchmarkId::new("hashmap", count), &keys, |b, keys| {
+			b.iter_batched(
+				HashMap::<String, String>::new,
+				|mut map| {
+					for k in keys {
+						black_box(map.insert(k.clone(), k.clone()));
+					}
+					map
+				},
+				criterion::BatchSize::SmallInput,
+			)
+		});
+	}
+	group.finish();
+}
+
+fn bench_lookup_hit_string(c: &mut Criterion) {
+	let mut group = c.benchmark_group("lookup_hit_string");
+
+	for count in [1_000, 10_000, 100_000] {
+		let keys = sequential_string_keys(count);
+		let lookup_count = 1000.min(count);
+		let lookup_keys: Vec<String> = keys[..lookup_count].to_vec();
+
+		let ferntree: Tree<String, String> = Tree::new();
+		let skipmap: SkipMap<String, String> = SkipMap::new();
+		let mut btreemap: BTreeMap<String, String> = BTreeMap::new();
+		let mut hashmap: HashMap<String, String> = HashMap::new();
+
+		for k in &keys {
+			ferntree.insert(k.clone(), k.clone());
+			skipmap.insert(k.clone(), k.clone());
+			btreemap.insert(k.clone(), k.clone());
+			hashmap.insert(k.clone(), k.clone());
+		}
+
+		group.throughput(Throughput::Elements(lookup_count as u64));
+
+		group.bench_with_input(BenchmarkId::new("ferntree", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(ferntree.lookup(k, |v| v.len()));
+				}
+			})
+		});
+
+		group.bench_with_input(
+			BenchmarkId::new("ferntree_optimistic", count),
+			&lookup_keys,
+			|b, keys| {
+				b.iter(|| {
+					for k in keys {
+						black_box(ferntree.lookup_optimistic(k, |v| v.len()));
+					}
+				})
+			},
+		);
+
+		group.bench_with_input(BenchmarkId::new("skipmap", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(skipmap.get(k).map(|e| e.value().len()));
+				}
+			})
+		});
+
+		group.bench_with_input(BenchmarkId::new("btreemap", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(btreemap.get(k).map(|v| v.len()));
+				}
+			})
+		});
+
+		group.bench_with_input(BenchmarkId::new("hashmap", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(hashmap.get(k).map(|v| v.len()));
+				}
+			})
+		});
+	}
+	group.finish();
+}
+
+fn bench_lookup_hit_bytes(c: &mut Criterion) {
+	let mut group = c.benchmark_group("lookup_hit_bytes");
+
+	for count in [1_000, 10_000] {
+		let keys = sequential_bytes_keys(count);
+		let lookup_count = 1000.min(count);
+		let lookup_keys: Vec<Vec<u8>> = keys[..lookup_count].to_vec();
+
+		let ferntree: Tree<Vec<u8>, Vec<u8>> = Tree::new();
+		let skipmap: SkipMap<Vec<u8>, Vec<u8>> = SkipMap::new();
+		let mut btreemap: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+		let mut hashmap: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+
+		for k in &keys {
+			ferntree.insert(k.clone(), k.clone());
+			skipmap.insert(k.clone(), k.clone());
+			btreemap.insert(k.clone(), k.clone());
+			hashmap.insert(k.clone(), k.clone());
+		}
+
+		group.throughput(Throughput::Elements(lookup_count as u64));
+
+		group.bench_with_input(BenchmarkId::new("ferntree", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(ferntree.lookup(k.as_slice(), |v| v.len()));
+				}
+			})
+		});
+
+		group.bench_with_input(
+			BenchmarkId::new("ferntree_optimistic", count),
+			&lookup_keys,
+			|b, keys| {
+				b.iter(|| {
+					for k in keys {
+						black_box(ferntree.lookup_optimistic(k.as_slice(), |v| v.len()));
+					}
+				})
+			},
+		);
+
+		group.bench_with_input(BenchmarkId::new("skipmap", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(skipmap.get(k.as_slice()).map(|e| e.value().len()));
+				}
+			})
+		});
+
+		group.bench_with_input(BenchmarkId::new("btreemap", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(btreemap.get(k.as_slice()).map(|v| v.len()));
+				}
+			})
+		});
+
+		group.bench_with_input(BenchmarkId::new("hashmap", count), &lookup_keys, |b, keys| {
+			b.iter(|| {
+				for k in keys {
+					black_box(hashmap.get(k.as_slice()).map(|v| v.len()));
+				}
+			})
+		});
+	}
+	group.finish();
+}
+
+// ============================================================================
+// Vec<u8> vs bytes::Bytes (side-by-side)
+// ============================================================================
+//
+// Compares the boxed-K/V storage cost for two refcount profiles:
+//   - `Vec<u8>`  — Clone allocates + memcpy of the inner buffer
+//   - `Bytes`    — Clone bumps an Arc refcount (no buffer copy)
+// Same 10-byte payload in both cases; only the Clone shape differs.
+
+fn bench_vec_vs_bytes_lookup_hit(c: &mut Criterion) {
+	let mut group = c.benchmark_group("vec_vs_bytes_lookup_hit");
+
+	for count in [1_000, 10_000] {
+		let vec_keys = sequential_bytes_keys(count);
+		let bytes_keys: Vec<BytesBlob> =
+			vec_keys.iter().map(|v| BytesBlob(Bytes::copy_from_slice(v))).collect();
+		let lookup_count = 1000.min(count);
+
+		let tree_vec: Tree<Vec<u8>, Vec<u8>> = Tree::new();
+		let tree_bytes: Tree<BytesBlob, BytesBlob> = Tree::new();
+
+		for (vk, bk) in vec_keys.iter().zip(bytes_keys.iter()) {
+			tree_vec.insert(vk.clone(), vk.clone());
+			tree_bytes.insert(bk.clone(), bk.clone());
+		}
+
+		let vec_lookup: Vec<Vec<u8>> = vec_keys[..lookup_count].to_vec();
+		let bytes_lookup: Vec<BytesBlob> = bytes_keys[..lookup_count].to_vec();
+
+		group.throughput(Throughput::Elements(lookup_count as u64));
+
+		group.bench_with_input(
+			BenchmarkId::new("vec_u8/ferntree", count),
+			&vec_lookup,
+			|b, keys| {
+				b.iter(|| {
+					for k in keys {
+						black_box(tree_vec.lookup(k.as_slice(), |v| v.len()));
+					}
+				})
+			},
+		);
+		group.bench_with_input(
+			BenchmarkId::new("vec_u8/ferntree_optimistic", count),
+			&vec_lookup,
+			|b, keys| {
+				b.iter(|| {
+					for k in keys {
+						black_box(tree_vec.lookup_optimistic(k.as_slice(), |v| v.len()));
+					}
+				})
+			},
+		);
+		group.bench_with_input(
+			BenchmarkId::new("bytes/ferntree", count),
+			&bytes_lookup,
+			|b, keys| {
+				b.iter(|| {
+					for k in keys {
+						black_box(tree_bytes.lookup(k, |v| v.0.len()));
+					}
+				})
+			},
+		);
+		group.bench_with_input(
+			BenchmarkId::new("bytes/ferntree_optimistic", count),
+			&bytes_lookup,
+			|b, keys| {
+				b.iter(|| {
+					for k in keys {
+						black_box(tree_bytes.lookup_optimistic(k, |v| v.0.len()));
+					}
+				})
+			},
+		);
+	}
+	group.finish();
+}
+
+fn bench_vec_vs_bytes_insert_random(c: &mut Criterion) {
+	let mut group = c.benchmark_group("vec_vs_bytes_insert_random");
+
+	for count in [1_000, 10_000] {
+		// Random 10-byte payloads from the same seeded RNG.
+		let mut rng = StdRng::seed_from_u64(SEED);
+		let payloads: Vec<[u8; 10]> = (0..count)
+			.map(|_| {
+				let mut p = [0u8; 10];
+				rng.fill(&mut p);
+				p
+			})
+			.collect();
+		let vec_keys: Vec<Vec<u8>> = payloads.iter().map(|p| p.to_vec()).collect();
+		let bytes_keys: Vec<BytesBlob> =
+			payloads.iter().map(|p| BytesBlob(Bytes::copy_from_slice(p))).collect();
+
+		group.throughput(Throughput::Elements(count as u64));
+
+		group.bench_with_input(BenchmarkId::new("vec_u8/ferntree", count), &vec_keys, |b, keys| {
+			b.iter_batched(
+				Tree::<Vec<u8>, Vec<u8>>::new,
+				|tree| {
+					for k in keys {
+						black_box(tree.insert(k.clone(), k.clone()));
+					}
+					tree
+				},
+				criterion::BatchSize::SmallInput,
+			)
+		});
+
+		group.bench_with_input(
+			BenchmarkId::new("bytes/ferntree", count),
+			&bytes_keys,
+			|b, keys| {
+				b.iter_batched(
+					Tree::<BytesBlob, BytesBlob>::new,
+					|tree| {
+						for k in keys {
+							black_box(tree.insert(k.clone(), k.clone()));
+						}
+						tree
+					},
+					criterion::BatchSize::SmallInput,
+				)
+			},
+		);
 	}
 	group.finish();
 }
@@ -1143,6 +1539,82 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
 	group.finish();
 }
 
+fn bench_concurrent_mixed_string(c: &mut Criterion) {
+	let mut group = c.benchmark_group("concurrent_mixed_string");
+
+	let cpu_cores = thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+	let configs = [
+		("2r_2w", 2, 2),
+		("4r_4w", 4, 4),
+		(&format!("{}r_{}w", cpu_cores / 2, cpu_cores / 2), cpu_cores / 2, cpu_cores / 2),
+	];
+
+	for count in [10_000] {
+		let keys = sequential_string_keys(count);
+		let ops_per_thread = 500;
+
+		for (config_name, num_readers, num_writers) in &configs {
+			if *num_readers == 0 || *num_writers == 0 {
+				continue;
+			}
+
+			let total_ops = ops_per_thread * (num_readers + num_writers);
+			group.throughput(Throughput::Elements(total_ops as u64));
+
+			let read_keys: Vec<String> = keys[..ops_per_thread].to_vec();
+			let write_keys: Vec<Vec<String>> = (0..*num_writers)
+				.map(|w| {
+					(0..ops_per_thread)
+						.map(|i| format!("w{:010}", w * ops_per_thread + i + count))
+						.collect()
+				})
+				.collect();
+
+			group.bench_function(
+				BenchmarkId::new(format!("ferntree/{}", config_name), count),
+				|b| {
+					b.iter_batched(
+						|| {
+							let tree = Arc::new(Tree::<String, String>::new());
+							for k in &keys {
+								tree.insert(k.clone(), k.clone());
+							}
+							tree
+						},
+						|tree| {
+							let mut handles = Vec::new();
+							for _ in 0..*num_readers {
+								let tree = Arc::clone(&tree);
+								let keys = read_keys.clone();
+								handles.push(thread::spawn(move || {
+									for k in &keys {
+										black_box(tree.lookup(k, |v| v.len()));
+									}
+								}));
+							}
+							for keys in write_keys.iter().take(*num_writers) {
+								let tree = Arc::clone(&tree);
+								let keys = keys.clone();
+								handles.push(thread::spawn(move || {
+									for k in keys {
+										black_box(tree.insert(k.clone(), k));
+									}
+								}));
+							}
+							for h in handles {
+								h.join().unwrap();
+							}
+							tree
+						},
+						criterion::BatchSize::SmallInput,
+					)
+				},
+			);
+		}
+	}
+	group.finish();
+}
+
 // ============================================================================
 // Refcounted-value benchmarks (Phase 3: epoch-deferred drop path)
 // ============================================================================
@@ -1260,6 +1732,11 @@ criterion_group!(
 	bench_remove,
 	bench_range,
 	bench_raw_iter,
+	bench_insert_random_string,
+	bench_lookup_hit_string,
+	bench_lookup_hit_bytes,
+	bench_vec_vs_bytes_lookup_hit,
+	bench_vec_vs_bytes_insert_random,
 );
 
 criterion_group!(
@@ -1267,6 +1744,7 @@ criterion_group!(
 	bench_concurrent_readers,
 	bench_concurrent_writers,
 	bench_concurrent_mixed,
+	bench_concurrent_mixed_string,
 );
 
 criterion_group!(refcounted_benches, bench_refcounted_lookup, bench_refcounted_writes,);

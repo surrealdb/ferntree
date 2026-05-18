@@ -59,6 +59,7 @@ use crate::optimistic::OptimisticRead;
 use crate::sync::epoch::{self as epoch};
 use crate::{Direction, GenericTree, Node};
 use std::borrow::Borrow;
+use std::mem::MaybeUninit;
 use std::ops::Bound;
 
 // ===========================================================================
@@ -306,12 +307,15 @@ pub struct RawSharedIter<'t, K: OptimisticRead, V: OptimisticRead, const IC: usi
 	/// Shared guard on the current leaf and our cursor position.
 	/// The shared lock blocks writers but allows concurrent readers.
 	leaf: Option<(SharedGuard<'t, Node<K, V, IC, LC>>, Cursor)>,
-	/// Buffer holding the last `(K, V)` materialised by `next` / `prev` /
-	/// `peek` / `peek_prev`. The returned `(&K, &V)` borrows from this
-	/// buffer with a lifetime tied to `&mut self`, so the borrow is
-	/// invalidated by the next call. `buf_init` tracks whether the
-	/// buffer currently holds initialised values.
-	buffer: Option<(K, V)>,
+	/// Stack-spilled K materialisation buffer for `load_into` calls in
+	/// `next` / `prev` / `peek` / `peek_prev`. For boxed K the buffer is
+	/// never written — `BoxedSlot::load_into` returns a borrow into the
+	/// `Box<K>` directly. For inline K the slot's bits are atomic-loaded
+	/// here. Dropping an uninitialised `MaybeUninit<K>` is sound for both
+	/// branches.
+	key_buf: MaybeUninit<K>,
+	/// Symmetric V buffer; see `key_buf`.
+	val_buf: MaybeUninit<V>,
 }
 
 impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
@@ -328,7 +332,8 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 			eg: epoch::pin(),
 			parent: None,
 			leaf: None,
-			buffer: None,
+			key_buf: MaybeUninit::uninit(),
+			val_buf: MaybeUninit::uninit(),
 		}
 	}
 
@@ -934,10 +939,14 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 				let (guard, cursor) = self.leaf.as_mut().unwrap();
 				let leaf = guard.as_leaf();
 				*cursor = new_cursor;
-				// SAFETY: cursor.next_entry() already validated that curr_pos < leaf.len.load()
-				let kv = unsafe { leaf.kv_at_unchecked(curr_pos) };
-				self.buffer = Some(kv);
-				let (k, v) = self.buffer.as_ref().unwrap();
+				// SAFETY: cursor.next_entry() already validated that
+				// curr_pos < leaf.len.load(); slot is init under the
+				// shared lock. For boxed K/V the borrow is into the Box;
+				// for inline K/V it's into the iterator's buffer. The
+				// previous call's `(&K, &V)` is invalidated by `&mut self`.
+				let k = unsafe { leaf.keys.load_into(curr_pos as usize, &mut self.key_buf) };
+				// SAFETY: see above.
+				let v = unsafe { leaf.values.load_into(curr_pos as usize, &mut self.val_buf) };
 				return Some((k, v));
 			} else {
 				// Current leaf exhausted - try to move to next leaf
@@ -977,10 +986,10 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 				let (guard, cursor) = self.leaf.as_mut().unwrap();
 				let leaf = guard.as_leaf();
 				*cursor = new_cursor;
-				// SAFETY: cursor.prev_entry() already validated that curr_pos is valid
-				let kv = unsafe { leaf.kv_at_unchecked(curr_pos) };
-				self.buffer = Some(kv);
-				let (k, v) = self.buffer.as_ref().unwrap();
+				// SAFETY: see RawSharedIter::next.
+				let k = unsafe { leaf.keys.load_into(curr_pos as usize, &mut self.key_buf) };
+				// SAFETY: see above.
+				let v = unsafe { leaf.values.load_into(curr_pos as usize, &mut self.val_buf) };
 				return Some((k, v));
 			} else {
 				// Current leaf exhausted - try to move to previous leaf
@@ -1035,10 +1044,12 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 			if let Some(pos) = pos_opt {
 				// Return entry at position (new borrow)
 				let (guard, _) = self.leaf.as_ref().unwrap();
-				// SAFETY: peek_next_pos() already validated that pos < leaf.len.load()
-				let kv = unsafe { guard.as_leaf().kv_at_unchecked(pos) };
-				self.buffer = Some(kv);
-				let (k, v) = self.buffer.as_ref().unwrap();
+				let leaf = guard.as_leaf();
+				// SAFETY: see RawSharedIter::next; peek_next_pos already
+				// validated `pos < leaf.len.load()`.
+				let k = unsafe { leaf.keys.load_into(pos as usize, &mut self.key_buf) };
+				// SAFETY: see above.
+				let v = unsafe { leaf.values.load_into(pos as usize, &mut self.val_buf) };
 				return Some((k, v));
 			} else {
 				// At end of current leaf - try to move to next leaf
@@ -1067,10 +1078,12 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 			if let Some(pos) = pos_opt {
 				// Return entry at position (new borrow)
 				let (guard, _) = self.leaf.as_ref().unwrap();
-				// SAFETY: peek_prev_pos() already validated that pos is valid
-				let kv = unsafe { guard.as_leaf().kv_at_unchecked(pos) };
-				self.buffer = Some(kv);
-				let (k, v) = self.buffer.as_ref().unwrap();
+				let leaf = guard.as_leaf();
+				// SAFETY: see RawSharedIter::next; peek_prev_pos already
+				// validated that `pos` is in bounds.
+				let k = unsafe { leaf.keys.load_into(pos as usize, &mut self.key_buf) };
+				// SAFETY: see above.
+				let v = unsafe { leaf.values.load_into(pos as usize, &mut self.val_buf) };
 				return Some((k, v));
 			} else {
 				// At start of current leaf - try to move to previous leaf
@@ -1146,9 +1159,15 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 		// - leaf_len is the actual length of the leaf
 		// - the loop only iterates while i < leaf_len
 		for i in start..leaf_len {
+			let mut key_buf: MaybeUninit<K> = MaybeUninit::uninit();
+			let mut val_buf: MaybeUninit<V> = MaybeUninit::uninit();
 			// SAFETY: `i < leaf_len == leaf.len.load()`, per the loop bound.
-			let (k, v) = unsafe { leaf.kv_at_unchecked(i) };
-			f(&k, &v);
+			// `load_into` borrows into the Box (boxed K/V) or the stack
+			// buffer (inline K/V); both outlive `f`'s call.
+			let k = unsafe { leaf.keys.load_into(i as usize, &mut key_buf) };
+			// SAFETY: see above.
+			let v = unsafe { leaf.values.load_into(i as usize, &mut val_buf) };
+			f(k, v);
 		}
 
 		// Mark cursor as exhausted (positioned at end of leaf)
