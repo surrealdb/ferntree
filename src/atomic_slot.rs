@@ -297,6 +297,25 @@ pub unsafe trait OptimisticSlot: Default + Send + Sync + Sized {
 		unsafe { (*this).try_load() }
 	}
 
+	/// Borrow variant of [`try_load_raw_ptr`] returning `Option<&T>`
+	/// instead of `Option<T>`. For [`BoxedSlot`] the borrow points into
+	/// the slot's `Box<T>` (zero-clone); for [`InlineSlot`] the value's
+	/// bits are atomic-loaded into the caller's `buf` and the borrow
+	/// points into `buf`. Returns `None` if the slot was concurrently
+	/// emptied (boxed) — for inline storage this branch is unreachable.
+	///
+	/// Used by the optimistic-read raw-pointer descent to compare keys
+	/// during binary search without allocating or cloning.
+	///
+	/// # Safety
+	///
+	/// - `this` must be a valid pointer to `Self`.
+	/// - Caller must validate via the surrounding latch's version recheck.
+	unsafe fn try_load_into_raw_ptr<'a>(
+		this: *const Self,
+		buf: &'a mut MaybeUninit<Self::Value>,
+	) -> Option<&'a Self::Value>;
+
 	/// Raw-pointer variant of [`store_into_empty`](Self::store_into_empty).
 	/// Bypasses the `&Self` reborrow so writer-side updates do not
 	/// conflict with a concurrent reader's foreign tag under Tree Borrows.
@@ -515,6 +534,22 @@ unsafe impl<T: AtomicLoadable + Default> OptimisticSlot for InlineSlot<T> {
 	}
 
 	#[inline]
+	unsafe fn try_load_into_raw_ptr<'a>(
+		this: *const Self,
+		buf: &'a mut MaybeUninit<T>,
+	) -> Option<&'a T> {
+		// Project directly to the inner atomic and load the value's bits
+		// into the caller's buffer; return a borrow into the buffer.
+		// SAFETY: see the function-level safety contract.
+		let atomic_ptr: *const T::Atomic = unsafe { ptr::addr_of!((*this).inner) };
+		// SAFETY: see the function-level safety contract.
+		let value = T::load_acquire(unsafe { &*atomic_ptr });
+		buf.write(value);
+		// SAFETY: just wrote `value` into `buf`; it is initialised.
+		Some(unsafe { buf.assume_init_ref() })
+	}
+
+	#[inline]
 	unsafe fn store_into_empty_raw_ptr(this: *const Self, value: T) {
 		// SAFETY: see the function-level safety contract.
 		let atomic_ptr: *const T::Atomic = unsafe { ptr::addr_of!((*this).inner) };
@@ -688,6 +723,28 @@ unsafe impl<T: Send + Sync + Clone + 'static> OptimisticSlot for BoxedSlot<T> {
 	}
 
 	#[inline]
+	unsafe fn try_load_into_raw_ptr<'a>(
+		this: *const Self,
+		_buf: &'a mut MaybeUninit<T>,
+	) -> Option<&'a T> {
+		// Same projection as `try_load_raw_ptr`, but the returned borrow
+		// points into the `Box<T>` rather than the buffer — zero clone.
+		// The borrow is valid for as long as the caller's lock / epoch
+		// guard keeps the Box alive (writer's `swap_init` / `take_init`
+		// route the displaced Box through the epoch GC).
+		// SAFETY: see the function-level safety contract.
+		let atomic_ptr: *const AtomicPtr<T> = unsafe { ptr::addr_of!((*this).inner) };
+		// SAFETY: see the function-level safety contract.
+		let raw = unsafe { (*atomic_ptr).load(Ordering::Acquire) };
+		if raw.is_null() {
+			return None;
+		}
+		// SAFETY: raw is non-null and points at a `T` whose lifetime is
+		// at least as long as the caller's surrounding lock / epoch guard.
+		Some(unsafe { &*raw })
+	}
+
+	#[inline]
 	unsafe fn store_into_empty_raw_ptr(this: *const Self, value: T) {
 		// SAFETY: see the function-level safety contract.
 		let atomic_ptr: *const AtomicPtr<T> = unsafe { ptr::addr_of!((*this).inner) };
@@ -837,6 +894,13 @@ unsafe impl OptimisticSlot for UnitSlot {
 	unsafe fn try_load(&self) -> Option<()> {
 		Some(())
 	}
+	#[inline]
+	unsafe fn try_load_into_raw_ptr<'a>(
+		_this: *const Self,
+		buf: &'a mut MaybeUninit<()>,
+	) -> Option<&'a ()> {
+		Some(buf.write(()))
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1043,30 @@ where
 		let slot_ptr = unsafe { Self::slots_ptr(this).add(pos) };
 		// SAFETY: see the function-level safety contract.
 		unsafe { S::try_load_raw_ptr(slot_ptr) }
+	}
+
+	/// Borrow variant of [`try_load_raw`](Self::try_load_raw): atomic-load
+	/// the slot's value and return `Option<&T>`. For boxed storage the
+	/// borrow is zero-clone (points into the slot's `Box<T>`); for inline
+	/// storage the value's bits are written into `buf` and the borrow
+	/// points there. Used by the optimistic-read raw-pointer descent to
+	/// compare keys without allocating.
+	///
+	/// # Safety
+	///
+	/// Same contract as [`try_load_raw`](Self::try_load_raw); `buf` must
+	/// outlive the returned borrow.
+	#[inline]
+	pub unsafe fn try_load_into_raw<'a>(
+		this: *const Self,
+		pos: usize,
+		buf: &'a mut MaybeUninit<S::Value>,
+	) -> Option<&'a S::Value> {
+		debug_assert!(pos < N);
+		// SAFETY: see the function-level safety contract.
+		let slot_ptr = unsafe { Self::slots_ptr(this).add(pos) };
+		// SAFETY: see the function-level safety contract.
+		unsafe { S::try_load_into_raw_ptr(slot_ptr, buf) }
 	}
 
 	/// Raw-pointer variant of [`shift_insert`](Self::shift_insert).

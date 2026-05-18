@@ -3781,25 +3781,15 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		while lower < upper {
 			let mid = ((upper - lower) / 2) + lower;
 
-			// Atomic load of the key at position `mid`. For inline storage
-			// this is an atomic-sized integer load; for boxed storage it
-			// clones through an Acquire-loaded pointer. Both synchronise
-			// with the writer's Release store under exclusive lock.
-			// SAFETY: `mid < upper <= LC`; slot is init while we hold a
-			// shared / exclusive guard on the leaf.
-			let mid_key_opt: Option<K> =
-				// SAFETY: see the function-level safety contract.
-				unsafe { SlotArray::try_load_raw(ptr::addr_of!(self.keys), mid as usize) };
-			let mid_key = match mid_key_opt {
-				Some(k) => k,
-				None => {
-					// Slot was concurrently emptied (only possible under
-					// the optimistic path with raced writer); caller's
-					// recheck will catch.
-					std::hint::cold_path();
-					return (lower, false);
-				}
-			};
+			// Atomic load of the key at position `mid` as a borrow. For
+			// boxed K the borrow points into the slot's `Box<K>` (zero
+			// clone); for inline K the bits are loaded into `buf` and
+			// the borrow points there. The shared / exclusive lock on
+			// the leaf keeps the slot init for the duration of the
+			// comparison.
+			let mut buf: core::mem::MaybeUninit<K> = core::mem::MaybeUninit::uninit();
+			// SAFETY: `mid < upper <= LC`; slot is init under our guard.
+			let mid_key: &K = unsafe { self.keys.load_into(mid as usize, &mut buf) };
 
 			if key < mid_key.borrow() {
 				upper = mid;
@@ -3917,28 +3907,31 @@ impl<K: OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, V, LC> {
 		while lower < upper {
 			let mid = ((upper - lower) / 2) + lower;
 
-			// Atomic-load the K at position mid into a stack
-			// ManuallyDrop. `try_load_raw` returns `None` if the slot
-			// was concurrently emptied (boxed null pointer race); we
-			// treat that as "trust the bounds we already have" — the
-			// caller's outer recheck will fail and we'll retry. For
-			// inline storage `try_load_raw` always returns `Some`.
+			// Atomic-load the K at position mid as a borrow via raw-
+			// pointer projection. For boxed K the borrow points into
+			// the slot's `Box<K>` (kept alive by the epoch guard the
+			// caller holds); for inline K the bits are loaded into the
+			// stack buffer and the borrow points into it. Either way,
+			// no clone — and no Drop concern, because we hold a borrow
+			// rather than an owned snapshot.
 			//
-			// SAFETY: `mid` < `upper` <= LC; the bounds check on the
-			// snapshot is validated later by the caller's recheck.
+			// `try_load_into_raw` returns `None` if the slot was
+			// concurrently emptied (boxed null pointer race); treat
+			// that as a recheck signal and bail with conservative
+			// bounds. For inline storage this branch is unreachable.
+			//
+			// SAFETY: `mid < upper <= LC`; outer recheck validates the
+			// snapshot.
+			let mut buf: core::mem::MaybeUninit<K> = core::mem::MaybeUninit::uninit();
 			// SAFETY: see the function-level safety contract.
-			let mid_key_opt: Option<K> = unsafe { SlotArray::try_load_raw(keys_ptr, mid as usize) };
-			let mid_key_snapshot: core::mem::ManuallyDrop<K> = match mid_key_opt {
-				Some(k) => core::mem::ManuallyDrop::new(k),
+			let mid_key_opt = unsafe { SlotArray::try_load_into_raw(keys_ptr, mid as usize, &mut buf) };
+			let mid_key = match mid_key_opt {
+				Some(k) => k,
 				None => {
-					// Concurrent removal raced our read; return
-					// conservative bounds so the caller's recheck
-					// triggers a retry.
 					std::hint::cold_path();
 					return (lower, false);
 				}
 			};
-			let mid_key: &K = &mid_key_snapshot;
 
 			if key < mid_key.borrow() {
 				upper = mid;
@@ -5214,6 +5207,35 @@ mod node_layout {
 	fn internal_node_is_cache_line_aligned() {
 		assert_eq!(core::mem::align_of::<InternalNode<i64, i64, 16, 16>>(), 64);
 		assert_eq!(core::mem::align_of::<InternalNode<String, i64, 16, 16>>(), 64);
+	}
+}
+
+#[cfg(test)]
+mod leaf_binary_search_load_into {
+	use super::*;
+
+	#[test]
+	fn leaf_lower_bound_load_into_smoke() {
+		// Build a tree with String keys (BoxedSlot path) and exercise
+		// the binary-search probes that now run via `load_into`.
+		let tree: Tree<String, i64> = Tree::new();
+		for i in 0..10 {
+			tree.insert(format!("k{:04}", i), i);
+		}
+
+		// Each lookup walks a tree of String slots; the binary-search
+		// probes borrow into the Box<String> rather than cloning.
+		for i in 0..10 {
+			let k = format!("k{:04}", i);
+			assert_eq!(tree.lookup(&k, |v| *v), Some(i));
+			assert_eq!(tree.lookup_optimistic(&k, |v| *v), Some(i));
+		}
+
+		// Missing keys should also drive the comparison path correctly.
+		assert_eq!(tree.lookup(&"k9999".to_string(), |v| *v), None);
+		assert_eq!(tree.lookup_optimistic(&"k9999".to_string(), |v| *v), None);
+		assert_eq!(tree.lookup(&"a".to_string(), |v| *v), None);
+		assert_eq!(tree.lookup_optimistic(&"a".to_string(), |v| *v), None);
 	}
 }
 
