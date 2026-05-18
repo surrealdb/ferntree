@@ -3683,6 +3683,7 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> Nod
 /// The `sample_key` is a key known to be in (or route to) this leaf. It's
 /// used by `find_parent()` to relocate this leaf in the tree after structural
 /// changes. Set during splits.
+#[repr(C, align(64))]
 pub(crate) struct LeafNode<K: OptimisticRead, V: OptimisticRead, const LC: usize> {
 	/// Number of key-value pairs in this leaf.
 	///
@@ -4359,6 +4360,7 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const LC: usize> LeafNode<K, 
 ///
 /// Similar to leaf nodes, internal nodes have fence keys defining their
 /// key range. These are used for optimistic validation and node relocation.
+#[repr(C, align(64))]
 pub(crate) struct InternalNode<
 	K: OptimisticRead,
 	V: OptimisticRead,
@@ -5171,6 +5173,23 @@ impl<
 				}
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod node_layout {
+	use super::*;
+
+	#[test]
+	fn leaf_node_is_cache_line_aligned() {
+		assert_eq!(core::mem::align_of::<LeafNode<i64, i64, 16>>(), 64);
+		assert_eq!(core::mem::align_of::<LeafNode<String, String, 16>>(), 64);
+	}
+
+	#[test]
+	fn internal_node_is_cache_line_aligned() {
+		assert_eq!(core::mem::align_of::<InternalNode<i64, i64, 16, 16>>(), 64);
+		assert_eq!(core::mem::align_of::<InternalNode<String, i64, 16, 16>>(), 64);
 	}
 }
 
