@@ -4,6 +4,12 @@ version = "0.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Concurrent in-memory B+ Tree featuring optimistic lock coupling"
+repository = "https://github.com/surrealdb/ferntree"
+homepage = "https://github.com/surrealdb/ferntree"
+documentation = "https://docs.rs/ferntree"
+readme = "README.md"
+keywords = ["btree", "concurrent", "lock-free", "index", "database"]
+categories = ["data-structures", "concurrency", "database-implementations"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
