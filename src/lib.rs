@@ -610,8 +610,9 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			// `as_raw` rather than `deref` here on purpose: this is a pure
 			// pointer comparison and dereferencing the loaded `Shared` would
 			// touch a potentially-freed `HybridLatch` *before* we get a
-			// chance to validate the parent's snapshot (issue #14). The
-			// actual deref happens inside `lock_coupling` below, which now
+			// chance to validate the parent's snapshot (issue #14). On a
+			// pointer match we break out without ever derefing this slot;
+			// on a mismatch the descent calls `lock_coupling` below, which
 			// validates the parent before touching the latch.
 			let c_latch_ptr = c_swip.load(Ordering::Acquire, eg).as_raw();
 
