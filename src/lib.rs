@@ -572,23 +572,39 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		let mut target_guard = root_guard;
 		let mut pos = 0u16;
 
-		// Descend the tree looking for the needle
+		// Descend the tree looking for the needle. Raw-pointer projection
+		// throughout — no `*target_guard` or `&InternalNode` reborrow —
+		// so a concurrent `shift_remove_raw` on an internal node cannot
+		// cause us to dereference a transiently-null boxed key slot
+		// during the binary search.
 		let parent_guard = loop {
-			// Determine which child to descend into based on the search key
-			let (c_swip, c_pos) = match *target_guard {
-				Node::Internal(ref internal) => {
-					// Binary search for the correct child position
-					let (c_pos, _) = internal.lower_bound(&search_key);
-					// Get the child pointer (swip = "software-implemented pointer")
-					let swip = internal.edge_at(c_pos)?;
-					(swip, c_pos)
+			let target_ptr = target_guard.as_ptr();
+			// SAFETY: `target_ptr` is owned by a HybridLatch we hold an
+			// optimistic guard on.
+			let (c_swip_ptr, c_pos) = match unsafe { Node::variant_raw(target_ptr) } {
+				NodeKindRaw::Internal(internal_ptr) => {
+					// SAFETY: `internal_ptr` is valid for the optimistic
+					// guard's lifetime; `K: OptimisticRead` (impl bound)
+					// certifies the snapshot discipline.
+					// `lower_bound_raw` short-circuits on a null peek.
+					let (c_pos, _) =
+						unsafe { InternalNode::lower_bound_raw(internal_ptr, &search_key) };
+					// SAFETY: same conditions as `lower_bound_raw`.
+					let swip_ptr = unsafe { InternalNode::edge_at_raw(internal_ptr, c_pos)? };
+					(swip_ptr, c_pos)
 				}
-				Node::Leaf(ref _leaf) => {
+				NodeKindRaw::Leaf(_) => {
 					// Reached a leaf without finding the needle in internal nodes
 					// The previous node (p_guard) must be the parent
 					break p_guard.expect("must have parent");
 				}
 			};
+
+			// `&Atomic` reborrow is sound (interior-mutable).
+			//
+			// SAFETY: `c_swip_ptr` is a valid `*const Atomic` for the
+			// parent guard's lifetime.
+			let c_swip = unsafe { &*c_swip_ptr };
 
 			// Load the child node
 			// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
@@ -1009,7 +1025,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		Option<(OptimisticGuard<'e, Node<K, V, IC, LC>>, u16)>,
 	)>
 	where
-		K: Borrow<Q> + Ord,
+		K: Borrow<Q> + Ord + OptimisticRead,
 		Q: ?Sized + Ord,
 	{
 		// Acquire access to the root
@@ -1026,22 +1042,51 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		let mut p_guard = None;
 		let mut target_guard = root_guard;
 
-		// Descend the tree following the key
+		// Descend the tree following the key. We use raw-pointer projection
+		// throughout — never `*target_guard` — so we never create an
+		// `&Node` / `&InternalNode` reborrow that would dereference a
+		// transiently-null boxed key slot during a concurrent
+		// `shift_remove_raw` on an internal node. The version `recheck()`
+		// at every level validates the snapshot.
 		let leaf_guard = loop {
-			let (c_swip, pos) = match *target_guard {
-				Node::Internal(ref internal) => {
-					// Binary search to find which child contains the key
-					let (pos, _) = internal.lower_bound(key);
-					let swip = internal.edge_at(pos)?;
-					(swip, pos)
+			let target_ptr = target_guard.as_ptr();
+			// SAFETY: `target_ptr` is owned by a HybridLatch we hold an
+			// optimistic guard on; the discriminant read is validated by
+			// `lock_coupling`'s parent recheck on the next iteration or
+			// by the caller's recheck after this function returns.
+			let (c_swip_ptr, pos) = match unsafe { Node::variant_raw(target_ptr) } {
+				NodeKindRaw::Internal(internal_ptr) => {
+					// SAFETY: pointer to `InternalNode` obtained via raw
+					// projection; `K: OptimisticRead` (added above)
+					// certifies the binary-search snapshot discipline.
+					// `lower_bound_raw` itself short-circuits to
+					// `(lower, false)` on a null peek, which we then
+					// resolve via the parent's `recheck()` inside
+					// `lock_coupling`.
+					let (pos, _) = unsafe { InternalNode::lower_bound_raw(internal_ptr, key) };
+					// SAFETY: same conditions as `lower_bound_raw`.
+					let swip_ptr = unsafe { InternalNode::edge_at_raw(internal_ptr, pos)? };
+					(swip_ptr, pos)
 				}
-				Node::Leaf(ref _leaf) => {
-					// Reached the target leaf
+				NodeKindRaw::Leaf(_) => {
+					// Reached the target leaf. Validate the snapshot
+					// before handing the guard back so callers can rely
+					// on the variant being stable.
+					target_guard.recheck()?;
 					break target_guard;
 				}
 			};
 
-			// Lock couple to the child
+			// Lock couple to the child via the raw swip pointer.
+			//
+			// SAFETY: `c_swip_ptr` points at an `Atomic<...>` inside the
+			// parent node we hold an optimistic guard on; the `&Atomic`
+			// reborrow is interior-mutable (its load is an atomic op
+			// rather than a non-atomic read), so it does not retag and
+			// is sound to alias concurrently with a writer's `&mut` on
+			// the surrounding node. `lock_coupling` performs the
+			// atomic load and a parent recheck.
+			let c_swip = unsafe { &*c_swip_ptr };
 			let guard = GenericTree::lock_coupling(&target_guard, c_swip, eg)?;
 			p_guard = Some((target_guard, pos));
 			target_guard = guard;
@@ -1119,14 +1164,29 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				let mut level = 1u16;
 
 				let leaf_guard = loop {
-					let (c_swip, pos) = match *target_guard {
-						Node::Internal(ref internal) => {
-							// Binary search for the correct child
-							let (pos, _) = internal.lower_bound(key);
-							let swip = internal.edge_at(pos)?;
-							(swip, pos)
+					// Descend via raw-pointer projection — never
+					// `*target_guard` — so we never form an `&Node` or
+					// `&InternalNode` reborrow that would dereference a
+					// transiently-null boxed key slot during a concurrent
+					// `shift_remove_raw` on an internal node.
+					let target_ptr = target_guard.as_ptr();
+					// SAFETY: `target_ptr` is owned by a HybridLatch we
+					// hold an optimistic guard on.
+					let (c_swip_ptr, pos) = match unsafe { Node::variant_raw(target_ptr) } {
+						NodeKindRaw::Internal(internal_ptr) => {
+							// SAFETY: pointer to `InternalNode` obtained
+							// via raw projection; `K: OptimisticRead`
+							// (impl bound) certifies the snapshot
+							// discipline. `lower_bound_raw` itself
+							// short-circuits on a null peek.
+							let (pos, _) =
+								unsafe { InternalNode::lower_bound_raw(internal_ptr, key) };
+							// SAFETY: same conditions as `lower_bound_raw`.
+							let swip_ptr =
+								unsafe { InternalNode::edge_at_raw(internal_ptr, pos)? };
+							(swip_ptr, pos)
 						}
-						Node::Leaf(ref _leaf) => {
+						NodeKindRaw::Leaf(_) => {
 							// Edge case: root is a leaf (single-node tree)
 							if let Some(tree_guard) = t_guard.take() {
 								tree_guard.recheck()?;
@@ -1149,6 +1209,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 							}
 						}
 					};
+
+					// `&Atomic` reborrow is sound: `Atomic` is interior-
+					// mutable (its load is an atomic op), so it does not
+					// retag against a concurrent writer's `&mut` on the
+					// surrounding node.
+					//
+					// SAFETY: `c_swip_ptr` is a valid `*const Atomic` for
+					// the parent guard's lifetime.
+					let c_swip = unsafe { &*c_swip_ptr };
 
 					// Check if next level is the leaf level.
 					//
@@ -1400,13 +1469,30 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				let mut level = 1u16;
 
 				let leaf_guard = loop {
-					let (c_swip, pos) = match *target_guard {
-						Node::Internal(ref internal) => {
-							let (pos, _) = internal.lower_bound(key);
-							let swip = internal.edge_at(pos)?;
-							(swip, pos)
+					// Descend via raw-pointer projection — see the matching
+					// note in `find_shared_leaf_and_optimistic_parent` —
+					// so a concurrent `shift_remove_raw` on an internal
+					// node cannot cause us to dereference a transiently
+					// null boxed key slot during binary search.
+					let target_ptr = target_guard.as_ptr();
+					// SAFETY: `target_ptr` is owned by a HybridLatch we
+					// hold an optimistic guard on.
+					let (c_swip_ptr, pos) = match unsafe { Node::variant_raw(target_ptr) } {
+						NodeKindRaw::Internal(internal_ptr) => {
+							// SAFETY: `internal_ptr` is a valid
+							// `*const InternalNode` for the optimistic
+							// guard's lifetime; `K: OptimisticRead`
+							// (impl bound) certifies the snapshot
+							// discipline. `lower_bound_raw` itself
+							// short-circuits on a null peek.
+							let (pos, _) =
+								unsafe { InternalNode::lower_bound_raw(internal_ptr, key) };
+							// SAFETY: same conditions as `lower_bound_raw`.
+							let swip_ptr =
+								unsafe { InternalNode::edge_at_raw(internal_ptr, pos)? };
+							(swip_ptr, pos)
 						}
-						Node::Leaf(ref _leaf) => {
+						NodeKindRaw::Leaf(_) => {
 							// Root is a leaf - upgrade to exclusive
 							if let Some(tree_guard) = t_guard.take() {
 								tree_guard.recheck()?;
@@ -1432,6 +1518,14 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 							}
 						}
 					};
+
+					// `&Atomic` reborrow is sound: `Atomic` is interior-
+					// mutable, so it does not retag against a concurrent
+					// writer's `&mut` on the surrounding node.
+					//
+					// SAFETY: `c_swip_ptr` is a valid `*const Atomic` for
+					// the parent guard's lifetime.
+					let c_swip = unsafe { &*c_swip_ptr };
 
 					// `Relaxed` is sufficient — see the matching note in
 					// `find_shared_leaf_and_optimistic_parent`. Correctness
