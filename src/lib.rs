@@ -836,12 +836,22 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		swip: &Atomic<HybridLatch<Node<K, V, IC, LC>>>,
 		eg: &'e epoch::Guard,
 	) -> error::Result<OptimisticGuard<'e, Node<K, V, IC, LC>>> {
-		// Step 1: Load the child pointer and dereference to get the latch
-		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
-		// before this reference is dropped. The swip is populated under the parent
+		// Step 1: Load the child pointer. `InternalNode::upper_edge` uses a
+		// null-pointer sentinel for "no upper edge" and the slot can be
+		// transiently null during a concurrent split / merge; treat a null
+		// load as a snapshot-validation failure (the parent's `recheck`
+		// below would catch the staleness anyway, but if we deref first
+		// we crash before getting there).
+		let shared = swip.load(Ordering::Acquire, eg);
+		if shared.is_null() {
+			std::hint::cold_path();
+			return Err(error::Error::Unwind);
+		}
+		// SAFETY: `shared` is non-null per the check above; `eg` is pinned,
+		// so the loaded `HybridLatch` cannot be reclaimed before this
+		// reference is dropped. The swip is populated under the parent
 		// latch before being made reachable by other threads.
-		// SAFETY: see the function-level safety contract.
-		let c_latch = unsafe { swip.load(Ordering::Acquire, eg).deref() };
+		let c_latch = unsafe { shared.deref() };
 
 		// Step 2: Acquire optimistic access to the child
 		let c_guard = c_latch.optimistic_or_spin();
@@ -863,10 +873,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		swip: &Atomic<HybridLatch<Node<K, V, IC, LC>>>,
 		eg: &'e epoch::Guard,
 	) -> error::Result<SharedGuard<'e, Node<K, V, IC, LC>>> {
-		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
-		// before `c_latch` is dropped.
-		// SAFETY: see the function-level safety contract.
-		let c_latch = unsafe { swip.load(Ordering::Acquire, eg).deref() };
+		// See `lock_coupling` for the null-load rationale.
+		let shared = swip.load(Ordering::Acquire, eg);
+		if shared.is_null() {
+			std::hint::cold_path();
+			return Err(error::Error::Unwind);
+		}
+		// SAFETY: `shared` is non-null; `eg` is pinned, so the loaded
+		// `HybridLatch` cannot be reclaimed before `c_latch` is dropped.
+		let c_latch = unsafe { shared.deref() };
 
 		// Acquire shared (blocking) access to the child
 		let c_guard = c_latch.shared();
@@ -886,10 +901,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		swip: &Atomic<HybridLatch<Node<K, V, IC, LC>>>,
 		eg: &'e epoch::Guard,
 	) -> error::Result<ExclusiveGuard<'e, Node<K, V, IC, LC>>> {
-		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
-		// before `c_latch` is dropped.
-		// SAFETY: see the function-level safety contract.
-		let c_latch = unsafe { swip.load(Ordering::Acquire, eg).deref() };
+		// See `lock_coupling` for the null-load rationale.
+		let shared = swip.load(Ordering::Acquire, eg);
+		if shared.is_null() {
+			std::hint::cold_path();
+			return Err(error::Error::Unwind);
+		}
+		// SAFETY: `shared` is non-null; `eg` is pinned, so the loaded
+		// `HybridLatch` cannot be reclaimed before `c_latch` is dropped.
+		let c_latch = unsafe { shared.deref() };
 
 		// Acquire exclusive (blocking) access to the child
 		let c_guard = c_latch.exclusive();
