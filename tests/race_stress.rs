@@ -426,18 +426,29 @@ fn t5_iterator_survival_and_lock_coupling_uaf_regression() {
 
 	// Iterator threads: each runs back-to-back scans over the
 	// writer-disjoint seeded band. Within that band the keyset is
-	// stable, so the iterator must emit exactly `0..SEEDED` in order
-	// every time — any deviation indicates either the UAF (memory
-	// corruption) or a descent-routing bug introduced by the recheck
-	// reordering.
+	// stable, so the iterator must emit `0..SEEDED` in order every
+	// time — any deviation in that prefix indicates either the UAF
+	// (memory corruption) or a descent-routing bug introduced by the
+	// recheck reordering.
+	//
+	// Use `Included(SEEDED - 1)` as the upper bound rather than
+	// `Excluded(SEEDED)`. Since `SEEDED` itself does not exist in the
+	// tree, `Range::new`'s missing-key upper-bound capture widens an
+	// `Excluded(SEEDED)` to "the next existing key after `SEEDED`" —
+	// which under churn is a writer-band key, and any keys that race
+	// into `[SEEDED, that_widened_key)` would legitimately pass the
+	// resulting bound check. `Included(SEEDED - 1)` pins the captured
+	// bound to a key that actually exists and is never touched by the
+	// writers, so the captured bound stays at `SEEDED - 1` regardless
+	// of writer timing.
+	let last_seeded = SEEDED - 1;
 	for _ in 0..2 {
 		let tree = Arc::clone(&tree);
 		let stop = Arc::clone(&stop);
 		handles.push(thread::spawn(move || {
 			while !stop.load(Ordering::Relaxed) {
 				let lo = 0u64;
-				let hi = SEEDED;
-				let mut range = tree.range(Bound::Included(&lo), Bound::Excluded(&hi));
+				let mut range = tree.range(Bound::Included(&lo), Bound::Included(&last_seeded));
 				let mut expected = 0u64;
 				while let Some((k, _)) = range.next() {
 					assert_eq!(
