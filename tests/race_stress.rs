@@ -440,7 +440,11 @@ fn t5_iterator_survival_and_lock_coupling_uaf_regression() {
 				let mut range = tree.range(Bound::Included(&lo), Bound::Excluded(&hi));
 				let mut expected = 0u64;
 				while let Some((k, _)) = range.next() {
-					assert_eq!(*k, expected, "iterator emitted {} where {} was expected", *k, expected);
+					assert_eq!(
+						*k, expected,
+						"iterator emitted {} where {} was expected",
+						*k, expected
+					);
 					expected += 1;
 				}
 				assert_eq!(expected, SEEDED, "iterator stopped early at {expected}");
