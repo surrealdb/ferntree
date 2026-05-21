@@ -529,12 +529,22 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		// Step 1: Acquire optimistic access to the tree's root pointer
 		let tree_guard = self.root.optimistic_or_spin();
 
-		// Step 2: Load the root node through the Atomic pointer
-		// SAFETY: `eg` is pinned for the lifetime of this borrow, so crossbeam-epoch
-		// cannot reclaim the loaded `HybridLatch` while we hold the reference. The
-		// root pointer is always non-null after `Tree::new` initialises it.
+		// Step 2: Load the root pointer, then validate `tree_guard` BEFORE
+		// dereferencing it. The deref-then-recheck ordering would be a
+		// `clear()`-race UAF analog of the `lock_coupling` bug in issue
+		// #14: a concurrent `clear()` swaps the root pointer under
+		// exclusive lock and `defer_destroy`s the old node, so a stale
+		// load + immediate deref could touch a `HybridLatch` whose `Box`
+		// has been freed by a later `crossbeam-epoch::collect`.
+		let shared = tree_guard.load(Ordering::Acquire, eg);
+		tree_guard.recheck()?;
+		// SAFETY: `recheck()` confirmed `self.root` has not been replaced
+		// since `tree_guard` was taken, so the loaded pointer still names
+		// the live root latch. `eg` is pinned for the lifetime of this
+		// reference. The root pointer is always non-null after `Tree::new`
+		// initialises it.
 		// SAFETY: see the function-level safety contract.
-		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+		let root_latch = unsafe { shared.deref() };
 		let root_latch_ptr = root_latch as *const _;
 
 		// Acquire optimistic access to the root node
@@ -704,10 +714,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	{
 		// Check if needle is the root (no siblings possible)
 		let tree_guard = self.root.optimistic_or_spin();
-		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
-		// for the lifetime of `root_latch`.
+		// Validate `tree_guard` BEFORE the deref — see `find_parent` for
+		// the clear-race UAF rationale (issue #14 analog).
+		let shared = tree_guard.load(Ordering::Acquire, eg);
+		tree_guard.recheck()?;
+		// SAFETY: `recheck()` confirmed `self.root` has not been replaced;
+		// `eg` is pinned, so the loaded `HybridLatch` is alive for the
+		// lifetime of `root_latch`.
 		// SAFETY: see the function-level safety contract.
-		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+		let root_latch = unsafe { shared.deref() };
 		let root_latch_ptr = root_latch as *const _;
 		let root_guard = root_latch.optimistic_or_spin();
 
@@ -1053,10 +1068,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	)> {
 		// Start from the root
 		let tree_guard = self.root.optimistic_or_spin();
-		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
-		// for the lifetime of `root_latch`.
+		// Validate `tree_guard` BEFORE deref — see `find_parent` for the
+		// clear-race UAF rationale (issue #14 analog).
+		let shared = tree_guard.load(Ordering::Acquire, eg);
+		tree_guard.recheck()?;
+		// SAFETY: `recheck()` confirmed `self.root` has not been replaced;
+		// `eg` is pinned, so the loaded `HybridLatch` is alive for the
+		// lifetime of `root_latch`.
 		// SAFETY: see the function-level safety contract.
-		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+		let root_latch = unsafe { shared.deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
 
@@ -1076,10 +1096,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	)> {
 		// Start from the root
 		let tree_guard = self.root.optimistic_or_spin();
-		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
-		// for the lifetime of `root_latch`.
+		// Validate `tree_guard` BEFORE deref — see `find_parent` for the
+		// clear-race UAF rationale (issue #14 analog).
+		let shared = tree_guard.load(Ordering::Acquire, eg);
+		tree_guard.recheck()?;
+		// SAFETY: `recheck()` confirmed `self.root` has not been replaced;
+		// `eg` is pinned, so the loaded `HybridLatch` is alive for the
+		// lifetime of `root_latch`.
 		// SAFETY: see the function-level safety contract.
-		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+		let root_latch = unsafe { shared.deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
 
@@ -1112,10 +1137,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	{
 		// Acquire access to the root
 		let tree_guard = self.root.optimistic_or_spin();
-		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
-		// for the lifetime of `root_latch`.
+		// Validate `tree_guard` BEFORE deref — see `find_parent` for the
+		// clear-race UAF rationale (issue #14 analog).
+		let shared = tree_guard.load(Ordering::Acquire, eg);
+		tree_guard.recheck()?;
+		// SAFETY: `recheck()` confirmed `self.root` has not been replaced;
+		// `eg` is pinned, so the loaded `HybridLatch` is alive for the
+		// lifetime of `root_latch`.
 		// SAFETY: see the function-level safety contract.
-		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+		let root_latch = unsafe { shared.deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
 
@@ -1231,10 +1261,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			let perform = || {
 				// Start traversal from root
 				let tree_guard = self.root.optimistic_or_spin();
-				// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be
-				// reclaimed for the lifetime of `root_latch`.
+				// Validate `tree_guard` BEFORE deref — see `find_parent`
+				// for the clear-race UAF rationale (issue #14 analog).
+				let shared = tree_guard.load(Ordering::Acquire, eg);
+				tree_guard.recheck()?;
+				// SAFETY: `recheck()` confirmed `self.root` has not been
+				// replaced; `eg` is pinned, so the loaded `HybridLatch` is
+				// alive for the lifetime of `root_latch`.
 				// SAFETY: see the function-level safety contract.
-				let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+				let root_latch = unsafe { shared.deref() };
 				let root_guard = root_latch.optimistic_or_spin();
 				tree_guard.recheck()?;
 
@@ -1381,10 +1416,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	{
 		// Start traversal from root
 		let tree_guard = self.root.optimistic_or_spin();
-		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be
-		// reclaimed for the lifetime of `root_latch`.
+		// Validate `tree_guard` BEFORE deref — see `find_parent` for the
+		// clear-race UAF rationale (issue #14 analog).
+		let shared = tree_guard.load(Ordering::Acquire, eg);
+		tree_guard.recheck()?;
+		// SAFETY: `recheck()` confirmed `self.root` has not been replaced;
+		// `eg` is pinned, so the loaded `HybridLatch` is alive for the
+		// lifetime of `root_latch`.
 		// SAFETY: see the function-level safety contract.
-		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+		let root_latch = unsafe { shared.deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
 
@@ -1536,10 +1576,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			let perform = || {
 				// Start traversal from root
 				let tree_guard = self.root.optimistic_or_spin();
-				// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be
-				// reclaimed for the lifetime of `root_latch`.
+				// Validate `tree_guard` BEFORE deref — see `find_parent`
+				// for the clear-race UAF rationale (issue #14 analog).
+				let shared = tree_guard.load(Ordering::Acquire, eg);
+				tree_guard.recheck()?;
+				// SAFETY: `recheck()` confirmed `self.root` has not been
+				// replaced; `eg` is pinned, so the loaded `HybridLatch` is
+				// alive for the lifetime of `root_latch`.
 				// SAFETY: see the function-level safety contract.
-				let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+				let root_latch = unsafe { shared.deref() };
 				let root_guard = root_latch.optimistic_or_spin();
 				tree_guard.recheck()?;
 
