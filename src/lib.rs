@@ -616,7 +616,19 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			// validates the parent before touching the latch.
 			let c_latch_ptr = c_swip.load(Ordering::Acquire, eg).as_raw();
 
-			// Check if this child IS the needle we're looking for
+			// Check if this child IS the needle we're looking for.
+			//
+			// ABA-safety: `eg` is pinned for the whole descent, and
+			// `crossbeam-epoch::defer_destroy` defers reclamation of any
+			// `HybridLatch` `Box` until every guard pinned at the
+			// destroy-time epoch has been released. While `eg` is live no
+			// detached latch's heap allocation can be freed and reused, so
+			// `std::ptr::eq` cannot coincidentally match a fresh latch
+			// allocated at the same address — either the load returned the
+			// needle's original latch (genuine match) or it returned a
+			// different live latch (different address, `ptr::eq` returns
+			// false). `target_guard.recheck()` below additionally validates
+			// the parent's snapshot before we commit to this answer.
 			if std::ptr::eq(needle.latch(), c_latch_ptr) {
 				// Found it! The current target_guard is the parent
 				target_guard.recheck()?;
