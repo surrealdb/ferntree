@@ -452,7 +452,15 @@ fn t5_iterator_survival_and_lock_coupling_uaf_regression() {
 		}));
 	}
 
-	thread::sleep(Duration::from_secs(STRESS_SECS));
+	// The pre-fix UAF in `lock_coupling_*` was reported as firing
+	// "1 in 5–10 runs" under ASan, so a 2-second budget (matching the
+	// rest of the file's `STRESS_SECS`) gives a regression a > 50%
+	// chance of *escaping* a single CI run. Quadruple it for this
+	// specific test so any reintroduction is caught with high
+	// confidence — and so the churn drives several full sliding-window
+	// passes through each writer's band rather than just the first.
+	const T5_STRESS_SECS: u64 = STRESS_SECS * 4;
+	thread::sleep(Duration::from_secs(T5_STRESS_SECS));
 	stop.store(true, Ordering::Release);
 	for h in handles {
 		h.join().unwrap();
