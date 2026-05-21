@@ -606,13 +606,14 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			// parent guard's lifetime.
 			let c_swip = unsafe { &*c_swip_ptr };
 
-			// Load the child node
-			// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
-			// before this reference is dropped. The swip is non-null because internal
-			// nodes always have populated child pointers for `pos <= len`.
-			// SAFETY: see the function-level safety contract.
-			let c_latch = unsafe { c_swip.load(Ordering::Acquire, eg).deref() };
-			let c_latch_ptr = c_latch as *const _;
+			// Load the child pointer for the needle-equality check. We use
+			// `as_raw` rather than `deref` here on purpose: this is a pure
+			// pointer comparison and dereferencing the loaded `Shared` would
+			// touch a potentially-freed `HybridLatch` *before* we get a
+			// chance to validate the parent's snapshot (issue #14). The
+			// actual deref happens inside `lock_coupling` below, which now
+			// validates the parent before touching the latch.
+			let c_latch_ptr = c_swip.load(Ordering::Acquire, eg).as_raw();
 
 			// Check if this child IS the needle we're looking for
 			if std::ptr::eq(needle.latch(), c_latch_ptr) {
@@ -847,17 +848,38 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			std::hint::cold_path();
 			return Err(error::Error::Unwind);
 		}
-		// SAFETY: `shared` is non-null per the check above; `eg` is pinned,
-		// so the loaded `HybridLatch` cannot be reclaimed before this
-		// reference is dropped. The swip is populated under the parent
-		// latch before being made reachable by other threads.
+
+		// Step 2: Validate the parent BEFORE dereferencing the child.
+		//
+		// This pre-deref recheck closes issue #14: if a concurrent (or
+		// earlier same-thread) writer has merged this child away under the
+		// parent's exclusive lock and `defer_destroy`d its `HybridLatch`,
+		// the parent's version has been bumped and `recheck()` will fail.
+		// Without this gate, the deref below would touch a latch that
+		// `crossbeam-epoch::collect` may have already freed — including the
+		// same-thread case where pinning a fresh epoch guard advanced the
+		// local epoch and ran `collect` on a prior op's deferred queue.
+		p_guard.recheck()?;
+
+		// SAFETY: `shared` is non-null per the check above; `recheck()` just
+		// confirmed the parent has not been modified since `p_guard` was
+		// taken, so the swip we loaded is still the current child pointer
+		// and that latch has not been unlinked + `defer_destroy`d. With `eg`
+		// pinned, the latch is alive for the lifetime of this reference.
 		let c_latch = unsafe { shared.deref() };
 
-		// Step 2: Acquire optimistic access to the child
+		// Step 3: Acquire optimistic access to the validated child
 		let c_guard = c_latch.optimistic_or_spin();
 
-		// Step 3: Validate the parent - ensures the child pointer was valid
-		// If parent changed, the child pointer might be stale
+		// Step 4: Re-validate the parent AFTER capturing the child snapshot.
+		//
+		// The pre-deref recheck only guarantees the deref was safe at that
+		// moment; between then and the `optimistic_or_spin` capture above a
+		// concurrent writer could have acquired the parent exclusively,
+		// detached this child, and bumped the parent's version. If that
+		// happened, our child snapshot is from a now-stale subtree — fail
+		// out and let the caller retry. (This second recheck is what the
+		// pre-fix code relied on; we keep it, just with the deref gated.)
 		p_guard.recheck()?;
 
 		Ok(c_guard)
@@ -879,14 +901,26 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			std::hint::cold_path();
 			return Err(error::Error::Unwind);
 		}
-		// SAFETY: `shared` is non-null; `eg` is pinned, so the loaded
-		// `HybridLatch` cannot be reclaimed before `c_latch` is dropped.
+
+		// Validate parent BEFORE dereferencing the child — see the matching
+		// note in `lock_coupling`. Skipping this gate exposes the descent to
+		// a use-after-free on a latch the same-thread writer-churn epoch
+		// race just freed (issue #14).
+		p_guard.recheck()?;
+
+		// SAFETY: `shared` is non-null and `recheck()` confirmed the swip is
+		// still the current child pointer; with `eg` pinned the latch is
+		// alive for the lifetime of `c_latch`.
 		let c_latch = unsafe { shared.deref() };
 
-		// Acquire shared (blocking) access to the child
+		// Acquire shared (blocking) access to the validated child
 		let c_guard = c_latch.shared();
 
-		// Validate parent after acquiring child lock
+		// Re-validate the parent after acquiring the child lock — see the
+		// matching note in `lock_coupling`. A writer can take parent
+		// exclusively, detach this child, and `defer_destroy` it during the
+		// `shared()` block; without this recheck we would return a lock on
+		// a detached subtree and the caller would mutate the tree off-path.
 		p_guard.recheck()?;
 
 		Ok(c_guard)
@@ -907,14 +941,29 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			std::hint::cold_path();
 			return Err(error::Error::Unwind);
 		}
-		// SAFETY: `shared` is non-null; `eg` is pinned, so the loaded
-		// `HybridLatch` cannot be reclaimed before `c_latch` is dropped.
+
+		// Validate parent BEFORE dereferencing the child — see the matching
+		// note in `lock_coupling`. Without this gate, an insert that follows
+		// a same-thread remove can deref (and `CAS`-spin on) a latch whose
+		// `Box` was freed by `crossbeam-epoch::collect` running during the
+		// insert's own `epoch::pin` (issue #14, t5 in `race_stress.rs`).
+		p_guard.recheck()?;
+
+		// SAFETY: `shared` is non-null and `recheck()` confirmed the swip is
+		// still the current child pointer; with `eg` pinned the latch is
+		// alive for the lifetime of `c_latch`.
 		let c_latch = unsafe { shared.deref() };
 
-		// Acquire exclusive (blocking) access to the child
+		// Acquire exclusive (blocking) access to the validated child
 		let c_guard = c_latch.exclusive();
 
-		// Validate parent after acquiring child lock
+		// Re-validate the parent after acquiring the child lock — see the
+		// matching note in `lock_coupling`. Without this second recheck a
+		// writer that took parent-exclusive during our `exclusive()` block
+		// can detach this child, leaving us with an exclusive lock on a
+		// node that is no longer reachable from the root; the caller's
+		// insert/remove would then mutate a detached subtree and the tree's
+		// sort invariant would be violated.
 		p_guard.recheck()?;
 
 		Ok(c_guard)
