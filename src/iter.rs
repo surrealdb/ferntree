@@ -2257,6 +2257,13 @@ impl<
 pub struct Range<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize> {
 	/// The underlying iterator.
 	iter: RawSharedIter<'t, K, V, IC, LC>,
+	/// The lower bound for iteration (owned).
+	///
+	/// The constructor's initial seek positions the cursor at or after this
+	/// bound, but a concurrent commit (sibling leaf merge between releasing
+	/// one shared lock and acquiring the next) can briefly move the cursor
+	/// back across it. So the bound is re-checked on every emit.
+	lower_bound: Bound<K>,
 	/// The upper bound for iteration (owned).
 	upper_bound: Bound<K>,
 	/// Whether we've finished iterating.
@@ -2309,22 +2316,69 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 			}
 		};
 
-		// Position the iterator based on the lower bound
-		match min {
-			Bound::Unbounded => iter.seek_to_first(),
-			Bound::Included(k) => iter.seek(k),
-			Bound::Excluded(k) => {
-				// Seek to the key, then skip it if it exists
-				if iter.seek_exact(k) {
-					let _ = iter.next(); // Skip the excluded key
+		// Position the iterator at the lower bound and capture an owned
+		// representation of that bound for defensive re-checks at every emit.
+		let lower_bound = match min {
+			Bound::Unbounded => {
+				iter.seek_to_first();
+				Bound::Unbounded
+			}
+			Bound::Included(k) => {
+				iter.seek(k);
+				match iter.peek() {
+					Some((key, _)) if key.borrow() == k => Bound::Included(key.clone()),
+					Some((key, _)) => {
+						// k doesn't exist; treat the first existing key >= k
+						// as the effective inclusive lower bound.
+						Bound::Included(key.clone())
+					}
+					None => Bound::Unbounded, // No keys at or after k.
 				}
 			}
-		}
+			Bound::Excluded(k) => {
+				// Seek to the key, then skip it if it exists.
+				if iter.seek_exact(k) {
+					let _ = iter.next();
+				}
+				match iter.peek() {
+					Some((key, _)) => Bound::Included(key.clone()),
+					None => Bound::Unbounded,
+				}
+			}
+		};
 
 		Range {
 			iter,
+			lower_bound,
 			upper_bound,
 			finished: false,
+		}
+	}
+
+	/// Advances the underlying iterator past any entries whose key is below
+	/// the requested lower bound.
+	///
+	/// Under concurrent commit pressure the raw iterator's leaf cursor can
+	/// briefly land before the seeked position (e.g. when a sibling leaf
+	/// merge is observed between releasing one shared lock and acquiring the
+	/// next). Skipping those entries here keeps the contract that the cursor
+	/// never emits keys outside `[lower_bound, upper_bound]`.
+	fn skip_below_lower(&mut self) {
+		loop {
+			// The peek borrow is dropped at the end of the statement, so we
+			// can call `iter.next()` below without conflicting with it.
+			let below = match self.iter.peek() {
+				Some((k, _)) => match &self.lower_bound {
+					Bound::Unbounded => false,
+					Bound::Included(min) => k < min,
+					Bound::Excluded(min) => k <= min,
+				},
+				None => return,
+			};
+			if !below {
+				return;
+			}
+			let _ = self.iter.next();
 		}
 	}
 
@@ -2337,7 +2391,10 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 		if self.finished {
 			return None;
 		}
-
+		// Defensively re-check the near bound before each emit; the raw
+		// iterator's seek-once positioning can be invalidated by concurrent
+		// leaf restructuring.
+		self.skip_below_lower();
 		match self.iter.next() {
 			Some((k, v)) => {
 				// Check if we've exceeded the upper bound
@@ -2397,7 +2454,8 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 		if self.finished {
 			return None;
 		}
-
+		// Defensively re-check the near bound before each emit.
+		self.skip_below_lower();
 		match self.iter.peek() {
 			Some((k, v)) => {
 				// Check if we've exceeded the upper bound
@@ -2453,6 +2511,12 @@ pub struct RangeRev<'t, K: OptimisticRead, V: OptimisticRead, const IC: usize, c
 	iter: RawSharedIter<'t, K, V, IC, LC>,
 	/// The lower bound for iteration (owned).
 	lower_bound: Bound<K>,
+	/// The upper bound for iteration (owned).
+	///
+	/// The constructor's `seek_for_prev` positions the cursor at or before
+	/// this bound, but a concurrent commit can briefly move the cursor past
+	/// it. So the bound is re-checked on every emit.
+	upper_bound: Bound<K>,
 	/// Whether we've finished iterating.
 	finished: bool,
 }
@@ -2504,12 +2568,25 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 			}
 		};
 
-		// Position the iterator based on the upper bound
-		match max {
-			Bound::Unbounded => iter.seek_to_last(),
+		// Position the iterator at the upper bound and capture an owned
+		// representation of that bound for defensive re-checks at every emit.
+		let upper_bound = match max {
+			Bound::Unbounded => {
+				iter.seek_to_last();
+				Bound::Unbounded
+			}
 			Bound::Included(k) => {
 				// Seek for prev positions so that prev() returns the largest key <= k
 				iter.seek_for_prev(k);
+				match iter.peek_prev() {
+					Some((key, _)) if key.borrow() == k => Bound::Included(key.clone()),
+					Some((key, _)) => {
+						// k doesn't exist; treat the largest existing key <= k
+						// as the effective inclusive upper bound.
+						Bound::Included(key.clone())
+					}
+					None => Bound::Unbounded, // No keys at or below k.
+				}
 			}
 			Bound::Excluded(k) => {
 				// Seek for prev, then we need to skip if we landed exactly on k
@@ -2520,13 +2597,45 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 						let _ = iter.prev(); // Skip the excluded key
 					}
 				}
+				match iter.peek_prev() {
+					Some((key, _)) => Bound::Included(key.clone()),
+					None => Bound::Unbounded,
+				}
 			}
-		}
+		};
 
 		RangeRev {
 			iter,
 			lower_bound,
+			upper_bound,
 			finished: false,
+		}
+	}
+
+	/// Moves the underlying iterator back past any entries whose key is above
+	/// the requested upper bound.
+	///
+	/// Under concurrent commit pressure the raw iterator's leaf cursor can
+	/// briefly land past the seeked position (e.g. when a sibling leaf merge
+	/// is observed between releasing one shared lock and acquiring the next).
+	/// Skipping those entries here keeps the contract that the cursor never
+	/// emits keys outside `[lower_bound, upper_bound]`.
+	fn skip_above_upper(&mut self) {
+		loop {
+			// The peek_prev borrow is dropped at the end of the statement, so
+			// we can call `iter.prev()` below without conflicting with it.
+			let above = match self.iter.peek_prev() {
+				Some((k, _)) => match &self.upper_bound {
+					Bound::Unbounded => false,
+					Bound::Included(max) => k > max,
+					Bound::Excluded(max) => k >= max,
+				},
+				None => return,
+			};
+			if !above {
+				return;
+			}
+			let _ = self.iter.prev();
 		}
 	}
 
@@ -2539,7 +2648,10 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 		if self.finished {
 			return None;
 		}
-
+		// Defensively re-check the near bound before each emit; the raw
+		// iterator's seek-once positioning can be invalidated by concurrent
+		// leaf restructuring.
+		self.skip_above_upper();
 		match self.iter.prev() {
 			Some((k, v)) => {
 				// Check if we've gone below the lower bound
@@ -2578,7 +2690,8 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 		if self.finished {
 			return None;
 		}
-
+		// Defensively re-check the near bound before each emit.
+		self.skip_above_upper();
 		match self.iter.peek_prev() {
 			Some((k, v)) => {
 				// Check if we've gone below the lower bound
