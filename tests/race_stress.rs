@@ -598,8 +598,8 @@ fn t8_internal_node_split_under_boxed_k_does_not_dangle_in_lower_bound_raw() {
 
 	let start = std::time::Instant::now();
 	while start.elapsed() < Duration::from_secs(STRESS_SECS) {
-		let mut range = tree
-			.range::<[u8]>(Bound::Included(beg.as_slice()), Bound::Excluded(end.as_slice()));
+		let mut range =
+			tree.range::<[u8]>(Bound::Included(beg.as_slice()), Bound::Excluded(end.as_slice()));
 		while range.next().is_some() {}
 	}
 

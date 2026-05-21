@@ -5089,8 +5089,7 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: us
 		// Remove the key at split_pos (it's being pushed to parent). The
 		// popped K may have an interior pointer being read by a concurrent
 		// optimistic descent; defer its drop through the epoch GC.
-		let popped_key =
-			self.keys.pop().expect("keys non-empty: split requires at least one key");
+		let popped_key = self.keys.pop().expect("keys non-empty: split requires at least one key");
 		optimistic::drop_or_defer(popped_key, eg);
 
 		// Set sample keys for node relocation. The pre-existing
