@@ -430,6 +430,48 @@ pub(crate) enum Direction {
 }
 
 // ---------------------------------------------------------------------------
+// Retry primitive
+// ---------------------------------------------------------------------------
+
+/// Retries `f` until it succeeds, applying a `spin_loop` hint between
+/// failed attempts.
+///
+/// This is the canonical retry shape for the tree's optimistic-descent
+/// and lookup paths: the closure runs an attempt, returning `Ok(t)` on
+/// success or `Err(Unwind)` when an optimistic snapshot was invalidated
+/// by concurrent writers. The `spin_loop` hint differentiates this
+/// helper from a raw `loop { … continue; }` — under heavy structural
+/// churn (writers repeatedly invalidating descents) the hint tells the
+/// CPU to back off on the memory bus and hyperthread sibling without
+/// stealing pipeline resources from the writer doing useful work.
+///
+/// We deliberately use `std::hint::spin_loop` rather than
+/// `parking_lot_core::SpinWait`. `SpinWait` escalates to
+/// `thread::yield_now()` after a small number of failed attempts;
+/// under producer-consumer workloads with bursty contention this
+/// yields the optimistic-reader to the OS scheduler often enough that
+/// it can be starved of CPU for the entire producer phase. The
+/// `spin_loop` hint stays in userspace and re-enters the closure
+/// immediately, which is what the optimistic-validation pattern
+/// actually wants: retry as soon as the contended snapshot might be
+/// stable again.
+#[inline]
+fn retry_optimistic<T, F>(mut f: F) -> T
+where
+	F: FnMut() -> error::Result<T>,
+{
+	loop {
+		match f() {
+			Ok(t) => return t,
+			Err(_) => {
+				std::hint::cold_path();
+				std::hint::spin_loop();
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // GenericTree Implementation
 // ---------------------------------------------------------------------------
 
@@ -529,12 +571,22 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		// Step 1: Acquire optimistic access to the tree's root pointer
 		let tree_guard = self.root.optimistic_or_spin();
 
-		// Step 2: Load the root node through the Atomic pointer
-		// SAFETY: `eg` is pinned for the lifetime of this borrow, so crossbeam-epoch
-		// cannot reclaim the loaded `HybridLatch` while we hold the reference. The
-		// root pointer is always non-null after `Tree::new` initialises it.
+		// Step 2: Load the root pointer, then validate `tree_guard` BEFORE
+		// dereferencing it. The deref-then-recheck ordering would be a
+		// `clear()`-race UAF analog of the `lock_coupling` bug in issue
+		// #14: a concurrent `clear()` swaps the root pointer under
+		// exclusive lock and `defer_destroy`s the old node, so a stale
+		// load + immediate deref could touch a `HybridLatch` whose `Box`
+		// has been freed by a later `crossbeam-epoch::collect`.
+		let shared = tree_guard.load(Ordering::Acquire, eg);
+		tree_guard.recheck()?;
+		// SAFETY: `recheck()` confirmed `self.root` has not been replaced
+		// since `tree_guard` was taken, so the loaded pointer still names
+		// the live root latch. `eg` is pinned for the lifetime of this
+		// reference. The root pointer is always non-null after `Tree::new`
+		// initialises it.
 		// SAFETY: see the function-level safety contract.
-		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+		let root_latch = unsafe { shared.deref() };
 		let root_latch_ptr = root_latch as *const _;
 
 		// Acquire optimistic access to the root node
@@ -606,15 +658,29 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			// parent guard's lifetime.
 			let c_swip = unsafe { &*c_swip_ptr };
 
-			// Load the child node
-			// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
-			// before this reference is dropped. The swip is non-null because internal
-			// nodes always have populated child pointers for `pos <= len`.
-			// SAFETY: see the function-level safety contract.
-			let c_latch = unsafe { c_swip.load(Ordering::Acquire, eg).deref() };
-			let c_latch_ptr = c_latch as *const _;
+			// Load the child pointer for the needle-equality check. We use
+			// `as_raw` rather than `deref` here on purpose: this is a pure
+			// pointer comparison and dereferencing the loaded `Shared` would
+			// touch a potentially-freed `HybridLatch` *before* we get a
+			// chance to validate the parent's snapshot (issue #14). On a
+			// pointer match we break out without ever derefing this slot;
+			// on a mismatch the descent calls `lock_coupling` below, which
+			// validates the parent before touching the latch.
+			let c_latch_ptr = c_swip.load(Ordering::Acquire, eg).as_raw();
 
-			// Check if this child IS the needle we're looking for
+			// Check if this child IS the needle we're looking for.
+			//
+			// ABA-safety: `eg` is pinned for the whole descent, and
+			// `crossbeam-epoch::defer_destroy` defers reclamation of any
+			// `HybridLatch` `Box` until every guard pinned at the
+			// destroy-time epoch has been released. While `eg` is live no
+			// detached latch's heap allocation can be freed and reused, so
+			// `std::ptr::eq` cannot coincidentally match a fresh latch
+			// allocated at the same address — either the load returned the
+			// needle's original latch (genuine match) or it returned a
+			// different live latch (different address, `ptr::eq` returns
+			// false). `target_guard.recheck()` below additionally validates
+			// the parent's snapshot before we commit to this answer.
 			if std::ptr::eq(needle.latch(), c_latch_ptr) {
 				// Found it! The current target_guard is the parent
 				target_guard.recheck()?;
@@ -690,10 +756,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	{
 		// Check if needle is the root (no siblings possible)
 		let tree_guard = self.root.optimistic_or_spin();
-		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
-		// for the lifetime of `root_latch`.
+		// Validate `tree_guard` BEFORE the deref — see `find_parent` for
+		// the clear-race UAF rationale (issue #14 analog).
+		let shared = tree_guard.load(Ordering::Acquire, eg);
+		tree_guard.recheck()?;
+		// SAFETY: `recheck()` confirmed `self.root` has not been replaced;
+		// `eg` is pinned, so the loaded `HybridLatch` is alive for the
+		// lifetime of `root_latch`.
 		// SAFETY: see the function-level safety contract.
-		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+		let root_latch = unsafe { shared.deref() };
 		let root_latch_ptr = root_latch as *const _;
 		let root_guard = root_latch.optimistic_or_spin();
 
@@ -847,17 +918,38 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			std::hint::cold_path();
 			return Err(error::Error::Unwind);
 		}
-		// SAFETY: `shared` is non-null per the check above; `eg` is pinned,
-		// so the loaded `HybridLatch` cannot be reclaimed before this
-		// reference is dropped. The swip is populated under the parent
-		// latch before being made reachable by other threads.
+
+		// Step 2: Validate the parent BEFORE dereferencing the child.
+		//
+		// This pre-deref recheck closes issue #14: if a concurrent (or
+		// earlier same-thread) writer has merged this child away under the
+		// parent's exclusive lock and `defer_destroy`d its `HybridLatch`,
+		// the parent's version has been bumped and `recheck()` will fail.
+		// Without this gate, the deref below would touch a latch that
+		// `crossbeam-epoch::collect` may have already freed — including the
+		// same-thread case where pinning a fresh epoch guard advanced the
+		// local epoch and ran `collect` on a prior op's deferred queue.
+		p_guard.recheck()?;
+
+		// SAFETY: `shared` is non-null per the check above; `recheck()` just
+		// confirmed the parent has not been modified since `p_guard` was
+		// taken, so the swip we loaded is still the current child pointer
+		// and that latch has not been unlinked + `defer_destroy`d. With `eg`
+		// pinned, the latch is alive for the lifetime of this reference.
 		let c_latch = unsafe { shared.deref() };
 
-		// Step 2: Acquire optimistic access to the child
+		// Step 3: Acquire optimistic access to the validated child
 		let c_guard = c_latch.optimistic_or_spin();
 
-		// Step 3: Validate the parent - ensures the child pointer was valid
-		// If parent changed, the child pointer might be stale
+		// Step 4: Re-validate the parent AFTER capturing the child snapshot.
+		//
+		// The pre-deref recheck only guarantees the deref was safe at that
+		// moment; between then and the `optimistic_or_spin` capture above a
+		// concurrent writer could have acquired the parent exclusively,
+		// detached this child, and bumped the parent's version. If that
+		// happened, our child snapshot is from a now-stale subtree — fail
+		// out and let the caller retry. (This second recheck is what the
+		// pre-fix code relied on; we keep it, just with the deref gated.)
 		p_guard.recheck()?;
 
 		Ok(c_guard)
@@ -879,14 +971,26 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			std::hint::cold_path();
 			return Err(error::Error::Unwind);
 		}
-		// SAFETY: `shared` is non-null; `eg` is pinned, so the loaded
-		// `HybridLatch` cannot be reclaimed before `c_latch` is dropped.
+
+		// Validate parent BEFORE dereferencing the child — see the matching
+		// note in `lock_coupling`. Skipping this gate exposes the descent to
+		// a use-after-free on a latch the same-thread writer-churn epoch
+		// race just freed (issue #14).
+		p_guard.recheck()?;
+
+		// SAFETY: `shared` is non-null and `recheck()` confirmed the swip is
+		// still the current child pointer; with `eg` pinned the latch is
+		// alive for the lifetime of `c_latch`.
 		let c_latch = unsafe { shared.deref() };
 
-		// Acquire shared (blocking) access to the child
+		// Acquire shared (blocking) access to the validated child
 		let c_guard = c_latch.shared();
 
-		// Validate parent after acquiring child lock
+		// Re-validate the parent after acquiring the child lock — see the
+		// matching note in `lock_coupling`. A writer can take parent
+		// exclusively, detach this child, and `defer_destroy` it during the
+		// `shared()` block; without this recheck we would return a lock on
+		// a detached subtree and the caller would mutate the tree off-path.
 		p_guard.recheck()?;
 
 		Ok(c_guard)
@@ -907,14 +1011,29 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 			std::hint::cold_path();
 			return Err(error::Error::Unwind);
 		}
-		// SAFETY: `shared` is non-null; `eg` is pinned, so the loaded
-		// `HybridLatch` cannot be reclaimed before `c_latch` is dropped.
+
+		// Validate parent BEFORE dereferencing the child — see the matching
+		// note in `lock_coupling`. Without this gate, an insert that follows
+		// a same-thread remove can deref (and `CAS`-spin on) a latch whose
+		// `Box` was freed by `crossbeam-epoch::collect` running during the
+		// insert's own `epoch::pin` (issue #14, t5 in `race_stress.rs`).
+		p_guard.recheck()?;
+
+		// SAFETY: `shared` is non-null and `recheck()` confirmed the swip is
+		// still the current child pointer; with `eg` pinned the latch is
+		// alive for the lifetime of `c_latch`.
 		let c_latch = unsafe { shared.deref() };
 
-		// Acquire exclusive (blocking) access to the child
+		// Acquire exclusive (blocking) access to the validated child
 		let c_guard = c_latch.exclusive();
 
-		// Validate parent after acquiring child lock
+		// Re-validate the parent after acquiring the child lock — see the
+		// matching note in `lock_coupling`. Without this second recheck a
+		// writer that took parent-exclusive during our `exclusive()` block
+		// can detach this child, leaving us with an exclusive lock on a
+		// node that is no longer reachable from the root; the caller's
+		// insert/remove would then mutate a detached subtree and the tree's
+		// sort invariant would be violated.
 		p_guard.recheck()?;
 
 		Ok(c_guard)
@@ -991,10 +1110,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	)> {
 		// Start from the root
 		let tree_guard = self.root.optimistic_or_spin();
-		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
-		// for the lifetime of `root_latch`.
+		// Validate `tree_guard` BEFORE deref — see `find_parent` for the
+		// clear-race UAF rationale (issue #14 analog).
+		let shared = tree_guard.load(Ordering::Acquire, eg);
+		tree_guard.recheck()?;
+		// SAFETY: `recheck()` confirmed `self.root` has not been replaced;
+		// `eg` is pinned, so the loaded `HybridLatch` is alive for the
+		// lifetime of `root_latch`.
 		// SAFETY: see the function-level safety contract.
-		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+		let root_latch = unsafe { shared.deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
 
@@ -1014,10 +1138,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	)> {
 		// Start from the root
 		let tree_guard = self.root.optimistic_or_spin();
-		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
-		// for the lifetime of `root_latch`.
+		// Validate `tree_guard` BEFORE deref — see `find_parent` for the
+		// clear-race UAF rationale (issue #14 analog).
+		let shared = tree_guard.load(Ordering::Acquire, eg);
+		tree_guard.recheck()?;
+		// SAFETY: `recheck()` confirmed `self.root` has not been replaced;
+		// `eg` is pinned, so the loaded `HybridLatch` is alive for the
+		// lifetime of `root_latch`.
 		// SAFETY: see the function-level safety contract.
-		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+		let root_latch = unsafe { shared.deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
 
@@ -1050,10 +1179,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	{
 		// Acquire access to the root
 		let tree_guard = self.root.optimistic_or_spin();
-		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be reclaimed
-		// for the lifetime of `root_latch`.
+		// Validate `tree_guard` BEFORE deref — see `find_parent` for the
+		// clear-race UAF rationale (issue #14 analog).
+		let shared = tree_guard.load(Ordering::Acquire, eg);
+		tree_guard.recheck()?;
+		// SAFETY: `recheck()` confirmed `self.root` has not been replaced;
+		// `eg` is pinned, so the loaded `HybridLatch` is alive for the
+		// lifetime of `root_latch`.
 		// SAFETY: see the function-level safety contract.
-		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+		let root_latch = unsafe { shared.deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
 
@@ -1164,133 +1298,137 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		K: Borrow<Q> + Ord,
 		Q: ?Sized + Ord,
 	{
-		// Retry loop for optimistic validation failures
-		loop {
-			let perform = || {
-				// Start traversal from root
-				let tree_guard = self.root.optimistic_or_spin();
-				// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be
-				// reclaimed for the lifetime of `root_latch`.
-				// SAFETY: see the function-level safety contract.
-				let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
-				let root_guard = root_latch.optimistic_or_spin();
-				tree_guard.recheck()?;
+		// `retry_optimistic` retries on validation failure with
+		// `SpinWait` backoff — the uncontended fast path pays nothing.
+		retry_optimistic(|| {
+			// Start traversal from root
+			let tree_guard = self.root.optimistic_or_spin();
+			// Validate `tree_guard` BEFORE deref — see `find_parent`
+			// for the clear-race UAF rationale (issue #14 analog).
+			let shared = tree_guard.load(Ordering::Acquire, eg);
+			tree_guard.recheck()?;
+			// SAFETY: `recheck()` confirmed `self.root` has not been
+			// replaced; `eg` is pinned, so the loaded `HybridLatch` is
+			// alive for the lifetime of `root_latch`.
+			// SAFETY: see the function-level safety contract.
+			let root_latch = unsafe { shared.deref() };
+			let root_guard = root_latch.optimistic_or_spin();
+			tree_guard.recheck()?;
 
-				let mut t_guard = Some(tree_guard);
-				let mut p_guard = None;
-				let mut target_guard = root_guard;
+			let mut t_guard = Some(tree_guard);
+			let mut p_guard = None;
+			let mut target_guard = root_guard;
 
-				// Track current level to know when we're about to reach leaves
-				let mut level = 1u16;
+			// Track current level to know when we're about to reach leaves
+			let mut level = 1u16;
 
-				let leaf_guard = loop {
-					// Descend via raw-pointer projection — never
-					// `*target_guard` — so we never form an `&Node` or
-					// `&InternalNode` reborrow that would dereference a
-					// transiently-null boxed key slot during a concurrent
-					// `shift_remove_raw` on an internal node.
-					let target_ptr = target_guard.as_ptr();
-					// SAFETY: `target_ptr` is owned by a HybridLatch we
-					// hold an optimistic guard on.
-					let (c_swip_ptr, pos) = match unsafe { Node::variant_raw(target_ptr) } {
-						NodeKindRaw::Internal(internal_ptr) => {
-							// SAFETY: pointer to `InternalNode` obtained
-							// via raw projection; `K: OptimisticRead`
-							// (impl bound) certifies the snapshot
-							// discipline. `lower_bound_raw` itself
-							// short-circuits on a null peek.
-							let (pos, _) =
-								unsafe { InternalNode::lower_bound_raw(internal_ptr, key) };
-							// SAFETY: same conditions as `lower_bound_raw`.
-							let swip_ptr = unsafe { InternalNode::edge_at_raw(internal_ptr, pos)? };
-							(swip_ptr, pos)
-						}
-						NodeKindRaw::Leaf(_) => {
-							// Edge case: root is a leaf (single-node tree)
-							if let Some(tree_guard) = t_guard.take() {
-								tree_guard.recheck()?;
-							}
-
-							if p_guard.is_none() {
-								// Root is the only node - upgrade to shared lock
-								break target_guard.to_shared()?;
-							} else {
-								// Concurrent height shrink: the tree
-								// collapsed a level between our
-								// initial `height` load and this
-								// descent, so the optimistic walk
-								// ended up at a leaf with a parent
-								// still set. Treat as a snapshot
-								// failure and retry rather than
-								// panicking on a benign race.
-								std::hint::cold_path();
-								return Err(error::Error::Unwind);
-							}
-						}
-					};
-
-					// `&Atomic` reborrow is sound: `Atomic` is interior-
-					// mutable (its load is an atomic op), so it does not
-					// retag against a concurrent writer's `&mut` on the
-					// surrounding node.
-					//
-					// SAFETY: `c_swip_ptr` is a valid `*const Atomic` for
-					// the parent guard's lifetime.
-					let c_swip = unsafe { &*c_swip_ptr };
-
-					// Check if next level is the leaf level.
-					//
-					// `Relaxed` is sufficient here: correctness of the
-					// optimistic-to-shared transition is ultimately gated by
-					// the parent's version `recheck()` performed inside
-					// `lock_coupling_shared` / `lock_coupling`. A stale
-					// height load either causes us to take a shared lock on
-					// an internal node (which then fails the leaf-pattern
-					// match and triggers retry) or an optimistic lock on a
-					// leaf (which is sound for OptimisticRead values but
-					// would fall through to the post-loop assertion for the
-					// shared path — so we ALSO validate the height after
-					// reading it by relying on the parent recheck). Either
-					// way the structural change is detected and the
-					// operation retries.
-					if (level + 1) as usize == self.height.load(Ordering::Relaxed) {
-						// About to access leaf - use shared lock coupling
+			let leaf_guard = loop {
+				// Descend via raw-pointer projection — never
+				// `*target_guard` — so we never form an `&Node` or
+				// `&InternalNode` reborrow that would dereference a
+				// transiently-null boxed key slot during a concurrent
+				// `shift_remove_raw` on an internal node.
+				let target_ptr = target_guard.as_ptr();
+				// SAFETY: `target_ptr` is owned by a HybridLatch we
+				// hold an optimistic guard on.
+				let (c_swip_ptr, pos) = match unsafe { Node::variant_raw(target_ptr) } {
+					NodeKindRaw::Internal(internal_ptr) => {
+						// SAFETY: pointer to `InternalNode` obtained
+						// via raw projection; `K: OptimisticRead`
+						// (impl bound) certifies the snapshot
+						// discipline. `lower_bound_raw` itself
+						// short-circuits on a null peek.
+						let (pos, _) = unsafe { InternalNode::lower_bound_raw(internal_ptr, key) };
+						// SAFETY: same conditions as `lower_bound_raw`.
+						let swip_ptr = unsafe { InternalNode::edge_at_raw(internal_ptr, pos)? };
+						(swip_ptr, pos)
+					}
+					NodeKindRaw::Leaf(_) => {
+						// Edge case: root is a leaf (single-node tree)
 						if let Some(tree_guard) = t_guard.take() {
 							tree_guard.recheck()?;
 						}
 
-						// Acquire shared lock on the leaf
-						let guard = Self::lock_coupling_shared(&target_guard, c_swip, eg)?;
-						p_guard = Some((target_guard, pos));
-
-						break guard;
-					} else {
-						// Still in internal nodes - use optimistic lock coupling
-						let guard = GenericTree::lock_coupling(&target_guard, c_swip, eg)?;
-						p_guard = Some((target_guard, pos));
-						target_guard = guard;
-
-						if let Some(tree_guard) = t_guard.take() {
-							tree_guard.recheck()?;
+						if p_guard.is_none() {
+							// Root is the only node - upgrade to shared lock
+							break target_guard.to_shared()?;
+						} else {
+							// Concurrent height shrink: the tree
+							// collapsed a level between our
+							// initial `height` load and this
+							// descent, so the optimistic walk
+							// ended up at a leaf with a parent
+							// still set. Treat as a snapshot
+							// failure and retry rather than
+							// panicking on a benign race.
+							std::hint::cold_path();
+							return Err(error::Error::Unwind);
 						}
-
-						level += 1;
 					}
 				};
 
-				error::Result::Ok((leaf_guard, p_guard))
+				// `&Atomic` reborrow is sound: `Atomic` is interior-
+				// mutable (its load is an atomic op), so it does not
+				// retag against a concurrent writer's `&mut` on the
+				// surrounding node.
+				//
+				// SAFETY: `c_swip_ptr` is a valid `*const Atomic` for
+				// the parent guard's lifetime.
+				let c_swip = unsafe { &*c_swip_ptr };
+				// Prefetch the child latch's first cache line while the
+				// branch below decides between shared / optimistic lock
+				// coupling. The pre-deref recheck added for issue #14
+				// adds an extra `Acquire` load on the parent's version
+				// to this iteration; the prefetch hides most of that
+				// cost by warming the child latch's cache line in
+				// parallel. A `Relaxed` load is sufficient — this is a
+				// hint, not a fence; if it tears we prefetch the wrong
+				// address and the CPU silently drops it.
+				let prefetch_target = c_swip.load(Ordering::Relaxed, eg).as_raw();
+				prefetch::read_data(prefetch_target);
+
+				// Check if next level is the leaf level.
+				//
+				// `Relaxed` is sufficient here: correctness of the
+				// optimistic-to-shared transition is ultimately gated by
+				// the parent's version `recheck()` performed inside
+				// `lock_coupling_shared` / `lock_coupling`. A stale
+				// height load either causes us to take a shared lock on
+				// an internal node (which then fails the leaf-pattern
+				// match and triggers retry) or an optimistic lock on a
+				// leaf (which is sound for OptimisticRead values but
+				// would fall through to the post-loop assertion for the
+				// shared path — so we ALSO validate the height after
+				// reading it by relying on the parent recheck). Either
+				// way the structural change is detected and the
+				// operation retries.
+				if (level + 1) as usize == self.height.load(Ordering::Relaxed) {
+					// About to access leaf - use shared lock coupling
+					if let Some(tree_guard) = t_guard.take() {
+						tree_guard.recheck()?;
+					}
+
+					// Acquire shared lock on the leaf
+					let guard = Self::lock_coupling_shared(&target_guard, c_swip, eg)?;
+					p_guard = Some((target_guard, pos));
+
+					break guard;
+				} else {
+					// Still in internal nodes - use optimistic lock coupling
+					let guard = GenericTree::lock_coupling(&target_guard, c_swip, eg)?;
+					p_guard = Some((target_guard, pos));
+					target_guard = guard;
+
+					if let Some(tree_guard) = t_guard.take() {
+						tree_guard.recheck()?;
+					}
+
+					level += 1;
+				}
 			};
 
-			match perform() {
-				Ok(tup) => {
-					return tup;
-				}
-				Err(_) => {
-					// Validation failed - retry from beginning
-					continue;
-				}
-			}
-		}
+			error::Result::Ok((leaf_guard, p_guard))
+		})
 	}
 
 	/// Descends to the leaf that should contain `key` using **only optimistic
@@ -1319,10 +1457,15 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	{
 		// Start traversal from root
 		let tree_guard = self.root.optimistic_or_spin();
-		// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be
-		// reclaimed for the lifetime of `root_latch`.
+		// Validate `tree_guard` BEFORE deref — see `find_parent` for the
+		// clear-race UAF rationale (issue #14 analog).
+		let shared = tree_guard.load(Ordering::Acquire, eg);
+		tree_guard.recheck()?;
+		// SAFETY: `recheck()` confirmed `self.root` has not been replaced;
+		// `eg` is pinned, so the loaded `HybridLatch` is alive for the
+		// lifetime of `root_latch`.
 		// SAFETY: see the function-level safety contract.
-		let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
+		let root_latch = unsafe { shared.deref() };
 		let root_guard = root_latch.optimistic_or_spin();
 		tree_guard.recheck()?;
 
@@ -1405,24 +1548,13 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		eg: &'e epoch::Guard,
 	) -> (SharedGuard<'e, Node<K, V, IC, LC>>, Option<(OptimisticGuard<'e, Node<K, V, IC, LC>>, u16)>)
 	{
-		loop {
-			let perform = || {
-				// Find first leaf with optimistic traversal
-				let (leaf, parent_opt) = self.find_first_leaf_and_parent(eg)?;
-				// Upgrade to shared lock
-				let shared_leaf = leaf.to_shared()?;
-				error::Result::Ok((shared_leaf, parent_opt))
-			};
-
-			match perform() {
-				Ok(tup) => {
-					return tup;
-				}
-				Err(_) => {
-					continue;
-				}
-			}
-		}
+		retry_optimistic(|| {
+			// Find first leaf with optimistic traversal
+			let (leaf, parent_opt) = self.find_first_leaf_and_parent(eg)?;
+			// Upgrade to shared lock
+			let shared_leaf = leaf.to_shared()?;
+			error::Result::Ok((shared_leaf, parent_opt))
+		})
 	}
 
 	/// Finds the last leaf and acquires a shared lock.
@@ -1433,24 +1565,13 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		eg: &'e epoch::Guard,
 	) -> (SharedGuard<'e, Node<K, V, IC, LC>>, Option<(OptimisticGuard<'e, Node<K, V, IC, LC>>, u16)>)
 	{
-		loop {
-			let perform = || {
-				// Find last leaf with optimistic traversal
-				let (leaf, parent_opt) = self.find_last_leaf_and_parent(eg)?;
-				// Upgrade to shared lock
-				let shared_leaf = leaf.to_shared()?;
-				error::Result::Ok((shared_leaf, parent_opt))
-			};
-
-			match perform() {
-				Ok(tup) => {
-					return tup;
-				}
-				Err(_) => {
-					continue;
-				}
-			}
-		}
+		retry_optimistic(|| {
+			// Find last leaf with optimistic traversal
+			let (leaf, parent_opt) = self.find_last_leaf_and_parent(eg)?;
+			// Upgrade to shared lock
+			let shared_leaf = leaf.to_shared()?;
+			error::Result::Ok((shared_leaf, parent_opt))
+		})
 	}
 
 	/// Finds a leaf by key and acquires an exclusive lock on it.
@@ -1470,119 +1591,116 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		K: Borrow<Q> + Ord,
 		Q: ?Sized + Ord,
 	{
-		loop {
-			let perform = || {
-				// Start traversal from root
-				let tree_guard = self.root.optimistic_or_spin();
-				// SAFETY: `eg` is pinned, so the loaded `HybridLatch` cannot be
-				// reclaimed for the lifetime of `root_latch`.
-				// SAFETY: see the function-level safety contract.
-				let root_latch = unsafe { tree_guard.load(Ordering::Acquire, eg).deref() };
-				let root_guard = root_latch.optimistic_or_spin();
-				tree_guard.recheck()?;
+		retry_optimistic(|| {
+			// Start traversal from root
+			let tree_guard = self.root.optimistic_or_spin();
+			// Validate `tree_guard` BEFORE deref — see `find_parent`
+			// for the clear-race UAF rationale (issue #14 analog).
+			let shared = tree_guard.load(Ordering::Acquire, eg);
+			tree_guard.recheck()?;
+			// SAFETY: `recheck()` confirmed `self.root` has not been
+			// replaced; `eg` is pinned, so the loaded `HybridLatch` is
+			// alive for the lifetime of `root_latch`.
+			// SAFETY: see the function-level safety contract.
+			let root_latch = unsafe { shared.deref() };
+			let root_guard = root_latch.optimistic_or_spin();
+			tree_guard.recheck()?;
 
-				let mut t_guard = Some(tree_guard);
-				let mut p_guard = None;
-				let mut target_guard = root_guard;
+			let mut t_guard = Some(tree_guard);
+			let mut p_guard = None;
+			let mut target_guard = root_guard;
 
-				let mut level = 1u16;
+			let mut level = 1u16;
 
-				let leaf_guard = loop {
-					// Descend via raw-pointer projection — see the matching
-					// note in `find_shared_leaf_and_optimistic_parent` —
-					// so a concurrent `shift_remove_raw` on an internal
-					// node cannot cause us to dereference a transiently
-					// null boxed key slot during binary search.
-					let target_ptr = target_guard.as_ptr();
-					// SAFETY: `target_ptr` is owned by a HybridLatch we
-					// hold an optimistic guard on.
-					let (c_swip_ptr, pos) = match unsafe { Node::variant_raw(target_ptr) } {
-						NodeKindRaw::Internal(internal_ptr) => {
-							// SAFETY: `internal_ptr` is a valid
-							// `*const InternalNode` for the optimistic
-							// guard's lifetime; `K: OptimisticRead`
-							// (impl bound) certifies the snapshot
-							// discipline. `lower_bound_raw` itself
-							// short-circuits on a null peek.
-							let (pos, _) =
-								unsafe { InternalNode::lower_bound_raw(internal_ptr, key) };
-							// SAFETY: same conditions as `lower_bound_raw`.
-							let swip_ptr = unsafe { InternalNode::edge_at_raw(internal_ptr, pos)? };
-							(swip_ptr, pos)
-						}
-						NodeKindRaw::Leaf(_) => {
-							// Root is a leaf - upgrade to exclusive
-							if let Some(tree_guard) = t_guard.take() {
-								tree_guard.recheck()?;
-							}
-
-							if p_guard.is_none() {
-								break target_guard.to_exclusive()?;
-							} else {
-								// We descended through internal nodes
-								// and unexpectedly landed on a leaf —
-								// concurrent height shrink between our
-								// initial `height.load(Relaxed)` and the
-								// next iteration can leave the
-								// optimistic descent one level "too
-								// deep". Treat as a snapshot-validation
-								// failure and retry; the parent's
-								// version check would have caught it
-								// anyway, but doing it explicitly here
-								// keeps us from panicking on a benign
-								// race.
-								std::hint::cold_path();
-								return Err(error::Error::Unwind);
-							}
-						}
-					};
-
-					// `&Atomic` reborrow is sound: `Atomic` is interior-
-					// mutable, so it does not retag against a concurrent
-					// writer's `&mut` on the surrounding node.
-					//
-					// SAFETY: `c_swip_ptr` is a valid `*const Atomic` for
-					// the parent guard's lifetime.
-					let c_swip = unsafe { &*c_swip_ptr };
-
-					// `Relaxed` is sufficient — see the matching note in
-					// `find_shared_leaf_and_optimistic_parent`. Correctness
-					// is gated by the parent's `recheck()`.
-					if (level + 1) as usize == self.height.load(Ordering::Relaxed) {
-						// About to access leaf - use exclusive lock coupling
+			let leaf_guard = loop {
+				// Descend via raw-pointer projection — see the matching
+				// note in `find_shared_leaf_and_optimistic_parent` —
+				// so a concurrent `shift_remove_raw` on an internal
+				// node cannot cause us to dereference a transiently
+				// null boxed key slot during binary search.
+				let target_ptr = target_guard.as_ptr();
+				// SAFETY: `target_ptr` is owned by a HybridLatch we
+				// hold an optimistic guard on.
+				let (c_swip_ptr, pos) = match unsafe { Node::variant_raw(target_ptr) } {
+					NodeKindRaw::Internal(internal_ptr) => {
+						// SAFETY: `internal_ptr` is a valid
+						// `*const InternalNode` for the optimistic
+						// guard's lifetime; `K: OptimisticRead`
+						// (impl bound) certifies the snapshot
+						// discipline. `lower_bound_raw` itself
+						// short-circuits on a null peek.
+						let (pos, _) = unsafe { InternalNode::lower_bound_raw(internal_ptr, key) };
+						// SAFETY: same conditions as `lower_bound_raw`.
+						let swip_ptr = unsafe { InternalNode::edge_at_raw(internal_ptr, pos)? };
+						(swip_ptr, pos)
+					}
+					NodeKindRaw::Leaf(_) => {
+						// Root is a leaf - upgrade to exclusive
 						if let Some(tree_guard) = t_guard.take() {
 							tree_guard.recheck()?;
 						}
 
-						let guard = Self::lock_coupling_exclusive(&target_guard, c_swip, eg)?;
-						p_guard = Some((target_guard, pos));
-
-						break guard;
-					} else {
-						let guard = GenericTree::lock_coupling(&target_guard, c_swip, eg)?;
-						p_guard = Some((target_guard, pos));
-						target_guard = guard;
-
-						if let Some(tree_guard) = t_guard.take() {
-							tree_guard.recheck()?;
+						if p_guard.is_none() {
+							break target_guard.to_exclusive()?;
+						} else {
+							// We descended through internal nodes
+							// and unexpectedly landed on a leaf —
+							// concurrent height shrink between our
+							// initial `height.load(Relaxed)` and the
+							// next iteration can leave the
+							// optimistic descent one level "too
+							// deep". Treat as a snapshot-validation
+							// failure and retry; the parent's
+							// version check would have caught it
+							// anyway, but doing it explicitly here
+							// keeps us from panicking on a benign
+							// race.
+							std::hint::cold_path();
+							return Err(error::Error::Unwind);
 						}
-
-						level += 1;
 					}
 				};
 
-				error::Result::Ok((leaf_guard, p_guard))
+				// `&Atomic` reborrow is sound: `Atomic` is interior-
+				// mutable, so it does not retag against a concurrent
+				// writer's `&mut` on the surrounding node.
+				//
+				// SAFETY: `c_swip_ptr` is a valid `*const Atomic` for
+				// the parent guard's lifetime.
+				let c_swip = unsafe { &*c_swip_ptr };
+				// Prefetch the child latch — see the matching note in
+				// `find_shared_leaf_and_optimistic_parent`.
+				let prefetch_target = c_swip.load(Ordering::Relaxed, eg).as_raw();
+				prefetch::read_data(prefetch_target);
+
+				// `Relaxed` is sufficient — see the matching note in
+				// `find_shared_leaf_and_optimistic_parent`. Correctness
+				// is gated by the parent's `recheck()`.
+				if (level + 1) as usize == self.height.load(Ordering::Relaxed) {
+					// About to access leaf - use exclusive lock coupling
+					if let Some(tree_guard) = t_guard.take() {
+						tree_guard.recheck()?;
+					}
+
+					let guard = Self::lock_coupling_exclusive(&target_guard, c_swip, eg)?;
+					p_guard = Some((target_guard, pos));
+
+					break guard;
+				} else {
+					let guard = GenericTree::lock_coupling(&target_guard, c_swip, eg)?;
+					p_guard = Some((target_guard, pos));
+					target_guard = guard;
+
+					if let Some(tree_guard) = t_guard.take() {
+						tree_guard.recheck()?;
+					}
+
+					level += 1;
+				}
 			};
 
-			match perform() {
-				Ok(tup) => {
-					return tup;
-				}
-				Err(_) => {
-					continue;
-				}
-			}
-		}
+			error::Result::Ok((leaf_guard, p_guard))
+		})
 	}
 
 	/// Finds a leaf containing an exact key match and acquires exclusive lock.
@@ -1602,76 +1720,65 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		K: Borrow<Q> + Ord,
 		Q: ?Sized + Ord,
 	{
-		loop {
-			let perform = || {
-				// Find the leaf that would contain the key
-				let (leaf, parent_opt) = self.find_leaf_and_parent(key, eg)?;
+		retry_optimistic(|| {
+			// Find the leaf that would contain the key
+			let (leaf, parent_opt) = self.find_leaf_and_parent(key, eg)?;
 
-				// Check if the key actually exists in this leaf — via
-				// raw-pointer projection rather than an `&LeafNode`
-				// reborrow. Going through `as_leaf()` here would call
-				// the safe-`&self` `lower_bound`, whose `load_into`
-				// dereferences the boxed slot's raw pointer without
-				// null-checking — and a concurrent `shift_remove_raw`
-				// on the same leaf transiently null-stores intermediate
-				// slots before incrementing the writer's epoch. The
-				// raw-pointer path uses `try_load_into_raw` and bails
-				// out via `Err(Unwind)` on a torn read.
-				let node_ptr = leaf.as_ptr();
-				// SAFETY: `leaf` is an `OptimisticGuard` whose pointer
-				// is valid for the guard's lifetime; the variant
-				// discriminant is validated by the `recheck` below
-				// (or by `to_exclusive`).
-				let leaf_ptr = match unsafe { Node::variant_raw(node_ptr) } {
-					NodeKindRaw::Leaf(l) => l,
-					NodeKindRaw::Internal(_) => {
-						// Torn discriminant under a concurrent
-						// structural change — retry.
-						std::hint::cold_path();
-						return Err(error::Error::Unwind);
-					}
-				};
-				// SAFETY: `leaf_ptr` is a valid `*const LeafNode` for
-				// the optimistic guard's lifetime; `K: OptimisticRead`
-				// (impl bound) certifies the bitwise-snapshot
-				// comparison discipline. `lower_bound_raw` itself
-				// short-circuits on a null peek.
-				let (_, exact) = unsafe { LeafNode::lower_bound_raw(leaf_ptr, key) };
-
-				if exact {
-					// Key tentatively found. Upgrade to exclusive
-					// lock to stabilise the leaf, then re-locate the
-					// key under the stable view — the optimistic
-					// position can be stale if a concurrent writer
-					// moved keys between the snapshot and the upgrade.
-					let exclusive_leaf = leaf.to_exclusive()?;
-					let (pos, exact) = exclusive_leaf.as_leaf().lower_bound(key);
-					if !exact {
-						// Concurrent remove of the same key; report
-						// "not found" rather than retry — that is
-						// the visible outcome of a serialised remove
-						// race anyway.
-						return error::Result::Ok(None);
-					}
-					error::Result::Ok(Some(((exclusive_leaf, pos), parent_opt)))
-				} else {
-					// Validate the negative result. If the optimistic
-					// read saw a torn snapshot, `recheck` will fail and
-					// we'll retry; otherwise the key really is absent.
-					leaf.recheck()?;
-					error::Result::Ok(None)
+			// Check if the key actually exists in this leaf — via
+			// raw-pointer projection rather than an `&LeafNode`
+			// reborrow. Going through `as_leaf()` here would call
+			// the safe-`&self` `lower_bound`, whose `load_into`
+			// dereferences the boxed slot's raw pointer without
+			// null-checking — and a concurrent `shift_remove_raw`
+			// on the same leaf transiently null-stores intermediate
+			// slots before incrementing the writer's epoch. The
+			// raw-pointer path uses `try_load_into_raw` and bails
+			// out via `Err(Unwind)` on a torn read.
+			let node_ptr = leaf.as_ptr();
+			// SAFETY: `leaf` is an `OptimisticGuard` whose pointer
+			// is valid for the guard's lifetime; the variant
+			// discriminant is validated by the `recheck` below
+			// (or by `to_exclusive`).
+			let leaf_ptr = match unsafe { Node::variant_raw(node_ptr) } {
+				NodeKindRaw::Leaf(l) => l,
+				NodeKindRaw::Internal(_) => {
+					// Torn discriminant under a concurrent
+					// structural change — retry.
+					std::hint::cold_path();
+					return Err(error::Error::Unwind);
 				}
 			};
+			// SAFETY: `leaf_ptr` is a valid `*const LeafNode` for
+			// the optimistic guard's lifetime; `K: OptimisticRead`
+			// (impl bound) certifies the bitwise-snapshot
+			// comparison discipline. `lower_bound_raw` itself
+			// short-circuits on a null peek.
+			let (_, exact) = unsafe { LeafNode::lower_bound_raw(leaf_ptr, key) };
 
-			match perform() {
-				Ok(opt) => {
-					return opt;
+			if exact {
+				// Key tentatively found. Upgrade to exclusive
+				// lock to stabilise the leaf, then re-locate the
+				// key under the stable view — the optimistic
+				// position can be stale if a concurrent writer
+				// moved keys between the snapshot and the upgrade.
+				let exclusive_leaf = leaf.to_exclusive()?;
+				let (pos, exact) = exclusive_leaf.as_leaf().lower_bound(key);
+				if !exact {
+					// Concurrent remove of the same key; report
+					// "not found" rather than retry — that is
+					// the visible outcome of a serialised remove
+					// race anyway.
+					return error::Result::Ok(None);
 				}
-				Err(_) => {
-					continue;
-				}
+				error::Result::Ok(Some(((exclusive_leaf, pos), parent_opt)))
+			} else {
+				// Validate the negative result. If the optimistic
+				// read saw a torn snapshot, `recheck` will fail and
+				// we'll retry; otherwise the key really is absent.
+				leaf.recheck()?;
+				error::Result::Ok(None)
 			}
-		}
+		})
 	}
 
 	/// Finds the first leaf and acquires an exclusive lock.
@@ -1682,22 +1789,11 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		ExclusiveGuard<'e, Node<K, V, IC, LC>>,
 		Option<(OptimisticGuard<'e, Node<K, V, IC, LC>>, u16)>,
 	) {
-		loop {
-			let perform = || {
-				let (leaf, parent_opt) = self.find_first_leaf_and_parent(eg)?;
-				let exclusive_leaf = leaf.to_exclusive()?;
-				error::Result::Ok((exclusive_leaf, parent_opt))
-			};
-
-			match perform() {
-				Ok(tup) => {
-					return tup;
-				}
-				Err(_) => {
-					continue;
-				}
-			}
-		}
+		retry_optimistic(|| {
+			let (leaf, parent_opt) = self.find_first_leaf_and_parent(eg)?;
+			let exclusive_leaf = leaf.to_exclusive()?;
+			error::Result::Ok((exclusive_leaf, parent_opt))
+		})
 	}
 
 	/// Finds the last leaf and acquires an exclusive lock.
@@ -1708,22 +1804,11 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 		ExclusiveGuard<'e, Node<K, V, IC, LC>>,
 		Option<(OptimisticGuard<'e, Node<K, V, IC, LC>>, u16)>,
 	) {
-		loop {
-			let perform = || {
-				let (leaf, parent_opt) = self.find_last_leaf_and_parent(eg)?;
-				let exclusive_leaf = leaf.to_exclusive()?;
-				error::Result::Ok((exclusive_leaf, parent_opt))
-			};
-
-			match perform() {
-				Ok(tup) => {
-					return tup;
-				}
-				Err(_) => {
-					continue;
-				}
-			}
-		}
+		retry_optimistic(|| {
+			let (leaf, parent_opt) = self.find_last_leaf_and_parent(eg)?;
+			let exclusive_leaf = leaf.to_exclusive()?;
+			error::Result::Ok((exclusive_leaf, parent_opt))
+		})
 	}
 
 	// -----------------------------------------------------------------------
@@ -1858,50 +1943,39 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	{
 		let eg = &epoch::pin();
 
-		// Retry loop for optimistic validation failures
-		loop {
-			let perform = || -> error::Result<bool> {
-				let leaf_guard = self.find_optimistic_leaf(key, eg)?;
+		// `retry_optimistic` retries on validation failure with
+		// `SpinWait` backoff — the uncontended fast path pays nothing.
+		retry_optimistic(|| -> error::Result<bool> {
+			let leaf_guard = self.find_optimistic_leaf(key, eg)?;
 
-				// Raw-pointer projection: no `&Node` / `&LeafNode`
-				// reborrow on the optimistic descent path. See
-				// `Node::variant_raw` + `LeafNode::lower_bound_raw`.
-				let node_ptr = leaf_guard.as_ptr();
-				// SAFETY: `leaf_guard` is an OptimisticGuard on the
-				// HybridLatch holding this Node; the raw discriminant
-				// read is validated by `recheck()` below.
-				// SAFETY: see the function-level safety contract.
-				let leaf_ptr = match unsafe { Node::variant_raw(node_ptr) } {
-					NodeKindRaw::Leaf(l) => l,
-					NodeKindRaw::Internal(_) => {
-						// Possible under a torn discriminant; recheck
-						// will fail and we'll retry.
-						std::hint::cold_path();
-						return Err(error::Error::Unwind);
-					}
-				};
-
-				// SAFETY: leaf_ptr is a valid pointer for the lifetime
-				// of the optimistic guard. K: OptimisticRead certifies
-				// the comparison snapshot discipline.
-				// SAFETY: see the function-level safety contract.
-				let (_, exact) = unsafe { LeafNode::lower_bound_raw(leaf_ptr, key) };
-
-				// Validate the descent and the position we observed.
-				leaf_guard.recheck()?;
-				Ok(exact)
+			// Raw-pointer projection: no `&Node` / `&LeafNode`
+			// reborrow on the optimistic descent path. See
+			// `Node::variant_raw` + `LeafNode::lower_bound_raw`.
+			let node_ptr = leaf_guard.as_ptr();
+			// SAFETY: `leaf_guard` is an OptimisticGuard on the
+			// HybridLatch holding this Node; the raw discriminant
+			// read is validated by `recheck()` below.
+			// SAFETY: see the function-level safety contract.
+			let leaf_ptr = match unsafe { Node::variant_raw(node_ptr) } {
+				NodeKindRaw::Leaf(l) => l,
+				NodeKindRaw::Internal(_) => {
+					// Possible under a torn discriminant; recheck
+					// will fail and we'll retry.
+					std::hint::cold_path();
+					return Err(error::Error::Unwind);
+				}
 			};
 
-			match perform() {
-				Ok(result) => return result,
-				Err(_) => {
-					// Retry is the cold path — in the uncontended case
-					// the first attempt succeeds.
-					std::hint::cold_path();
-					continue;
-				}
-			}
-		}
+			// SAFETY: leaf_ptr is a valid pointer for the lifetime
+			// of the optimistic guard. K: OptimisticRead certifies
+			// the comparison snapshot discipline.
+			// SAFETY: see the function-level safety contract.
+			let (_, exact) = unsafe { LeafNode::lower_bound_raw(leaf_ptr, key) };
+
+			// Validate the descent and the position we observed.
+			leaf_guard.recheck()?;
+			Ok(exact)
+		})
 	}
 
 	/// Looks up a value using the optimistic read fast path.
@@ -1950,100 +2024,90 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	{
 		let eg = &epoch::pin();
 
-		// Retry loop for optimistic validation failures
-		loop {
-			let perform = || -> error::Result<Option<R>> {
-				let leaf_guard = self.find_optimistic_leaf(key, eg)?;
+		// `retry_optimistic` retries on validation failure with
+		// `SpinWait` backoff — the uncontended fast path pays nothing.
+		retry_optimistic(|| -> error::Result<Option<R>> {
+			let leaf_guard = self.find_optimistic_leaf(key, eg)?;
 
-				// Raw-pointer projection — never `*leaf_guard` to `&Node`
-				// or `&LeafNode`, so no retag races with a concurrent
-				// writer.
-				let node_ptr = leaf_guard.as_ptr();
-				// SAFETY: leaf_guard is an OptimisticGuard on the
-				// HybridLatch holding this Node.
-				// SAFETY: see the function-level safety contract.
-				let leaf_ptr = match unsafe { Node::variant_raw(node_ptr) } {
-					NodeKindRaw::Leaf(l) => l,
-					NodeKindRaw::Internal(_) => {
-						std::hint::cold_path();
-						return Err(error::Error::Unwind);
-					}
-				};
-
-				// SAFETY: see `LeafNode::lower_bound_raw`. K: OptimisticRead
-				// certifies the binary-search snapshot discipline.
-				// SAFETY: see the function-level safety contract.
-				let (pos, exact) = unsafe { LeafNode::lower_bound_raw(leaf_ptr, key) };
-
-				if !exact {
-					// Validate that the negative result is real.
-					leaf_guard.recheck()?;
-					return Ok(None);
-				}
-
-				// Bound by the compile-time capacity LC since `len` may be
-				// inconsistent under concurrent mutation. We have
-				// `pos <= LC` because `lower_bound_raw`'s `upper` is
-				// bounded by `len.min(LC)`.
-				if (pos as usize) >= LC {
+			// Raw-pointer projection — never `*leaf_guard` to `&Node`
+			// or `&LeafNode`, so no retag races with a concurrent
+			// writer.
+			let node_ptr = leaf_guard.as_ptr();
+			// SAFETY: leaf_guard is an OptimisticGuard on the
+			// HybridLatch holding this Node.
+			// SAFETY: see the function-level safety contract.
+			let leaf_ptr = match unsafe { Node::variant_raw(node_ptr) } {
+				NodeKindRaw::Leaf(l) => l,
+				NodeKindRaw::Internal(_) => {
+					std::hint::cold_path();
 					return Err(error::Error::Unwind);
 				}
-
-				// Atomic load from the leaf's atomic mirror via raw-
-				// pointer projection (no `&LeafNode` reborrow). For
-				// boxed-storage V, `try_load_raw` performs
-				// `AtomicPtr::load(Acquire)` and clones through the
-				// pointer; for inline-storage V, it does an atomic-sized
-				// load of V's bits. Either way, the load synchronises
-				// with the writer's `Release` store in `swap_init` /
-				// `shift_*`, so Miri's data-race detector is satisfied.
-				// `try_load` returns `None` if the slot was concurrently
-				// emptied (boxed null pointer), which we treat as a
-				// recheck-must-retry condition.
-				//
-				// SAFETY: `leaf_ptr` is valid for the lifetime of the
-				// optimistic guard; `values` is a `SlotArray<…,
-				// LC>` at a known field offset; `pos < LC` checked.
-				let values_ptr: *const SlotArray<V::Slot, LC> =
-					// SAFETY: see the function-level safety contract.
-					unsafe { ptr::addr_of!((*leaf_ptr).values) };
-				// SAFETY: see the function-level safety contract.
-				let snapshot: V = match unsafe { SlotArray::try_load_raw(values_ptr, pos as usize) }
-				{
-					Some(v) => v,
-					None => {
-						// Slot was concurrently emptied; retry.
-						std::hint::cold_path();
-						return Err(error::Error::Unwind);
-					}
-				};
-
-				// Validate that the snapshot is internally consistent
-				// (i.e. no concurrent writer touched the leaf between
-				// our binary search and the atomic load above).
-				if let Err(err) = leaf_guard.recheck() {
-					core::mem::forget(snapshot);
-					return Err(err);
-				}
-
-				// The snapshot is validated. Hand a borrow to the user
-				// closure. For boxed storage `snapshot` is a Clone of
-				// the boxed V (its drop releases the cloned heap
-				// allocation); for inline storage `snapshot` is a copy
-				// of the V's bits (drop is a no-op).
-				let result = f(&snapshot);
-				drop(snapshot);
-				Ok(Some(result))
 			};
 
-			match perform() {
-				Ok(result) => return result,
-				Err(_) => {
-					std::hint::cold_path();
-					continue;
-				}
+			// SAFETY: see `LeafNode::lower_bound_raw`. K: OptimisticRead
+			// certifies the binary-search snapshot discipline.
+			// SAFETY: see the function-level safety contract.
+			let (pos, exact) = unsafe { LeafNode::lower_bound_raw(leaf_ptr, key) };
+
+			if !exact {
+				// Validate that the negative result is real.
+				leaf_guard.recheck()?;
+				return Ok(None);
 			}
-		}
+
+			// Bound by the compile-time capacity LC since `len` may be
+			// inconsistent under concurrent mutation. We have
+			// `pos <= LC` because `lower_bound_raw`'s `upper` is
+			// bounded by `len.min(LC)`.
+			if (pos as usize) >= LC {
+				return Err(error::Error::Unwind);
+			}
+
+			// Atomic load from the leaf's atomic mirror via raw-
+			// pointer projection (no `&LeafNode` reborrow). For
+			// boxed-storage V, `try_load_raw` performs
+			// `AtomicPtr::load(Acquire)` and clones through the
+			// pointer; for inline-storage V, it does an atomic-sized
+			// load of V's bits. Either way, the load synchronises
+			// with the writer's `Release` store in `swap_init` /
+			// `shift_*`, so Miri's data-race detector is satisfied.
+			// `try_load` returns `None` if the slot was concurrently
+			// emptied (boxed null pointer), which we treat as a
+			// recheck-must-retry condition.
+			//
+			// SAFETY: `leaf_ptr` is valid for the lifetime of the
+			// optimistic guard; `values` is a `SlotArray<…,
+			// LC>` at a known field offset; `pos < LC` checked.
+			let values_ptr: *const SlotArray<V::Slot, LC> =
+				// SAFETY: see the function-level safety contract.
+				unsafe { ptr::addr_of!((*leaf_ptr).values) };
+			// SAFETY: see the function-level safety contract.
+			let snapshot: V = match unsafe { SlotArray::try_load_raw(values_ptr, pos as usize) } {
+				Some(v) => v,
+				None => {
+					// Slot was concurrently emptied; retry.
+					std::hint::cold_path();
+					return Err(error::Error::Unwind);
+				}
+			};
+
+			// Validate that the snapshot is internally consistent
+			// (i.e. no concurrent writer touched the leaf between
+			// our binary search and the atomic load above).
+			if let Err(err) = leaf_guard.recheck() {
+				core::mem::forget(snapshot);
+				return Err(err);
+			}
+
+			// The snapshot is validated. Hand a borrow to the user
+			// closure. For boxed storage `snapshot` is a Clone of
+			// the boxed V (its drop releases the cloned heap
+			// allocation); for inline storage `snapshot` is a copy
+			// of the V's bits (drop is a no-op).
+			let result = f(&snapshot);
+			drop(snapshot);
+			Ok(Some(result))
+		})
 	}
 
 	/// Returns a clone of the value corresponding to the key.
@@ -3503,25 +3567,18 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 	pub fn is_empty(&self) -> bool {
 		let eg = epoch::pin();
 
-		loop {
-			let perform = || {
-				// Find the first (leftmost) leaf in the tree
-				let (leaf_guard, _parent_opt) = self.find_first_leaf_and_parent(&eg)?;
+		retry_optimistic(|| {
+			// Find the first (leftmost) leaf in the tree
+			let (leaf_guard, _parent_opt) = self.find_first_leaf_and_parent(&eg)?;
 
-				// Check if the first leaf has any entries
-				let is_empty = leaf_guard.as_leaf().len.load() == 0;
+			// Check if the first leaf has any entries
+			let is_empty = leaf_guard.as_leaf().len.load() == 0;
 
-				// Validate our optimistic read
-				leaf_guard.recheck()?;
+			// Validate our optimistic read
+			leaf_guard.recheck()?;
 
-				error::Result::Ok(is_empty)
-			};
-
-			match perform() {
-				Ok(result) => return result,
-				Err(_) => continue, // Retry on validation failure
-			}
-		}
+			error::Result::Ok(is_empty)
+		})
 	}
 }
 

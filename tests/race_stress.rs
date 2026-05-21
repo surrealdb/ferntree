@@ -14,10 +14,12 @@
 //! 4. `pop_first` + `pop_last` simultaneous contention — both edges of
 //!    the tree under contention at once, verifying no entry is observed
 //!    twice or lost.
-//! 5. (Iterator survival across full-tree turnover — left intentionally
-//!    SKIPPED; see the long comment near `t5_…` for the
-//!    `lock_coupling_exclusive` UAF that makes any reasonable workload
-//!    for this pattern flaky under stress. Worth its own follow-up.)
+//! 5. Iterator survival across full-tree turnover — long-lived range
+//!    iterators must stay memory-safe and terminate cleanly while
+//!    writer threads drive sustained insert/remove churn. Also serves
+//!    as the regression test for issue #14 (the `lock_coupling_*`
+//!    deref-before-recheck UAF the same churn pattern previously
+//!    tripped).
 //! 6. `clear()` while iterating — clear() vs live iterators must not
 //!    crash, and the iterator's emitted sequence must stay sorted within
 //!    a single scan.
@@ -28,7 +30,7 @@
 //!    writers split internal nodes must not memcmp through a freed
 //!    `Vec<u8>` buffer.
 //!
-//! Tests 1, 3, 4, 6, 7 use *inline* `K` types (u64 / u32) so they don't
+//! Tests 1, 3, 4, 5, 6, 7 use *inline* `K` types (u64 / u32) so they don't
 //! trip the latent boxed-K UAF in `InternalNode::lower_bound_raw`.
 //! Test 8 covers that UAF specifically (issue #15) using `Vec<u8>` keys.
 //! Boxed `V` is used only in test 2 and only via `insert_defer` /
@@ -72,16 +74,9 @@ fn prefix_range(ix: u8, kind: u8) -> (u64, u64) {
 	(lo, hi)
 }
 
-// Note on writer intensity: we use a *finite* drain/refill budget per
-// writer and only two writer threads, rather than running until a
-// wall-clock deadline. Under heavier insert/remove pressure (more
-// writers or unbounded duration) this test reliably trips the
-// pre-existing `lock_coupling_exclusive` UAF documented in t5's
-// comment — every additional writer makes the writer-vs-writer epoch
-// race more likely to fire. Two writers × four cycles is enough to
-// drive plenty of leaf merges (the merge being what differentiates
-// this test from the insert-only `scan_out_of_range` reverse case)
-// without crossing into the UAF region.
+// Two writers × four drain/refill cycles is enough to drive plenty of
+// leaf merges — the merge being what differentiates this test from the
+// insert-only `scan_out_of_range` reverse case.
 #[test]
 fn t1_reverse_scan_under_merge_heavy_churn_emits_only_in_range() {
 	let tree = Arc::new(Tree::<u64, ()>::new());
@@ -369,39 +364,127 @@ fn t4_concurrent_pop_first_and_pop_last_partition_the_tree() {
 }
 
 // ===========================================================================
-// 5. Iterator survival across tree turnover — SKIPPED.
+// 5. Iterator survival under writer-churn epoch race (issue #14 regression)
 // ===========================================================================
 //
-// The pattern we want to test is: a long-lived `range(Unbounded,
-// Unbounded)` iterator must terminate cleanly and stay memory-safe even
-// when concurrent writers turn keys over beneath it. Adding that test
-// (in any form) reliably trips a pre-existing latent UAF in the
-// optimistic-descent path under sustained insert/remove churn:
+// Two patterns at once, both of which used to trip the pre-fix UAF in
+// `lock_coupling_*`'s `load → deref → lock → recheck` ordering:
 //
-// 1. Writer T does `tree.remove(k)`. `remove_entry` pins epoch eg1.
-//    A leaf-merge inside the function `defer_destroy`s the absorbed
-//    sibling's `HybridLatch`. eg1 is dropped on return.
-// 2. T calls `tree.insert(n, n)`. `raw_iter_mut` pins epoch eg2.
-//    Pinning eg2 advances T's local epoch and runs `collect()`, which
-//    drops the Box<HybridLatch> deferred under eg1.
-// 3. T's optimistic descent loads a parent swip whose snapshot still
-//    points to the just-freed HybridLatch (the parent was updated in
-//    step 1, but optimistic snapshot semantics permit the load to
-//    return the pre-update pointer; the parent's `recheck` would catch
-//    that — but only after `lock_coupling_exclusive` derefs the swip
-//    and calls `.exclusive()` on the latch, which is where the UAF
-//    actually fires).
+//   a) Same-thread `insert` + `remove` churn — every writer alternates
+//      bursts of inserts and removes from a single thread. `remove`'s
+//      `try_merge` registers a `defer_destroy` on the absorbed
+//      sibling's `HybridLatch`; the next `insert`'s `epoch::pin`
+//      advances the writer's local epoch and runs `collect`, freeing
+//      the deferred latch *during* the descent that's about to deref
+//      it. Pre-fix this is the heap-use-after-free reported in #14.
 //
-// That bug is orthogonal to anything in this PR (it predates the
-// raw-pointer-projection commit, and it has nothing to do with range
-// bounds, boxed K, or boxed V). Triggering it from a test in this PR
-// would mask the change under test; fixing it requires reordering the
-// optimistic-descent contract to `load → recheck → access` instead of
-// `load → access → recheck`, which is its own change.
+//   b) Long-lived `range` iterator running across a band the writers
+//      don't touch — has to stay memory-safe and terminate cleanly
+//      even while the rest of the tree is churning.
 //
-// The iterator-survival pattern is left as a follow-up — see the
-// `latch.rs:192 -> lock_coupling_exclusive` ASan reports captured
-// while developing this PR.
+// With the fix (recheck before deref in `lock_coupling*`), both must
+// run cleanly under ASan with no `lock_coupling_exclusive` UAFs. The
+// iterator scans a writer-disjoint band so this test isolates the
+// fix under verification — sort-order behaviour of `range` across a
+// writer-touched key (i.e. anchor recovery when the anchored key has
+// been concurrently removed) is its own story and not what #14 is
+// about.
+
+#[test]
+fn t5_iterator_survival_and_lock_coupling_uaf_regression() {
+	const SEEDED: u64 = 4_096;
+	const WRITER_BASE: u64 = 10_000_000;
+	let tree = Arc::new(Tree::<u64, u64>::new());
+	for i in 0..SEEDED {
+		tree.insert(i, i);
+	}
+
+	let stop = Arc::new(AtomicBool::new(false));
+	let mut handles = Vec::new();
+
+	// Three writers driving the exact insert+remove pattern from
+	// issue #14 — bursts of inserts followed by removes from the same
+	// thread, so each writer interleaves `defer_destroy` + `epoch::pin`
+	// on its own local queue. Writer bands sit well above the seeded
+	// range so the iterator below sees a stable keyset.
+	for w in 0..3u64 {
+		let tree = Arc::clone(&tree);
+		let stop = Arc::clone(&stop);
+		handles.push(thread::spawn(move || {
+			let mut n = WRITER_BASE + w * 1_000_000;
+			while !stop.load(Ordering::Relaxed) {
+				for _ in 0..256 {
+					tree.insert(n, n);
+					n = n.wrapping_add(1);
+				}
+				for k in n.wrapping_sub(512)..n.wrapping_sub(256) {
+					tree.remove(&k);
+				}
+			}
+		}));
+	}
+
+	// Iterator threads: each runs back-to-back scans over the
+	// writer-disjoint seeded band. The pre-fix UAF was a hard crash
+	// (`HybridLatch::exclusive` CAS-spinning on freed memory), so the
+	// regression signal we care about is "iterator threads complete
+	// without panicking". Anchor recovery under sustained
+	// internal-node churn isn't strong enough to guarantee a strict
+	// `0..SEEDED` emission order (a writer-side internal-node split
+	// can momentarily route the descent to a sibling subtree before
+	// the next recheck fires the retry), but that's an iterator
+	// semantics question — orthogonal to #14 — so this test stays
+	// focused on "doesn't crash" and "doesn't emit anything outside
+	// the requested bound".
+	//
+	// Use `Included(SEEDED - 1)` as the upper bound rather than
+	// `Excluded(SEEDED)`. Since `SEEDED` itself does not exist in the
+	// tree, `Range::new`'s missing-key upper-bound capture widens an
+	// `Excluded(SEEDED)` to "the next existing key after `SEEDED`" —
+	// which under churn is a writer-band key — and the resulting
+	// bound check would no longer fence off writer keys. Pinning the
+	// bound to `SEEDED - 1` (which exists for the lifetime of the
+	// test) keeps the captured bound stable.
+	let last_seeded = SEEDED - 1;
+	for _ in 0..2 {
+		let tree = Arc::clone(&tree);
+		let stop = Arc::clone(&stop);
+		handles.push(thread::spawn(move || {
+			while !stop.load(Ordering::Relaxed) {
+				let lo = 0u64;
+				let mut range = tree.range(Bound::Included(&lo), Bound::Included(&last_seeded));
+				while let Some((k, _)) = range.next() {
+					assert!(
+						*k < SEEDED,
+						"iterator emitted {} outside the requested upper bound {}",
+						*k,
+						last_seeded
+					);
+				}
+			}
+		}));
+	}
+
+	// The pre-fix UAF in `lock_coupling_*` was reported as firing
+	// "1 in 5–10 runs" under ASan, so a 2-second budget (matching the
+	// rest of the file's `STRESS_SECS`) gives a regression a > 50%
+	// chance of *escaping* a single CI run. Quadruple it for this
+	// specific test so any reintroduction is caught with high
+	// confidence — and so the churn drives several full sliding-window
+	// passes through each writer's band rather than just the first.
+	const T5_STRESS_SECS: u64 = STRESS_SECS * 4;
+	thread::sleep(Duration::from_secs(T5_STRESS_SECS));
+	stop.store(true, Ordering::Release);
+	for h in handles {
+		h.join().unwrap();
+	}
+
+	// Every seeded key must still be present after the churn.
+	for k in 0..SEEDED {
+		assert!(tree.lookup(&k, |_| ()).is_some(), "seeded key {k} disappeared after churn");
+	}
+	tree.assert_invariants();
+}
 
 // ===========================================================================
 // 6. clear() while iterating
@@ -413,10 +496,6 @@ fn t4_concurrent_pop_first_and_pop_last_partition_the_tree() {
 // next scan against the post-clear tree (which may be empty or partially
 // refilled). Neither path may crash or violate sort order.
 
-// Note on writer intensity: a finite clear/refill cycle count (rather
-// than time-based churn) keeps this test below the threshold at which
-// the `lock_coupling_exclusive` UAF documented in t5's comment starts
-// firing during the writer's own `insert` descents.
 #[test]
 fn t6_clear_while_iterating_keeps_iterator_sorted_and_alive() {
 	const KEYS_PER_FILL: u64 = 512;
