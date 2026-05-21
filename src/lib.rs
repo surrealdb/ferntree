@@ -433,33 +433,39 @@ pub(crate) enum Direction {
 // Retry primitive
 // ---------------------------------------------------------------------------
 
-/// Retries `f` until it succeeds, applying `parking_lot_core::SpinWait`
-/// backoff between failed attempts.
+/// Retries `f` until it succeeds, applying a `spin_loop` hint between
+/// failed attempts.
 ///
 /// This is the canonical retry shape for the tree's optimistic-descent
 /// and lookup paths: the closure runs an attempt, returning `Ok(t)` on
 /// success or `Err(Unwind)` when an optimistic snapshot was invalidated
-/// by concurrent writers. Backoff is what differentiates this helper
-/// from a raw `loop { … continue; }` — without it, a thrashing tree
-/// (heavy structural churn that repeatedly invalidates descents) can
-/// burn unbounded CPU in a tight retry, starving the writer threads
-/// that would otherwise quiesce the contention.
+/// by concurrent writers. The `spin_loop` hint differentiates this
+/// helper from a raw `loop { … continue; }` — under heavy structural
+/// churn (writers repeatedly invalidating descents) the hint tells the
+/// CPU to back off on the memory bus and hyperthread sibling without
+/// stealing pipeline resources from the writer doing useful work.
 ///
-/// `SpinWait`'s first iteration is just a handful of `PAUSE`
-/// instructions, so the uncontended fast path (one-shot success) pays
-/// effectively nothing.
+/// We deliberately use `std::hint::spin_loop` rather than
+/// `parking_lot_core::SpinWait`. `SpinWait` escalates to
+/// `thread::yield_now()` after a small number of failed attempts;
+/// under producer-consumer workloads with bursty contention this
+/// yields the optimistic-reader to the OS scheduler often enough that
+/// it can be starved of CPU for the entire producer phase. The
+/// `spin_loop` hint stays in userspace and re-enters the closure
+/// immediately, which is what the optimistic-validation pattern
+/// actually wants: retry as soon as the contended snapshot might be
+/// stable again.
 #[inline]
 fn retry_optimistic<T, F>(mut f: F) -> T
 where
 	F: FnMut() -> error::Result<T>,
 {
-	let mut spinwait = parking_lot_core::SpinWait::new();
 	loop {
 		match f() {
 			Ok(t) => return t,
 			Err(_) => {
 				std::hint::cold_path();
-				spinwait.spin();
+				std::hint::spin_loop();
 			}
 		}
 	}
