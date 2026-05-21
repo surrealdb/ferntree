@@ -1478,15 +1478,57 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				// Find the leaf that would contain the key
 				let (leaf, parent_opt) = self.find_leaf_and_parent(key, eg)?;
 
-				// Check if the key actually exists in this leaf
-				let (pos, exact) = leaf.as_leaf().lower_bound(key);
+				// Check if the key actually exists in this leaf — via
+				// raw-pointer projection rather than an `&LeafNode`
+				// reborrow. Going through `as_leaf()` here would call
+				// the safe-`&self` `lower_bound`, whose `load_into`
+				// dereferences the boxed slot's raw pointer without
+				// null-checking — and a concurrent `shift_remove_raw`
+				// on the same leaf transiently null-stores intermediate
+				// slots before incrementing the writer's epoch. The
+				// raw-pointer path uses `try_load_into_raw` and bails
+				// out via `Err(Unwind)` on a torn read.
+				let node_ptr = leaf.as_ptr();
+				// SAFETY: `leaf` is an `OptimisticGuard` whose pointer
+				// is valid for the guard's lifetime; the variant
+				// discriminant is validated by the `recheck` below
+				// (or by `to_exclusive`).
+				let leaf_ptr = match unsafe { Node::variant_raw(node_ptr) } {
+					NodeKindRaw::Leaf(l) => l,
+					NodeKindRaw::Internal(_) => {
+						// Torn discriminant under a concurrent
+						// structural change — retry.
+						std::hint::cold_path();
+						return Err(error::Error::Unwind);
+					}
+				};
+				// SAFETY: `leaf_ptr` is a valid `*const LeafNode` for
+				// the optimistic guard's lifetime; `K: OptimisticRead`
+				// (impl bound) certifies the bitwise-snapshot
+				// comparison discipline. `lower_bound_raw` itself
+				// short-circuits on a null peek.
+				let (_, exact) = unsafe { LeafNode::lower_bound_raw(leaf_ptr, key) };
 
 				if exact {
-					// Key found - upgrade to exclusive lock
+					// Key tentatively found. Upgrade to exclusive
+					// lock to stabilise the leaf, then re-locate the
+					// key under the stable view — the optimistic
+					// position can be stale if a concurrent writer
+					// moved keys between the snapshot and the upgrade.
 					let exclusive_leaf = leaf.to_exclusive()?;
+					let (pos, exact) = exclusive_leaf.as_leaf().lower_bound(key);
+					if !exact {
+						// Concurrent remove of the same key; report
+						// "not found" rather than retry — that is
+						// the visible outcome of a serialised remove
+						// race anyway.
+						return error::Result::Ok(None);
+					}
 					error::Result::Ok(Some(((exclusive_leaf, pos), parent_opt)))
 				} else {
-					// Key not found
+					// Validate the negative result. If the optimistic
+					// read saw a torn snapshot, `recheck` will fail and
+					// we'll retry; otherwise the key really is absent.
 					leaf.recheck()?;
 					error::Result::Ok(None)
 				}
