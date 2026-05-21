@@ -1370,6 +1370,17 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				// SAFETY: `c_swip_ptr` is a valid `*const Atomic` for
 				// the parent guard's lifetime.
 				let c_swip = unsafe { &*c_swip_ptr };
+				// Prefetch the child latch's first cache line while the
+				// branch below decides between shared / optimistic lock
+				// coupling. The pre-deref recheck added for issue #14
+				// adds an extra `Acquire` load on the parent's version
+				// to this iteration; the prefetch hides most of that
+				// cost by warming the child latch's cache line in
+				// parallel. A `Relaxed` load is sufficient — this is a
+				// hint, not a fence; if it tears we prefetch the wrong
+				// address and the CPU silently drops it.
+				let prefetch_target = c_swip.load(Ordering::Relaxed, eg).as_raw();
+				prefetch::read_data(prefetch_target);
 
 				// Check if next level is the leaf level.
 				//
@@ -1653,6 +1664,10 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 				// SAFETY: `c_swip_ptr` is a valid `*const Atomic` for
 				// the parent guard's lifetime.
 				let c_swip = unsafe { &*c_swip_ptr };
+				// Prefetch the child latch — see the matching note in
+				// `find_shared_leaf_and_optimistic_parent`.
+				let prefetch_target = c_swip.load(Ordering::Relaxed, eg).as_raw();
+				prefetch::read_data(prefetch_target);
 
 				// `Relaxed` is sufficient — see the matching note in
 				// `find_shared_leaf_and_optimistic_parent`. Correctness
