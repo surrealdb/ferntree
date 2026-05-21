@@ -1136,10 +1136,16 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 								// Root is the only node - upgrade to shared lock
 								break target_guard.to_shared()?;
 							} else {
-								// Should never happen - found leaf before expected level
-								unreachable!(
-									"tree structure corruption: encountered leaf at internal level during traversal"
-								)
+								// Concurrent height shrink: the tree
+								// collapsed a level between our
+								// initial `height` load and this
+								// descent, so the optimistic walk
+								// ended up at a leaf with a parent
+								// still set. Treat as a snapshot
+								// failure and retry rather than
+								// panicking on a benign race.
+								std::hint::cold_path();
+								return Err(error::Error::Unwind);
 							}
 						}
 					};
@@ -1409,9 +1415,20 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 							if p_guard.is_none() {
 								break target_guard.to_exclusive()?;
 							} else {
-								unreachable!(
-									"tree structure corruption: encountered leaf at internal level during traversal"
-								)
+								// We descended through internal nodes
+								// and unexpectedly landed on a leaf —
+								// concurrent height shrink between our
+								// initial `height.load(Relaxed)` and the
+								// next iteration can leave the
+								// optimistic descent one level "too
+								// deep". Treat as a snapshot-validation
+								// failure and retry; the parent's
+								// version check would have caught it
+								// anyway, but doing it explicitly here
+								// keeps us from panicking on a benign
+								// race.
+								std::hint::cold_path();
+								return Err(error::Error::Unwind);
 							}
 						}
 					};
