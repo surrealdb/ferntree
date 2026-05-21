@@ -2316,34 +2316,56 @@ impl<'t, K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, co
 			}
 		};
 
-		// Position the iterator at the lower bound and capture an owned
-		// representation of that bound for defensive re-checks at every emit.
+		// Capture the lower bound and position the iterator for forward
+		// iteration. The bound capture is symmetric to the upper bound's
+		// "broader than the request" semantics — for a missing `k`, we
+		// look *backward* via `seek_for_prev` for the largest existing
+		// key <= k and exclude it, rather than looking forward and
+		// including the next-greater existing key.
+		//
+		// The asymmetric alternative (`Included(first_key_>=_k)` when
+		// `k` is missing) filtered concurrent inserts in `[k, first)`
+		// out of the emit stream — strictly narrower than the user's
+		// request, which is the opposite of the upper bound's behaviour
+		// for the same missing-key case. Matching the upper bound's
+		// "broader" capture keeps `Range`'s two bounds symmetric.
 		let lower_bound = match min {
 			Bound::Unbounded => {
 				iter.seek_to_first();
 				Bound::Unbounded
 			}
 			Bound::Included(k) => {
-				iter.seek(k);
-				match iter.peek() {
+				// Probe the largest existing key <= k.
+				iter.seek_for_prev(k);
+				let captured = match iter.peek_prev() {
 					Some((key, _)) if key.borrow() == k => Bound::Included(key.clone()),
 					Some((key, _)) => {
-						// k doesn't exist; treat the first existing key >= k
-						// as the effective inclusive lower bound.
-						Bound::Included(key.clone())
+						// k doesn't exist; capture `Excluded(largest <
+						// k)` so concurrent inserts in
+						// `(largest, k]` still pass the bound check.
+						Bound::Excluded(key.clone())
 					}
-					None => Bound::Unbounded, // No keys at or after k.
-				}
+					None => Bound::Unbounded, // No key <= k.
+				};
+				// Re-position for forward iteration at the first key >= k.
+				iter.seek(k);
+				captured
 			}
 			Bound::Excluded(k) => {
-				// Seek to the key, then skip it if it exists.
+				// Probe the largest existing key <= k. Either an exact
+				// match on k or the largest key < k becomes the
+				// exclusive lower bound (`k' > captured`), symmetric to
+				// the upper bound's `Excluded` probe.
+				iter.seek_for_prev(k);
+				let captured = match iter.peek_prev() {
+					Some((key, _)) => Bound::Excluded(key.clone()),
+					None => Bound::Unbounded,
+				};
+				// Re-position for forward iteration past the excluded key.
 				if iter.seek_exact(k) {
 					let _ = iter.next();
 				}
-				match iter.peek() {
-					Some((key, _)) => Bound::Included(key.clone()),
-					None => Bound::Unbounded,
-				}
+				captured
 			}
 		};
 
