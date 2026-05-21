@@ -1332,8 +1332,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 						// (impl bound) certifies the snapshot
 						// discipline. `lower_bound_raw` itself
 						// short-circuits on a null peek.
-						let (pos, _) =
-							unsafe { InternalNode::lower_bound_raw(internal_ptr, key) };
+						let (pos, _) = unsafe { InternalNode::lower_bound_raw(internal_ptr, key) };
 						// SAFETY: same conditions as `lower_bound_raw`.
 						let swip_ptr = unsafe { InternalNode::edge_at_raw(internal_ptr, pos)? };
 						(swip_ptr, pos)
@@ -1624,8 +1623,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 						// (impl bound) certifies the snapshot
 						// discipline. `lower_bound_raw` itself
 						// short-circuits on a null peek.
-						let (pos, _) =
-							unsafe { InternalNode::lower_bound_raw(internal_ptr, key) };
+						let (pos, _) = unsafe { InternalNode::lower_bound_raw(internal_ptr, key) };
 						// SAFETY: same conditions as `lower_bound_raw`.
 						let swip_ptr = unsafe { InternalNode::edge_at_raw(internal_ptr, pos)? };
 						(swip_ptr, pos)
