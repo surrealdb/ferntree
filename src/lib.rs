@@ -2655,7 +2655,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 						{
 							let new_right_node =
 								new_right_node_owned.as_mut().as_mut().as_internal_mut();
-							root_internal_node.split(new_right_node, split_pos);
+							root_internal_node.split(new_right_node, split_pos, eg);
 						}
 
 						// Create atomic pointers for the new tree structure
@@ -2772,7 +2772,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 							{
 								let new_right_node =
 									new_right_node_owned.as_mut().as_mut().as_internal_mut();
-								left_internal.split(new_right_node, split_pos);
+								left_internal.split(new_right_node, split_pos, eg);
 							}
 
 							// Create atomic pointer for right node
@@ -2989,7 +2989,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 									if pos == parent_len {
 										// Target was at upper_edge
 										// Remove separator, left becomes the new upper_edge
-										let (_, left_edge) = parent_internal.remove_at(pos - 1);
+										let left_edge = parent_internal.remove_at(pos - 1, eg);
 										let dropped_edge = std::mem::replace(
 											&mut parent_internal.upper_edge,
 											left_edge,
@@ -3011,7 +3011,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 										}
 									} else {
 										// Target was at edges[pos]
-										let (_, left_edge) = parent_internal.remove_at(pos - 1);
+										let left_edge = parent_internal.remove_at(pos - 1, eg);
 										let dropped_edge = std::mem::replace(
 											&mut parent_internal.edges[(pos - 1) as usize],
 											left_edge,
@@ -3043,7 +3043,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 								// Merging two internal nodes
 								assert!(!left_guard_x.is_leaf());
 
-								if !left_guard_x.as_internal_mut().merge(target_internal) {
+								if !left_guard_x.as_internal_mut().merge(target_internal, eg) {
 									parent_guard = parent_guard_x.unlock();
 									target_guard = target_guard_x.unlock();
 									false
@@ -3051,7 +3051,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 									let parent_internal = parent_guard_x.as_internal_mut();
 
 									if pos == parent_len {
-										let (_, left_edge) = parent_internal.remove_at(pos - 1);
+										let left_edge = parent_internal.remove_at(pos - 1, eg);
 										let dropped_edge = std::mem::replace(
 											&mut parent_internal.upper_edge,
 											left_edge,
@@ -3071,7 +3071,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 											unsafe { eg.defer_destroy(shared) };
 										}
 									} else {
-										let (_, left_edge) = parent_internal.remove_at(pos - 1);
+										let left_edge = parent_internal.remove_at(pos - 1, eg);
 										let dropped_edge = std::mem::replace(
 											&mut parent_internal.edges[(pos - 1) as usize],
 											left_edge,
@@ -3139,7 +3139,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 
 										// Remove separator and schedule right node for destruction
 										if pos + 1 == parent_len {
-											let (_, left_edge) = parent_internal.remove_at(pos);
+											let left_edge = parent_internal.remove_at(pos, eg);
 											let dropped_edge = std::mem::replace(
 												&mut parent_internal.upper_edge,
 												left_edge,
@@ -3159,7 +3159,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 												unsafe { eg.defer_destroy(shared) };
 											}
 										} else {
-											let (_, left_edge) = parent_internal.remove_at(pos);
+											let left_edge = parent_internal.remove_at(pos, eg);
 											let dropped_edge = std::mem::replace(
 												&mut parent_internal.edges[pos as usize],
 												left_edge,
@@ -3189,7 +3189,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 									// Merging internal nodes
 									assert!(!right_guard_x.is_leaf());
 
-									if !target_internal.merge(right_guard_x.as_internal_mut()) {
+									if !target_internal.merge(right_guard_x.as_internal_mut(), eg) {
 										parent_guard = parent_guard_x.unlock();
 										let _ = target_guard_x.unlock();
 										false
@@ -3197,7 +3197,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 										let parent_internal = parent_guard_x.as_internal_mut();
 
 										if pos + 1 == parent_len {
-											let (_, left_edge) = parent_internal.remove_at(pos);
+											let left_edge = parent_internal.remove_at(pos, eg);
 											let dropped_edge = std::mem::replace(
 												&mut parent_internal.upper_edge,
 												left_edge,
@@ -3217,7 +3217,7 @@ impl<K: Clone + Ord + OptimisticRead, V: OptimisticRead, const IC: usize, const 
 												unsafe { eg.defer_destroy(shared) };
 											}
 										} else {
-											let (_, left_edge) = parent_internal.remove_at(pos);
+											let left_edge = parent_internal.remove_at(pos, eg);
 											let dropped_edge = std::mem::replace(
 												&mut parent_internal.edges[pos as usize],
 												left_edge,
@@ -4955,13 +4955,30 @@ impl<K: OptimisticRead, V: OptimisticRead, const IC: usize, const LC: usize>
 	}
 
 	/// Removes the key and edge at the given position.
-	pub(crate) fn remove_at(&mut self, pos: u16) -> (K, Atomic<HybridLatch<Node<K, V, IC, LC>>>) {
+	///
+	/// The displaced K is routed through the epoch GC so the heap buffer
+	/// behind a boxed K (e.g. `Vec<u8>`, `String`) survives until every
+	/// concurrent optimistic reader has dropped its snapshot. Without
+	/// this, a reader inside `InternalNode::lower_bound_raw`'s binary
+	/// search holds a `ptr::read` snapshot of `(ptr, len, cap)` whose
+	/// `ptr` would dangle after the synchronous drop, and the
+	/// subsequent `memcmp` would read freed memory. See issue #15.
+	pub(crate) fn remove_at(
+		&mut self,
+		pos: u16,
+		eg: &epoch::Guard,
+	) -> Atomic<HybridLatch<Node<K, V, IC, LC>>> {
 		let key = self.keys.remove(pos as usize);
 		let edge = self.edges.remove(pos as usize);
 		// SAFETY: see the fetch_add_relaxed in `insert`.
 		unsafe { self.len.fetch_sub_relaxed(1) };
 
-		(key, edge)
+		// `drop_or_defer` is an immediate drop for inline K (no interior
+		// pointer) and routes through `eg.defer` for boxed K. The branch
+		// is a `const` on `K::EPOCH_DEFERRED_DROP`, elided at monomorph.
+		optimistic::drop_or_defer(key, eg);
+
+		edge
 	}
 
 	/// Inserts a separator key and new right child after a node split.
@@ -5029,15 +5046,30 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: us
 	/// Note: K3 is removed from both children and used as the separator
 	/// in the parent. The edge that was at K3's position (E3) becomes
 	/// the left node's upper_edge.
-	pub(crate) fn split(&mut self, right: &mut InternalNode<K, V, IC, LC>, split_pos: u16) {
+	///
+	/// The `eg` parameter is used to route synchronously-displaced K
+	/// values through the epoch GC so concurrent optimistic readers
+	/// holding a `ptr::read` snapshot (in `InternalNode::lower_bound_raw`)
+	/// don't observe a freed interior buffer. See issue #15.
+	pub(crate) fn split(
+		&mut self,
+		right: &mut InternalNode<K, V, IC, LC>,
+		split_pos: u16,
+		eg: &epoch::Guard,
+	) {
 		// Get the split key - this will be pushed up to the parent
 		let split_key =
 			self.key_at(split_pos).expect("split position must be within node bounds").clone();
 
-		// Update fence keys
+		// Update fence keys. `right` is freshly allocated so its fences
+		// are None; the only fence whose displaced value matters is
+		// `self.upper_fence`, which a concurrent reader may have a
+		// `ptr::read` snapshot of.
 		right.lower_fence = Some(split_key.clone());
 		right.upper_fence = self.upper_fence.clone();
-		self.upper_fence = Some(split_key);
+		if let Some(k) = self.upper_fence.replace(split_key) {
+			optimistic::drop_or_defer(k, eg);
+		}
 
 		// Move keys and edges after split_pos to right
 		assert!(right.keys.is_empty());
@@ -5054,11 +5086,20 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: us
 		// (it was pointing to children between K(split_pos-1) and K(split_pos))
 		self.upper_edge =
 			self.edges.pop().expect("edges non-empty: split requires at least one edge");
-		// Remove the key at split_pos (it's being pushed to parent)
-		self.keys.pop().expect("keys non-empty: split requires at least one key");
+		// Remove the key at split_pos (it's being pushed to parent). The
+		// popped K may have an interior pointer being read by a concurrent
+		// optimistic descent; defer its drop through the epoch GC.
+		let popped_key =
+			self.keys.pop().expect("keys non-empty: split requires at least one key");
+		optimistic::drop_or_defer(popped_key, eg);
 
-		// Set sample keys for node relocation
-		self.sample_key = Some(self.keys[0].clone());
+		// Set sample keys for node relocation. The pre-existing
+		// `self.sample_key` may be observed by an in-flight reader (sample
+		// keys are read from internal-node descent paths under
+		// `find_parent`); defer-drop the displaced value.
+		if let Some(k) = self.sample_key.replace(self.keys[0].clone()) {
+			optimistic::drop_or_defer(k, eg);
+		}
 		right.sample_key = Some(right.keys[0].clone());
 
 		// Update lengths
@@ -5093,15 +5134,31 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: us
 	///
 	/// - `true` if merge succeeded
 	/// - `false` if combined size would exceed capacity
-	pub(crate) fn merge(&mut self, right: &mut InternalNode<K, V, IC, LC>) -> bool {
+	///
+	/// The `eg` parameter is used to route synchronously-displaced K
+	/// values (`self.upper_fence` and `self.sample_key`) through the
+	/// epoch GC so a concurrent optimistic descent that snapshotted them
+	/// via `ptr::read` doesn't observe a freed interior buffer. See
+	/// issue #15.
+	pub(crate) fn merge(
+		&mut self,
+		right: &mut InternalNode<K, V, IC, LC>,
+		eg: &epoch::Guard,
+	) -> bool {
 		// Check if combined entries fit
 		// +1 for the separator key that gets added back
 		if (self.len.load_relaxed() + right.len.load_relaxed() + 1) as usize > IC {
 			return false;
 		}
 
-		// Inherit right's upper_fence (we now cover its range too)
-		let _left_upper_fence = std::mem::replace(&mut self.upper_fence, right.upper_fence.take());
+		// Inherit right's upper_fence (we now cover its range too). The
+		// displaced `self.upper_fence` may have a `ptr::read` snapshot
+		// outstanding in a concurrent `lower_bound_raw`; defer-drop it.
+		let displaced_upper_fence =
+			std::mem::replace(&mut self.upper_fence, right.upper_fence.take());
+		if let Some(k) = displaced_upper_fence {
+			optimistic::drop_or_defer(k, eg);
+		}
 
 		// Our upper_edge will be used as a regular edge. Swap right's
 		// upper_edge into ours; right is consumed so it doesn't matter
@@ -5130,9 +5187,13 @@ impl<K: Clone + OptimisticRead, V: OptimisticRead, const IC: usize, const LC: us
 		self.edges.extend(right.edges.drain(..));
 
 		// Update sample_key: prefer right's sample_key if available,
-		// otherwise ensure we have one if we have keys (prevents find_parent failures)
+		// otherwise ensure we have one if we have keys (prevents find_parent failures).
+		// The displaced `self.sample_key` may be snapshotted by a concurrent
+		// reader; defer-drop it just like the fence above.
 		if let Some(sample) = right.sample_key.take() {
-			self.sample_key = Some(sample);
+			if let Some(k) = self.sample_key.replace(sample) {
+				optimistic::drop_or_defer(k, eg);
+			}
 		} else if self.sample_key.is_none() && !self.keys.is_empty() {
 			self.sample_key = Some(self.keys[0].clone());
 		}

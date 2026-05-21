@@ -23,12 +23,16 @@
 //!    a single scan.
 //! 7. `get_or_insert_with` race — under contention on a missing key the
 //!    documented "closure runs exactly once" contract must hold.
+//! 8. Boxed-K internal-node UAF regression (issue #15) — bounded-range
+//!    scans driven through `InternalNode::lower_bound_raw` while
+//!    writers split internal nodes must not memcmp through a freed
+//!    `Vec<u8>` buffer.
 //!
-//! All tests use *inline* `K` types (u64 / u32) so they don't trip the
-//! latent boxed-K UAF in `InternalNode::lower_bound_raw` — that's
-//! orthogonal and worth its own fix. Boxed `V` is used only in test 2
-//! and only via `insert_defer` / `lookup_optimistic`, which is the
-//! documented safe combination.
+//! Tests 1, 3, 4, 6, 7 use *inline* `K` types (u64 / u32) so they don't
+//! trip the latent boxed-K UAF in `InternalNode::lower_bound_raw`.
+//! Test 8 covers that UAF specifically (issue #15) using `Vec<u8>` keys.
+//! Boxed `V` is used only in test 2 and only via `insert_defer` /
+//! `lookup_optimistic`, which is the documented safe combination.
 
 use ferntree::{OptimisticRead, Tree};
 use std::ops::Bound;
@@ -523,6 +527,85 @@ fn t7_get_or_insert_with_runs_closure_exactly_once_under_contention() {
 			"round {round}: contending threads got different returns: {:?}",
 			returns
 		);
+	}
+}
+
+// ===========================================================================
+// 8. Boxed-K internal-node UAF regression — issue #15
+// ===========================================================================
+//
+// Reader does narrow-range scans (descending through internal nodes that
+// hold `Vec<u8>` keys) while writers drive enough insert churn to force
+// internal-node splits. The reader's `InternalNode::lower_bound_raw`
+// does `ptr::read` to snapshot a midpoint key and then memcmps through
+// its interior pointer; pre-fix, a concurrent writer's
+// `InternalNode::split` synchronously displaced and dropped that K's
+// `Vec<u8>`, freeing the buffer the reader was about to memcmp.
+//
+// Insert-only writers — the writer-vs-writer epoch race in #14 needs
+// remove-driven `defer_destroy`, which we never run here. Inline K
+// (already covered elsewhere in this suite) is not affected by #15
+// because `ptr::read` bitwise-copies the whole value.
+
+#[test]
+fn t8_internal_node_split_under_boxed_k_does_not_dangle_in_lower_bound_raw() {
+	let tree: Arc<Tree<Vec<u8>, ()>> = Arc::new(Tree::new());
+
+	let mk = |ix: u8, kind: u8, n: u64| -> Vec<u8> {
+		let mut k = Vec::with_capacity(2 + 8);
+		k.push(ix);
+		k.push(kind);
+		k.extend_from_slice(&n.to_be_bytes());
+		k
+	};
+
+	// Seed enough entries to force a multi-level tree.
+	for ix in 0..8u8 {
+		for kind in 0..4u8 {
+			for n in 0..128u64 {
+				tree.insert(mk(ix, kind, n), ());
+			}
+		}
+	}
+
+	let stop = Arc::new(AtomicBool::new(false));
+	let mut handles = Vec::new();
+	for w in 0..5u32 {
+		let tree = Arc::clone(&tree);
+		let stop = Arc::clone(&stop);
+		handles.push(thread::spawn(move || {
+			let mut n: u64 = 128 + (w as u64) * 1_000_000;
+			while !stop.load(Ordering::Relaxed) {
+				for ix in 0..8u8 {
+					for kind in 0..4u8 {
+						tree.insert(mk(ix, kind, n), ());
+					}
+				}
+				n = n.wrapping_add(1);
+			}
+		}));
+	}
+
+	// Reader: scan a narrow `(ix, kind)` prefix repeatedly. The bounded
+	// range scan goes through `find_leaf_and_parent`'s internal-node
+	// optimistic descent — the binary-search path where the pre-fix UAF
+	// would fire.
+	let target_ix = 4u8;
+	let target_kind = 2u8;
+	let beg = vec![target_ix, target_kind];
+	let mut end = beg.clone();
+	end[1] += 1;
+
+	let start = std::time::Instant::now();
+	while start.elapsed() < Duration::from_secs(STRESS_SECS) {
+		let mut range = tree
+			.range::<[u8]>(Bound::Included(beg.as_slice()), Bound::Excluded(end.as_slice()));
+		while range.next().is_some() {}
+	}
+
+	stop.store(true, Ordering::Release);
+	for h in handles {
+		h.join().unwrap();
 	}
 }
 
